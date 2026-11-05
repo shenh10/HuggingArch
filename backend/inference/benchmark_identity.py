@@ -742,8 +742,9 @@ class MatrixShard:
     """One published weight partition (`weight_shards`, the walk's
     `WeightShard`): the rows `n` and reduction width `k` of the grid its
     scale tiles, unsharded and on one rank, which weight it is packed into
-    and its own scale layout. Numbers only — which axes are rows, which are
-    copies, and what was cut is the walk's reading, not this one's."""
+    and its own scale layout. Axis geometry and the optional checkpoint
+    block-layout contract are the walk's facts: this consumer does not infer
+    which axes are rows, copies, or load-time scale boundaries."""
 
     pack: Tuple[int, int]
     n: int
@@ -751,6 +752,7 @@ class MatrixShard:
     k: int
     k_local: int
     granularity: Optional[str]
+    block_scale_layout: Optional[Dict[str, Any]] = None
 
     @property
     def cuts_n(self) -> bool:
@@ -764,7 +766,8 @@ class MatrixShard:
     def of(cls, shard: Dict[str, Any]) -> "MatrixShard":
         return cls(tuple(shard["pack"]), int(shard["rows"]),
                    int(shard["rows_local"]), int(shard["width"]),
-                   int(shard["width_local"]), shard["granularity"])
+                   int(shard["width_local"]), shard["granularity"],
+                   shard.get("block_scale_layout"))
 
 
 def routed_launch(row: Dict[str, Any]) -> Optional[RoutedLaunch]:

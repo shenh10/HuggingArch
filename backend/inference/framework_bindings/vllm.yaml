@@ -417,6 +417,16 @@ collectives:
       worlds: [6, 8]
       source_anchor: "group sizes torch symmetric memory runs multimem at on SM100/SM103 (vllm/distributed/device_communicators/symm_mem.py:26-31) and has a cap for (vllm/distributed/device_communicators/all_reduce_utils.py:58-83); torch symmetric memory's multimem all-reduce (vllm/distributed/device_communicators/symm_mem.py:26-31, vllm/distributed/device_communicators/symm_mem.py:137-154), dispatched at vllm/distributed/device_communicators/cuda_communicator.py:427-431"
 
+# Checkpoint scale layouts this framework's model loader transforms. The model
+# spec declares the layout; this binding owns the framework behavior and its
+# audited source.
+weight_loaders:
+  mimo_v2_fused_qkv:
+    kind: tp_interleaved
+    loader: head_gather
+    when: { architectures: [MiMoV2ForCausalLM] }
+    source_anchor: "vLLM gathers each rank's Q/K/V heads from checkpoint chunks, replicating KV where needed, then requantizes one rank-local fused grid (vllm/model_executor/models/mimo_v2.py:495-632); requantization pads the final block (vllm/model_executor/models/mimo_v2.py:468-492), and the linear constructor allows the ragged merged FP8 partition (vllm/model_executor/layers/linear.py:540-574)"
+
 op_implementations:
   # V1 FlashAttention backend (v1/attention/backends/flash_attn.py:1052); FA3
   # on SM90 (v1/attention/backends/fa_utils.py:99-101), FA4 on SM100

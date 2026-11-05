@@ -65,8 +65,13 @@ def test_unflushed_timing_still_reads_a_warm_cache():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
     from kernel_bench.timing import time_callable
-    x = torch.randn(16 * 2**20 // 4, device="cuda")
-    sink = torch.empty((), device="cuda")
-    hot = time_callable(lambda: torch.amax(x, dim=0, out=sink), flush_l2=False)
-    cold = time_callable(lambda: torch.amax(x, dim=0, out=sink))
+    # Reduce independent rows, not the entire tensor to one scalar. A
+    # global reduction adds cross-block coordination that can hide the
+    # memory-access difference (16 MiB on B300: cold/hot ~1.03). Row-wise
+    # reduction reads the same bytes with only a small output, keeping this
+    # a cache-read check rather than a reduction-latency check.
+    x = torch.randn(16 * 2**20 // 4 // 1024, 1024, device="cuda")
+    sink = torch.empty(x.shape[0], device="cuda")
+    hot = time_callable(lambda: torch.amax(x, dim=1, out=sink), flush_l2=False)
+    cold = time_callable(lambda: torch.amax(x, dim=1, out=sink))
     assert cold.p50_us >= hot.p50_us * 1.1, (hot.p50_us, cold.p50_us)

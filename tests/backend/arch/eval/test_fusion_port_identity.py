@@ -110,7 +110,9 @@ def test_every_fused_port_sits_on_the_member_its_name_declares(model_id):
                 result = analyze(
                     resolved, parallel=ParallelConfig.from_dict(parallel),
                     framework_binding=binding, batch_size=1, avg_input_tokens=16, avg_output_tokens=0,
-                    phase=phase, breakdown=False)
+                    # Inspect graph identities even when the selected loader
+                    # refuses this deployment; loadability has its own gates.
+                    phase=phase, breakdown=False, allow_load_refusals=True)
                 problems += [f"{mesh} {phase} {p}"
                              for p in _violations(result, framework)]
     assert not problems, "\n".join(sorted(set(problems)))
