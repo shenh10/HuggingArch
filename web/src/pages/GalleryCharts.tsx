@@ -512,9 +512,11 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
   });
   const perUser = (n: number) => `${fmtCompact(n)} tok/s/user`;
   const perGpu = (n: number) => `${fmtCompact(n)} tok/s/GPU`;
-  const logSpan = {
-    min: (v: { min: number }) => v.min / 1.5,
-    max: (v: { max: number }) => v.max * 1.5,
+  // Linear axes from zero: both rates are non-negative, and a shared zero
+  // keeps the gaps between curves proportional to the rates themselves.
+  const linearSpan = {
+    min: 0,
+    max: (v: { max: number }) => v.max * 1.05,
   };
   // The first `drawn.length` series are the SOL frontiers, in order.
   const events = onPoint ? {
@@ -549,12 +551,12 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
     },
     legend: legendOpts(drawn.map((s) => s.label)),
     xAxis: {
-      ...axis("log", "Interactivity (tok/s per user, log)", fmtCompact, 28), ...logSpan,
-      axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: false, showMaxLabel: false },
+      ...axis("value", "Interactivity (tok/s per user)", fmtCompact, 28), ...linearSpan,
+      axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
     },
     yAxis: {
-      ...axis("log", "Output throughput (tok/s per GPU, log)", fmtCompact, 52), ...logSpan,
-      axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: false, showMaxLabel: false },
+      ...axis("value", "Output throughput (tok/s per GPU)", fmtCompact, 52), ...linearSpan,
+      axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
     },
     series: [
       ...drawn.map((s) => ({
