@@ -44,13 +44,15 @@ def _imports_kernel_bench(path: Path) -> bool:
     return False
 
 
-#: HTTP composition roots may import the harness. Nothing else under
-#: `backend/` may — the cost model and the spec tree must not grow a
+#: HTTP and Kernel Bench service composition roots may import the harness.
+#: Nothing else under `backend/` may — the cost model and the spec tree must not grow a
 #: reverse edge. Comments that mention the name are not imports; this
 #: walks AST.
 KERNEL_BENCH_IMPORTERS = frozenset({
     "backend/api/routes/inference.py",
     "backend/api/routes/fusion.py",
+    "backend/service/bench/annotations.py",
+    "backend/service/bench/data_rules.py",
     "backend/service/bench/routes.py",
 })
 

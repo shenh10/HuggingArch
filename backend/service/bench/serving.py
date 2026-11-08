@@ -12,19 +12,24 @@ under pytest) walks the startup once:
   3. a lake left `importing` by the one-time import from the Postgres
      tables (those tables are gone, migration 0026) can never
      finish: refused — restore it from backup;
-  4. claim the lease (`bench_lake_claim`, migration 0023) with the lake's
+  4. decide the copy's role: a lake created (or claimed) with the lease is the
+     one authority; a lake created without the lease is a development lake
+     with its own id; an existing lake without the lease that does not say it
+     is development is a restored copy and serves reads only — it never gets
+     a second writable history under an authoritative lake_id;
+  5. claim the lease (`bench_lake_claim`, migration 0023) with the lake's
      `lake_id` and this machine's id (FLY_MACHINE_ID; BENCH_LAKE_MACHINE in
      development): 'claimed' / 'ok' serve; 'refused' — another lake, or this
      lake on another machine (a cloned volume) — does not, and neither does
      an unreachable lease (fail closed; retried). Only an operator moves the
      lease to another machine (`bench_lake_transfer`);
-  5. annotate every input in memory (`store.annotate_all` with the
+  6. annotate every input in memory (`store.annotate_all` with the
      `annotate` the routes pass: only they may import kernel_bench) — the
      grouping labels are computed, never stored;
-  6. backups (mandatory; BENCH_LAKE_BACKUP=off opts out in development):
+  7. backups (mandatory; BENCH_LAKE_BACKUP=off opts out in development):
      back up what `current` lacks, then a `backup.Trigger` follows every
      write;
-  7. serve: `on_serving(lake, backup)` (the routes start the shared rows' revision
+  8. serve: `on_serving(lake, backup)` (the routes start the shared rows' revision
      and start the maintainer).
 
 Until step 7, and whenever a step refuses, every lake endpoint answers 503
@@ -35,8 +40,10 @@ too far behind) or the lake's volume is short of space
 that failed for a reason that may pass (the lake or the lease unreachable)
 is retried on a request after `RETRY_AFTER` seconds.
 
-The lease is required unless BENCH_LAKE_LEASE=off — for development and
-tests only; startup logs it and /health reports it.
+`BENCH_LAKE_LEASE=off` never turns an authoritative copy into a writable
+local lake. It permits writes only to a lake whose `lake_meta.lake_role` says
+`development` (and such a lake can never claim the production lease); every
+other unleased copy is read-only.
 """
 from __future__ import annotations
 
@@ -50,7 +57,7 @@ from typing import Callable, Optional
 import httpx
 
 from backend import supabase_env, supabase_rest
-from backend.service.bench import store
+from backend.service.bench import data_rules, store
 from backend.service.bench import backup as _backup
 from backend.service.bench.backup import Backup, BackupConfig, Trigger
 from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable, get_lake
@@ -150,13 +157,21 @@ class _Refused(Exception):
         self.transient = transient
 
 
+class _Degraded(Exception):
+    """Startup put the lake in a named degraded state; retrying may help."""
+
+    def __init__(self, reason: str, *, transient: bool = True):
+        super().__init__(reason)
+        self.transient = transient
+
+
 class Gate:
     """The process's Kernel Bench lake behind the startup checks."""
 
     def __init__(self, *, annotate: store.Annotate, open_lake: Callable[[], Lake] = get_lake,
                  lease: Callable[[], Optional[Lease]] = Lease.from_env,
                  backup: Callable[[], Optional[BackupConfig]] = BackupConfig.from_env,
-                 on_serving: Callable[[Lake, Optional[Backup]], None] = lambda lake, backup: None,
+                 on_serving: Callable[..., None] = lambda lake, backup, read_only=False: None,
                  restore: Callable[[], Optional[str]] = restore_from_env,
                  clock: Callable[[], float] = time.monotonic):
         self._open, self._lease, self._backup_config = open_lake, lease, backup
@@ -164,9 +179,12 @@ class Gate:
         self._restore = restore
         self._on_serving, self._clock = on_serving, clock
         self._guard = threading.Lock()
-        self.phase = "new"         # new | starting | serving | unavailable
+        self.phase = "new"         # new | starting | serving | degraded | unavailable
         self.reason = ""
         self.lease_state = "unknown"
+        self.data_rules = {"state": "unknown",
+                           "registered": data_rules.registered_version()}
+        self.read_only = False
         self._retry_at: Optional[float] = None
         self.lake: Optional[Lake] = None
         self.backup: Optional[Backup] = None
@@ -189,6 +207,8 @@ class Gate:
             self._unavailable(str(e), transient=e.transient)
         except (LakeUnavailable, LeaseUnreachable) as e:
             self._unavailable(str(e), transient=True)
+        except _Degraded as e:
+            self._degraded(str(e), transient=e.transient)
         except Exception as e:
             _LOG.exception("bench lake startup failed")
             self._unavailable(f"startup failed: {type(e).__name__}: {e}", transient=True)
@@ -198,6 +218,27 @@ class Gate:
         with self._guard:
             self.phase, self.reason = "unavailable", reason
             self._retry_at = self._clock() + RETRY_AFTER if transient else None
+
+    def _degraded(self, reason: str, *, transient: bool) -> None:
+        _LOG.error("Kernel Bench store degraded: %s", reason)
+        with self._guard:
+            self.phase, self.reason = "degraded", reason
+            self._retry_at = self._clock() + RETRY_AFTER if transient else None
+
+    def _set_data_rules(self, state: str, *, lake: str | None = None,
+                        migration: dict | None = None, error: str | None = None,
+                        phase: tuple[str, str] | None = None) -> None:
+        """Publish the migration owner's in-memory answer without reading the lake."""
+        with self._guard:
+            self.data_rules = {
+                "state": state,
+                "registered": data_rules.registered_version(),
+                **({"lake": lake} if lake is not None else {}),
+                **({"migration": migration} if migration is not None else {}),
+                **({"error": error} if error is not None else {}),
+            }
+            if phase is not None:
+                self.phase, self.reason = phase
 
     def _startup(self) -> None:
         try:
@@ -219,29 +260,79 @@ class Gate:
                 if holder is not None:
                     raise _Refused(f"not the authoritative lake (an empty lake; the lease names lake "
                                    f"{holder}) — restore it from backup")
-            store.ensure_schema(lake, lake_id=str(uuid.uuid4()), import_state="none")
+            store.ensure_schema(
+                lake, lake_id=str(uuid.uuid4()), import_state="none",
+                lake_role="authority" if lease is not None else "development")
+            data_rules.initialize(lake)
         meta = store.meta(lake)
-        if "lake_id" not in meta:        # a lake made before lake_meta (tests, scripts)
-            store.set_meta(lake, lake_id=str(uuid.uuid4()), import_state="none")
+        if "lake_id" not in meta:
+            # No identity means this copy cannot share an authoritative id.
+            store.set_meta(lake, lake_id=str(uuid.uuid4()), import_state="none",
+                           lake_role="development")
             meta = store.meta(lake)
         if meta.get("import_state") == "importing":
             raise _Refused("the import from the Postgres tables into this lake never finished, "
-                           "and those tables are gone — restore the lake from backup")
+                "and those tables are gone — restore the lake from backup")
+        role = meta.get("lake_role")
         if lease is not None:
+            if role == "development":
+                raise _Refused("a development lake cannot claim the authoritative lease")
             self._claim(lease, meta["lake_id"], here)
+            if role is None:
+                store.set_meta(lake, lake_role="authority")
+                role = "authority"
+        elif role != "development":
+            # An older restored copy has no role. It may be the authoritative
+            # lake's backup, so the only safe assumption is read-only.
+            self.read_only = True
+            _LOG.warning("bench lake lease is OFF and lake_role is %r: serving read-only",
+                         role or "unset")
+        before = data_rules.lake_version(lake)
+        if not data_rules.known_version(before):
+            reason = (f"the lake's data rules are {before!r}, outside this "
+                      f"deployment's registered chain")
+            self._set_data_rules("failed", lake=before, error=reason)
+            raise _Degraded(f"the lake's data rules did not migrate: {reason}",
+                            transient=False)
+        if before != data_rules.registered_version():
+            self._set_data_rules(
+                "behind", lake=before,
+                phase=("degraded", f"the lake's data rules are {before}; migrating"))
+            if self.read_only:
+                reason = (f"the read-only copy's data rules are {before}, not "
+                          f"{data_rules.registered_version()}; restore a current backup "
+                          "or start the authoritative lease holder")
+                self._set_data_rules("failed", lake=before, error=reason,
+                                     phase=("degraded", reason))
+                raise _Degraded(f"the lake's data rules did not migrate: {reason}",
+                                transient=False)
         # A lake written before annotations moved to memory (docs/measured_calibration.md §4.2) still
         # has them as `inputs` columns, and an upload's insert of the key
         # alone fails against them: drop them (idempotent; after the lease,
         # like every other write).
-        store.ensure_schema(lake)
-        rekeyed = store.rekey_env(lake)
-        if rekeyed:
-            _LOG.warning("bench lake: %d rows rekeyed to the envelope key without parallel", rekeyed)
+        if self.read_only:
+            self._set_data_rules("current", lake=before)
+        else:
+            store.ensure_schema(lake)
+            try:
+                migrated = data_rules.migrate(lake)
+            except Exception as e:
+                self._set_data_rules("failed", lake=before,
+                                     error=f"{type(e).__name__}: {e}")
+                raise _Degraded(
+                    f"the lake's data rules did not migrate: {type(e).__name__}: {e}",
+                    transient=not isinstance(e, data_rules.DataRulesError)) from e
+            if before == data_rules.registered_version():
+                self._set_data_rules("current", lake=before)
+            else:
+                self._set_data_rules(
+                    "current", lake=migrated.version, migration=migrated.report())
         store.annotate_all(lake, self._annotate)
-        self._start_backups(lake)
+        if not self.read_only:
+            self._start_backups(lake)
         with self._guard:
             self.lake, self.phase, self.reason = lake, "serving", ""
-        self._on_serving(lake, self.backup)
+        self._on_serving(lake, self.backup, read_only=self.read_only)
 
     def _claim(self, lease: Lease, lake_id: str, here: str) -> None:
         try:
@@ -287,6 +378,10 @@ class Gate:
         backup refusing (unconfigured, failing, behind), or the volume
         short of space."""
         lake = self.reader()
+        if self.read_only:
+            raise LakeUnavailable(
+                "writes are refused: this copy of lake "
+                f"{store.meta(lake).get('lake_id', '?')} is read-only; only the lease holder may write")
         refusal = self.backup.refusal() if self.backup is not None else None
         if refusal:
             raise LakeUnavailable(f"writes are refused: {refusal}")
@@ -301,7 +396,9 @@ class Gate:
     def health(self) -> dict:
         """For /health's detail: never raises."""
         out = {"state": self.phase, "reason": self.reason or None, "lease": self.lease_state,
-               "backup": self.backup.status() if self.backup is not None else "off"}
+               "read_only": self.read_only,
+               "backup": self.backup.status() if self.backup is not None else "off",
+               "data_rules": self.data_rules}
         try:
             free = self.lake.free_bytes() if self.lake is not None else None
             out["free_mb"] = None if free is None else free // 2**20
@@ -313,3 +410,6 @@ class Gate:
         """Tests: forget the lake (the caller closes it)."""
         with self._guard:
             self.phase, self.lake, self.backup, self._trigger = "new", None, None, None
+            self.read_only = False
+            self.data_rules = {"state": "unknown",
+                               "registered": data_rules.registered_version()}

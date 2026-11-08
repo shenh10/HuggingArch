@@ -5,7 +5,7 @@
                 annotations built (`store.annotate_all`)
   make_rows     valid CSV-row dicts (strings, as `validate_text` yields them),
                 distinct identities, any field overridable
-  annotate      a deterministic stand-in for `bench.routes.row_annotations`
+  annotate      a deterministic stand-in for `bench.annotations.row_annotations`
                 (which imports kernel_bench): same keys, no torch
   make_annotate the same with another signature prefix
 """

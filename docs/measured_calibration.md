@@ -348,7 +348,7 @@ The lake stores four tables and nothing derived (`store.py`):
 | `batches` | One row per upload: `batch_id`, `owner`, `upload_id`, `piece`, `run_id`, `label`, `created_at`, `status` (§6.1), `within_peak`, `nominated_at`, `decided_at`, `decided_by`. Unique on `(owner, upload_id, piece)`. |
 | `inputs` | An input's identity only: `input_id` and the key `(op, phase, kernel_impl, shape_json)`. |
 | `measurements` | Every CSV column (`benchmarks.ALL_COLUMNS`, typed by `store.MEASUREMENT_TYPES`) plus `id` (UUID), `batch_id`, `input_id`, `env`, `created_at`. Written sorted by `(batch_id, input_id)`. |
-| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `import_state`, `lease_claimed_at`. |
+| `lake_meta` | The lake's own facts: `lake_id` (a UUID written when the lake is created), `lake_role` (`authority` or `development`), `import_state`, `supersedes_lake_id` on a replacement, `data_rules`, and the last data-rules migration's report. |
 
 Ids are hashes of the identities they name, not counters
 (`md5_number_upper` over the identity's fields joined by `0x1F`), so two
@@ -359,15 +359,28 @@ row's `dtype_env_json` and `gpu` (`store.env_key`); the deployment
 shape (§4.2).
 
 A measurement is never updated after it is written, with two exceptions: the
-roofline columns may be restamped (§4.3), and a lake whose `env` was written
-under an older definition is rekeyed once at startup (`store.rekey_env`).
+roofline columns may be restamped (§4.3), and a registered data-rules migration
+may rekey an older lake (below). The migration owner is not an ad-hoc script:
+`backend/service/bench/data_rules.py` follows the chain registered in
+`data_rules_version.json`, whose final target is the live `rules_rev`, and a
+test refuses a key/validator edit whose target has not been registered. A
+brand-new lake is stamped with the current revision; an older lake is migrated
+after the lease is claimed and before annotations or serving. The heavy legacy
+dtype-env rewrite ships as `migrations/prod_rekey_plan.json` (the same plan
+`kernel_bench.rekey_lake` made offline), then today's validator is run over
+the rows, refused rows are deleted through the owner deletion path, and
+effective-shared duplicate identities are reduced to their earliest row.
+`data_rules` is written only after every registered step commits. A read-only
+restored copy that is behind this revision does not serve: it cannot migrate
+itself, and its rows therefore do not yet carry the guarantee the read path
+relies on.
 
 ### 4.2 Annotations
 
 An input's **annotations** are the grouping labels the uploader does not
 state: `signature`, `physical_shape`, `workload_batch`, `workload_context`,
 `catalog_kernel` and `phys`. They are pure functions of the input under the
-current code (`routes.row_annotations`, composing `physical_identity`,
+current code (`annotations.row_annotations`, composing `physical_identity`,
 `workload_coordinates` and the provider catalog's `catalog_kernel`) and are
 **not stored**. At startup the service computes them for every input into an
 in-memory table `annot` (`store.annotate_all`); an upload adds its new
@@ -375,11 +388,30 @@ inputs' annotations before it commits them, so a committed row always has
 them. An input the rules refuse has no `annot` entry: its rows are visible
 in row views but belong to no envelope.
 
-A change to the annotation rules or catalogs takes effect at the next
-service start. `routes.rules_rev` names the rules' revision: a hash of the
-source of every repository module the rules can run (their import closure),
-the engine's shared data version, and the loaded signature and kernel
-catalogs. It is part of every measurement scope (§7.1).
+A change to the annotation rules or catalogs takes effect at the next service
+start. `rules_revision.rules_rev` names the data format's revision from the
+semantic owners declared by `rules_revision.rule_inputs`:
+
+| Input | Why it can change a row or its key |
+|---|---|
+| `annotations.row_annotations`, `registered_kernels`, provider `catalog_kernel` | input annotations and the implementation catalog |
+| `benchmark_identity.current_shape`, `measured_row_migration`, `workload_coordinates` | retired/derived shape axes and workload coordinates |
+| `op_calibration.physical_identity` | signature and physical-shape projection |
+| `store.canonical_json` and the storage schema in that module | canonical identity JSON and row storage format |
+| `benchmarks.validate_row`, `row_identity` | row validity and duplicate identity |
+| dtype, activation-format, eval-format, and measured-row migration modules | vocabulary and migrations the validator/key derivation reads |
+| loaded `all_signatures()` and `registered_kernels()` | signature and kernel catalogs as data |
+| `data_rules.migrate` and `kernel_bench.rekey_lake.apply` | the migration algorithm itself |
+| `shared_data_version()` | shared migration tables read by `current_shape` |
+
+The revision hashes the source module of each declared owner, not that owner's
+transitive import closure. Connection, budget, startup, HTTP, and lookup
+execution modules are deliberately outside the boundary. It is part of every
+measurement scope (§7.1). A key, validator, shared-data, or migration change
+that can make an older lake invalid must extend the registered chain and
+regenerate `data_rules_version.json`; `test_data_rules.py` turns an
+unregistered edit red, and `test_service.py` proves lake/lookup execution
+edits do not move the revision while validator/physical-identity edits do.
 
 ### 4.3 Writes
 
@@ -428,7 +460,7 @@ refuses one not owned by the process user or granting any group or other
 permission. The container entrypoint creates `bench_lake` root-owned with
 mode 0700 and chowns only the agent's own directories (§8.1).
 
-### 4.6 The lease: one authoritative lake
+### 4.6 The lease: one authoritative, writable lake
 
 A Supabase table `public.bench_lake_lease` (one row: `lake_id`, `machine`,
 `claimed_at`) records which lake is authoritative, through the functions
@@ -445,7 +477,66 @@ it with its `lake_id` and machine id (`FLY_MACHINE_ID`, or
 An unreachable lease fails closed and is retried. A brand-new, empty lake is
 refused when the lease already names a lake: an empty volume is restored
 from backup, never started afresh. `BENCH_LAKE_LEASE=off` disables the lease
-for development and tests only.
+for development and tests only — and it never turns a copy of an identified
+lake into a second writable history:
+
+- a lake created or claimed with the lease has `lake_role=authority`;
+- a lake created without the lease has `lake_role=development` and its own
+  UUID, and can never later claim the production lease;
+- an existing unleased lake that does not say `development` (including a
+  backup restored before `lake_role` existed) serves **reads only**; `writer`
+  refuses, startup runs no data migration, maintenance and backups do not
+  write, and `/health` reports `read_only: true`.
+
+Thus `lake_id` names one lineage. Caches may key on it without adding a
+second content identity: two copies at one `lake_id` may exist for disaster
+recovery, but only the lease holder can write one.
+
+#### Replacing the authoritative lake
+
+Never upload a copied lake under its old `lake_id`. Build a replacement in a
+separate directory, give it a new lineage, upload that directory, then move
+the lease in one operator action:
+
+```bash
+# 1. From a pristine copy (never the live authority), make a new candidate.
+PYTHONPATH=. .venv/bin/python tools/reidentify_authoritative_lake.py \
+  --source-catalog /scratch1/newlake/catalog.ducklake \
+  --source-data /scratch1/newlake/data \
+  --destination /scratch1/lake-v3-candidate \
+  --migrate
+
+# 2. Apply the operator-only lease migration once (migration 0027).
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 \
+  -f supabase/migrations/0027_bench_lake_transfer_lineage.sql
+
+# 3. Publish the candidate as its own backup generation (credentials elided).
+BENCH_LAKE_CATALOG=/scratch1/lake-v3-candidate/catalog.ducklake \
+BENCH_LAKE_DATA=/scratch1/lake-v3-candidate/data \
+BENCH_LAKE_BACKUP_DATA=s3://bench-lake-backup/lake-v3 \
+BENCH_LAKE_BACKUP_S3_ENDPOINT=... BENCH_LAKE_BACKUP_S3_REGION=... \
+BENCH_LAKE_BACKUP_S3_KEY=... BENCH_LAKE_BACKUP_S3_SECRET=... \
+  .venv/bin/python scripts/bench_lake_backup_now.py
+```
+
+Restore that **new generation/prefix** into an empty production volume
+(`BENCH_LAKE_BACKUP_DATA=s3://bench-lake-backup/lake-v3` and
+`HUGGINGARCH_BENCH_RESTORE=on`). Stop the old writer first. Then, with the
+old lease's `lake_id`/machine and the candidate's new `lake_id`/machine, use
+the four-argument `bench_lake_transfer`: it changes both the machine and the
+lake lineage only when the old holder matches:
+
+```sql
+SELECT public.bench_lake_transfer(
+  '<old-machine>', '<new-machine>',
+  '<old-lake-id>'::uuid, '<new-lake-id>'::uuid);
+```
+
+Start the new service and confirm `/health` reports the new `lake_id`,
+`read_only: false`, and current data rules. The old volume and old backup
+generation are rollback artifacts, not writable peers. The two-argument
+`bench_lake_transfer(old_machine, new_machine)` remains for moving the same
+lineage between machines.
 
 ### 4.7 Backup and restore
 
@@ -526,9 +617,9 @@ The service authenticates no one. Its trust boundary is:
   empty for an anonymous caller) and `X-HA-Admin` (`1` for an admin) on a
   request that passed the secret check (`identity.py`).
 - **The HA API's proxy** (`backend/service/bench_proxy.py`) authenticates
-  the browser — a session (bearer JWT or access cookie), or on
-  `POST /api/bench/upload` also a personal access token (`hbench upload`) —
-  and forwards `/api/bench/*` with headers built fresh: the body's
+  the browser — a session (bearer JWT or access cookie), with a personal access
+  token accepted only on the measurement pipeline's upload, nominate and promote
+  routes — and forwards `/api/bench/*` with headers built fresh: the body's
   `Content-Type` and the three `X-HA-*` headers it alone sets. No browser
   header, cookie or `X-HA-*` header crosses. Bodies stream both ways.
   Timeouts: reads 30 s, writes 120 s, connect 2 s; a client disconnect
@@ -621,6 +712,10 @@ The service's `/health` never reads the lake and never fails: it reports the
 gate's state and reason, the lease state, the backup's status (newest
 recoverable snapshot, lag, last error), free space, and lookup statistics
 (count, keys, rows, rows per key, the largest answer, refusals, the bound).
+The gate also reports `data_rules`: the registered revision, the lake's
+revision while a migration is pending, the completed migration's counts, or
+the migration error. A lake behind or failed is `degraded`, and the HA API's
+`kernel_bench` health carries that state instead of reporting the service up.
 The HA API's `/health` includes it (`bench_proxy.bench_health`, bounded at
 2 s).
 
@@ -658,6 +753,13 @@ batches has.
 An admin may also publish an upload directly as shared (`hbench upload
 --public`). The owner may delete a run, an upload or selected rows at any
 status; deleting a shared row removes it from the shared corpus.
+
+The H100 and RTX-4090 harvesters use the same public review flow
+(`tools/upload_to_authoritative_lake.py`): a personal access token of the
+contributor/admin account, upload private, nominate `within_peak`, promote.
+The loopback service on port 8100 is not an upload target; a local lake is a
+restore of the authoritative backup. The queue may still ask that local copy
+the read-only coverage question while it plans work.
 
 ### 6.3 How private and shared rows merge
 
@@ -731,11 +833,13 @@ snapshot. One projection decides membership — the service's current
 annotations — and the client indexes each row under the key that selected
 it, never re-projecting the row's stored shape (`registry_from_lookup`).
 
-**Validation.** Every row is checked under the current validator
-(`benchmarks.RowCheck`). A shared row that fails, or repeats another shared
-row's identity, fails the lookup with 500 rather than silently dropping a
-public measurement. An owner's row that fails is left out and counted
-(`excluded_mine`), and `/api/bench/calibration` reports why.
+**Validation.** The write path validates every upload, and a validator change
+is applied to the lake by the registered data-rules migration before it serves
+(§4.1). Lookup does not re-run Python's validator for every selected row in
+every process; that defense cost about 80 µs per row and was a read-path
+duplicate of the migration owner. `/api/bench/calibration` still validates and
+explains one owner's rows on its own page. `excluded_mine` remains in the wire
+contract and is zero for a validated, migrated lake.
 
 **Wire form.** A row travels as the columns the estimator's registry reads
 (`op_calibration.ROW_COLUMNS`: the 12-column identity, the measurement,
@@ -750,7 +854,7 @@ estimate never reads stays in the lake.
 | Keys per lookup (`lookup.MAX_KEYS`) | 20,000 | Request refused. |
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
 | In-memory selection table (`Selection.BUDGET_BYTES`) | 32 MiB (~500k rows) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
-| Row verdicts held by the service (`Verdicts`) | 120,000 rows | Each row's validator verdict is remembered by id. |
+| Row cells held by the service (`Verdicts`) | 120,000 rows | Lookup's cells are remembered by id; owner calibration computes validator verdicts. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
 
@@ -900,7 +1004,11 @@ prints the exports the API, workers, warm and service need, `run` execs the
 service with the `BENCH_LAKE_*` settings from `.env`, and `pid` / `health`
 report its state. A local lake uses a file catalog in a local directory,
 usually with `BENCH_LAKE_LEASE=off` and `BENCH_LAKE_BACKUP=off` (or a local
-backup directory).
+backup directory). A fresh local lake is created as `lake_role=development`
+with its own UUID and may write. Restoring an authoritative backup locally is
+for reads and debugging: without the lease it stays read-only even when
+`BENCH_LAKE_LEASE=off`. Never change that copy's `lake_id` by hand; build a
+new development lake instead.
 
 ---
 
@@ -919,13 +1027,17 @@ backup directory).
 | Plan, run, check, upload CLI (`hbench`) | `kernel_bench/cli.py`, [`kernel_bench/README.md`](../kernel_bench/README.md) |
 | Lake instance, locks, content identity | `backend/service/bench/lake.py` |
 | Tables and writes | `backend/service/bench/store.py` |
+| Registered lake data-format migrations | `backend/service/bench/data_rules.py`, `backend/service/bench/data_rules_version.json` |
 | Kernel Bench page views | `backend/service/bench/browse.py` |
 | Batch pages | `backend/service/bench/sets.py` |
 | Estimate lookup (service side) | `backend/service/bench/lookup.py` |
 | Startup gate, lease, restore | `backend/service/bench/serving.py` |
+| Replacement lake lineage | `tools/reidentify_authoritative_lake.py`, `supabase/migrations/0027_bench_lake_transfer_lineage.sql` |
 | Backup and restore | `backend/service/bench/backup.py`, `scripts/bench_lake_backup_now.py` |
 | Maintainer | `backend/service/bench/maintain.py` |
-| HTTP routes, annotation rules, `rules_rev` | `backend/service/bench/routes.py` |
+| Annotation rules and kernel catalog | `backend/service/bench/annotations.py` |
+| Data-rules revision boundary | `backend/service/bench/rules_revision.py` |
+| Kernel Bench HTTP routes | `backend/service/bench/routes.py` |
 | Service process, trust boundary | `backend/service/bench/server.py`, `backend/service/bench/identity.py` |
 | API proxy | `backend/service/bench_proxy.py` |
 | Measurement scope, result identity | `backend/measure/scope.py`, `backend/api/_access.py` |

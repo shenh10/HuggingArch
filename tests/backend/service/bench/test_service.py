@@ -14,8 +14,7 @@ from fastapi.testclient import TestClient
 
 import tests.corpus_row as _corpus
 from backend.measure.scope import MeasurementScope
-from backend.service.bench import lake as lake_mod
-from backend.service.bench import routes as R
+from backend.service.bench import annotations as A
 from backend.service.bench import store
 
 from ..conftest import BENCH_SECRET, as_user
@@ -41,7 +40,7 @@ def _upload(client, user: str, rows: list, *, public: bool = False) -> dict:
 
 def _key(row: dict) -> dict:
     """The lookup key an estimate builds for the row's physical op."""
-    ann = R.row_annotations(row)
+    ann = A.row_annotations(row)
     return {"signature": ann["signature"], "physical_shape": ann["physical_shape"],
             "dtype_env_json": row["dtype_env_json"], "gpu": row["gpu"], "phase": row["phase"]}
 
@@ -169,13 +168,13 @@ class TestLookup:
             if dims.get("d_head") == 64:
                 dims["d_head"] = 128
             return json.dumps(dims, sort_keys=True, separators=(",", ":"))
-        monkeypatch.setattr(R, "current_shape", migrate)
+        monkeypatch.setattr(A, "current_shape", migrate)
         stored = json.loads(_row(0)["shape_json"])
         stored["d_head"] = 64
         row = _corpus.row(shape_json=json.dumps(stored, sort_keys=True, separators=(",", ":")))
         _upload(bench_client, ADMIN, [row], public=True)
         current = _key(row)
-        raw = {**current, "physical_shape": R.physical_identity(
+        raw = {**current, "physical_shape": A.physical_identity(
             row["op"], row["shape_json"])["physical_shape"]}
         assert json.loads(current["physical_shape"])["d_head"] == 128
         assert json.loads(raw["physical_shape"])["d_head"] == 64
@@ -183,26 +182,29 @@ class TestLookup:
         assert len(got[0]) == 1 and got[1] == []
         assert json.loads(got[0][0]["shape_json"])["d_head"] == 64
 
-    def test_an_invalid_shared_row_fails_an_invalid_owners_row_is_counted(
-            self, bench_client, bench_lake):
+    def test_the_write_path_refuses_bad_rows_and_lookup_does_not_revalidate(
+            self, bench_client, bench_lake, monkeypatch):
         old = _corpus.row(contributor="old", shape_json=json.dumps(
             {"B": 1, "H": 4, "s_ctx": 77}, sort_keys=True, separators=(",", ":")))
         good = _row(0)
         bench_client.get("/api/bench/list", headers=as_user(ALICE))       # the lake serves
-        lake = lake_mod.get_lake()
-        store.upload(lake, owner=ALICE, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old, good], annotate=R.row_annotations)
+        refused = bench_client.post("/api/bench/upload", headers=as_user(ALICE), json={
+            "csv_text": _corpus.to_csv([old]), "label": "old"})
+        assert refused.status_code == 422
+        assert "unknown symbol 'H'" in refused.json()["detail"]
+        _upload(bench_client, ALICE, [good])
         keys = [_key(old), _key(good)]
-        got = _lookup(bench_client, keys, owner=ALICE)
-        assert got["excluded_mine"] == 1
-        assert [len(k) for k in got["rows"]] == [0, 1]
         report = bench_client.get("/api/bench/calibration", headers=as_user(ALICE)).json()
-        assert (report["rows_used"], report["rows_rejected"]) == (1, 1)
-        assert "unknown symbol 'H'" in report["rejected_reasons"][0]["reason"]
-        store.upload(lake, owner=BOB, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=[old], annotate=R.row_annotations, status="shared", decided_by=ADMIN)
-        r = bench_client.post("/internal/bench/lookup", json={"keys": keys})
-        assert r.status_code == 500 and "fails the validator" in r.json()["detail"]
+        assert report["rows_rejected"] == 0
+        from backend.inference import benchmarks
+
+        def unreachable(_row):
+            raise AssertionError("lookup must not run the row validator")
+
+        monkeypatch.setattr(benchmarks, "validate_row", unreachable)
+        got = _lookup(bench_client, keys, owner=ALICE)
+        assert got["excluded_mine"] == 0
+        assert [len(k) for k in got["rows"]] == [0, 1]
 
     def test_bounds(self, bench_client, bench_lake):
         bench_client.get("/api/bench/list", headers=as_user(ALICE))
@@ -255,25 +257,45 @@ class TestVersion:
                 report["rows_rejected"]) == (1, 1, 0)
 
 
-def test_rules_rev_covers_the_annotation_closure():
-    """The revision hashes every module the annotation rules can run —
-    `current_shape`'s and `project_shape_for_op`'s module, the signature
-    catalog, the canonicalization, kernel_bench's catalog — not only the
-    entry points."""
-    import ast
-    seen = set()
-    todo = list(R.rule_roots())
-    while todo:
-        name = todo.pop()
-        if name in seen or R._module_file(name) is None:
-            continue
-        seen.add(name)
-        todo.extend(R._imports(R._module_file(name), name))
-    for module in ("backend.inference.benchmark_identity", "backend.inference.op_signatures",
-                   "backend.inference.op_signatures_catalog", "backend.arch.spec_migrate",
-                   "backend.service.bench.store", "kernel_bench.providers"):
-        assert module in seen, module
-    assert ast and len(R.rules_rev()) == 16
+def test_rules_rev_follows_the_declared_rule_boundary(monkeypatch):
+    """Connection and lookup execution code is infrastructure; the validator
+    and physical identity are rules.  The revision must say which is which."""
+    from pathlib import Path
+    from importlib import import_module
+    from backend.service.bench import lake as bench_lake
+    from backend.service.bench import lookup as bench_lookup
+    from backend.service.bench import rules_revision
+    from backend.inference import benchmarks
+    from backend.inference.op_calibration import physical_identity
+
+    owners = {entry.owner.__module__ if callable(entry.owner)
+              else entry.owner.__name__ for entry in rules_revision.rule_inputs()}
+    assert "backend.inference.benchmarks" in owners
+    assert "backend.inference.op_calibration" in owners
+    assert "backend.service.bench.data_rules" in owners
+    assert not {"backend.service.bench.lake", "backend.service.bench.lookup",
+                "backend.service.bench.serving"} & owners
+
+    def with_probe(path: Path, marker: str) -> str:
+        rules_revision.rules_rev.cache_clear()
+        original = path.read_bytes()
+        path.write_bytes(original + f"\n# {marker}\n".encode())
+        try:
+            rules_revision.rules_rev.cache_clear()
+            return rules_revision.rules_rev()
+        finally:
+            path.write_bytes(original)
+            rules_revision.rules_rev.cache_clear()
+
+    assert with_probe(Path(bench_lake.__file__), "connection-budget probe") == (
+        rules_revision.rules_rev())
+    assert with_probe(Path(bench_lookup.__file__), "lookup execution probe") == (
+        rules_revision.rules_rev())
+    assert with_probe(Path(benchmarks.__file__), "validator probe") != (
+        rules_revision.rules_rev())
+    identity_module = import_module(physical_identity.__module__)
+    assert with_probe(Path(identity_module.__file__),
+                      "physical identity probe") != rules_revision.rules_rev()
 
 
 def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
@@ -297,10 +319,10 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
         def catalog_kernel(kernel_impl):
             return kernel_impl.upper()
 
-    monkeypatch.setattr(R, "current_shape", current_shape)
-    monkeypatch.setattr(R, "physical_identity", physical_identity)
-    monkeypatch.setattr(R, "_catalog", lambda: Catalog)
-    R._shape_identity.cache_clear()
+    monkeypatch.setattr(A, "current_shape", current_shape)
+    monkeypatch.setattr(A, "physical_identity", physical_identity)
+    monkeypatch.setattr(A, "_catalog", lambda: Catalog)
+    A._shape_identity.cache_clear()
     try:
         shape = _row(0)["shape_json"]
         rows = [
@@ -309,9 +331,9 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
             for phase in ("decode", "prefill")
             for impl in ("a", "b")
         ]
-        answers = [R.row_annotations(row) for row in rows]
+        answers = [A.row_annotations(row) for row in rows]
     finally:
-        R._shape_identity.cache_clear()
+        A._shape_identity.cache_clear()
     assert calls == {"shape": 1, "identity": 1}
     assert {answer["catalog_kernel"] for answer in answers} == {"A", "B"}
 
@@ -408,14 +430,14 @@ import sys, json, uuid
 sys.path.insert(0, {str(root)!r})
 import tests.corpus_row as C
 from fastapi.testclient import TestClient
-from backend.service.bench import server, routes as R
+from backend.service.bench import annotations as A, server
 app = server.create_app(start_lake=False)
 c = TestClient(app, client=("127.0.0.1", 1), headers={{"X-HA-Internal": "s"}})
 admin = {{"X-HA-User": str(uuid.uuid4()), "X-HA-Admin": "1"}}
 r = c.post("/api/bench/upload", headers=admin, json={{"csv_text": C.to_csv([C.row()]), "make_public": True}})
 assert r.status_code == 200, r.text
 row = C.row()
-ann = R.row_annotations(row)
+ann = A.row_annotations(row)
 key = {{"signature": ann["signature"], "physical_shape": ann["physical_shape"],
        "dtype_env_json": row["dtype_env_json"], "gpu": row["gpu"], "phase": row["phase"]}}
 v = c.get("/internal/bench/version").json()

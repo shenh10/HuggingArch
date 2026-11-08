@@ -17,14 +17,14 @@ answer always matches the identity it was asked for. The annotations are joined 
 deleted, so every input of an old snapshot has its entry, and an entry of an
 input added later joins no row of the old snapshot (tests pin both).
 
-Validation is the shared-corpus export's as it was (`benchmarks.RowCheck`): a shared row is valid
-by construction (upload and promote take only validated rows), so one that
-fails the current validator, or repeats another shared row's identity, fails
-the lookup (`InvalidSharedRow`, a 500, logged) rather than quietly dropping
-a public measurement; an owner's row that fails is left out and counted
-(`excluded_mine`). A row's verdict under this process's validator is
-remembered by row id (rows are never edited; the validator changes only with
-the code, at a restart).
+Validity is owned by the write path and the registered data-rules migration,
+not by this hot read path. Upload validates every new row; when the validator
+changes, the registered migration updates or removes the rows it now refuses
+before `lake_meta.data_rules` reaches the live revision and the lake serves.
+Lookup sends the selected rows without re-running Python's validator for
+every row in every process. `/api/bench/calibration` still reports an owner's
+rows under the current validator; it is a page over that owner's rows, not
+the estimate's hot path.
 
 Rows travel as the CSV cells the estimator's registry reads
 (`op_calibration.ROW_COLUMNS`: the identity and the measurement — the text
@@ -123,11 +123,6 @@ class LookupStats:
                     "refused": self.refused, "max_rows_allowed": MAX_ROWS}
 
 
-class InvalidSharedRow(RuntimeError):
-    """A shared row the current validator refuses: an integrity bug, never
-    an empty answer (the route answers 500 and logs it)."""
-
-
 def _q(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
@@ -159,7 +154,8 @@ class Verdicts:
     columns only for rows it does not hold (the narrow join that selects
     rows is most of a warm lookup). A row is held as the cells a lookup
     sends (`ROW_COLUMNS`, interned: a shape or a dtype env is one string
-    however many rows repeat it) and its verdict."""
+    however many rows repeat it) and its verdict. Lookup asks for cells with
+    `validate=False`; owner reporting asks for the current verdict."""
 
     def __init__(self, max_entries: int = 120_000):
         self._max = max_entries
@@ -174,14 +170,16 @@ class Verdicts:
                 self._memo.move_to_end(row_id)
             return got
 
-    def put(self, row_id: str, cells: Mapping[str, str]) -> tuple:
+    def put(self, row_id: str, cells: Mapping[str, str], *,
+            validate: bool = True) -> tuple:
         """Hold a row read from the lake (all its cells, `ALL_COLUMNS`): the
-        cells a lookup sends and its verdict."""
-        try:
-            _benchmarks.validate_row(dict(cells))
-            why = None
-        except _benchmarks.BenchmarkValidationError as e:
-            why = str(e)
+        cells a lookup sends, and its verdict when the caller asked for one."""
+        why = None
+        if validate:
+            try:
+                _benchmarks.validate_row(dict(cells))
+            except _benchmarks.BenchmarkValidationError as e:
+                why = str(e)
         entry = (tuple(sys.intern(cells[c]) for c in ROW_COLUMNS), why)
         with self._lock:
             self._memo[row_id] = entry
@@ -245,7 +243,8 @@ def _entries(lake: Lake, found: Sequence[Mapping[str, Any]], snapshot: int,
                 f"AT (VERSION => ?) WHERE m.input_id IN ({inputs})", [snapshot]):
             if r["id"] in missing:
                 out[r["id"]] = verdicts.put(
-                    r["id"], {c: _cell(r[c]) for c in _benchmarks.ALL_COLUMNS})
+                    r["id"], {c: _cell(r[c]) for c in _benchmarks.ALL_COLUMNS},
+                    validate=False)
     return out
 
 
@@ -404,7 +403,6 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
             f"{len(found)} candidate rows for {len(keys)} keys, over the lookup's "
             f"bound of {MAX_ROWS}: ask fewer keys")
     entries = _entries(lake, found, snapshot, verdicts)
-    shared_gate, mine_gate = _Gate(), _Gate()
     shared_rows: list[list[list[int]]] = [[] for _ in keys]
     mine_rows: list[list[list[int]]] = [[] for _ in keys]
     excluded = 0
@@ -420,16 +418,8 @@ def lookup(lake: Lake, keys: Sequence[Mapping[str, str]], *, owner: Optional[str
                 key["dtype_env_json"], key["gpu"], key["phase"]):
             continue
         if r["shared"]:
-            why = shared_gate.reason(r["id"], entry)
-            if why is not None:
-                _LOG.error("Kernel Bench lookup: shared row %s fails the validator: %s",
-                           r["id"], why)
-                raise InvalidSharedRow(f"shared row {r['id']} fails the validator: {why}")
             shared_rows[r["idx"]].append(cells_of(entry, "shared"))
         if r["mine"]:
-            if mine_gate.reason(r["id"], entry) is not None:
-                excluded += 1
-                continue
             mine_rows[r["idx"]].append(cells_of(entry, "mine"))
     for i in range(len(keys)):
         out[i] = shared_rows[i] + mine_rows[i]

@@ -20,7 +20,10 @@ import pytest
 
 from tests.backend.service.bench.pg import SOCKET, scratch_database
 
-_INIT = Path(__file__).resolve().parents[4] / "supabase/init.sql"
+_ROOT = Path(__file__).resolve().parents[4]
+_INIT = _ROOT / "supabase/init.sql"
+_TRANSFER_LAKE = (_ROOT / "supabase" / "migrations"
+                  / "0027_bench_lake_transfer_lineage.sql")
 _PSQL = "/tmp/pgenv/bin/psql"
 _FRESH = "/tmp/pg_fresh_db.sh"
 _DB = f"bench_lease_test_{os.getpid()}"
@@ -36,7 +39,12 @@ def con():
         (Path(src) / "supabase" / "migrations").mkdir(parents=True)
         (Path(src) / "supabase" / "init.sql").write_text(_INIT.read_text())
         out = subprocess.run(["bash", _FRESH, _DB, src], capture_output=True, text=True,
-                             timeout=300, check=False)
+                              timeout=300, check=False)
+        assert out.returncode == 0, out.stderr
+        out = subprocess.run(
+            [_PSQL, "-h", SOCKET, "-d", _DB, "-v", "ON_ERROR_STOP=1",
+             "-f", str(_TRANSFER_LAKE)], capture_output=True, text=True,
+            timeout=300, check=False)
         assert out.returncode == 0, out.stderr
         conns = []
 
@@ -88,6 +96,18 @@ def test_transfer_moves_the_machine_only_from_the_holder(con):
     assert [r[:2] for r in _lease(c)] == [[A, "m-2"]]
 
 
+def test_transfer_can_move_a_new_lake_lineage_only_from_the_holder(con):
+    c = con()
+    _claim(c, A, "m-1")
+    assert c.run(
+        "SELECT public.bench_lake_transfer('m-9', 'm-2', CAST(:a AS uuid), "
+        "CAST(:b AS uuid))", a=A, b=B) == [["refused"]]
+    assert c.run(
+        "SELECT public.bench_lake_transfer('m-1', 'm-2', CAST(:a AS uuid), "
+        "CAST(:b AS uuid))", a=A, b=B) == [["moved"]]
+    assert [r[:2] for r in _lease(c)] == [[B, "m-2"]]
+
+
 def test_one_row_only(con):
     c = con()
     _claim(c, A)
@@ -126,4 +146,9 @@ def test_service_role_only(con):
         "SELECT r, has_function_privilege(r, 'public.bench_lake_transfer(text, text)', 'EXECUTE')"
         " FROM unnest(ARRAY['anon', 'authenticated', 'service_role']) r"))
     assert transfer == {"anon": False, "authenticated": False, "service_role": False}
+    transfer_lake = dict(c.run(
+        "SELECT r, has_function_privilege(r, 'public.bench_lake_transfer("
+        "text, text, uuid, uuid)', 'EXECUTE')"
+        " FROM unnest(ARRAY['anon', 'authenticated', 'service_role']) r"))
+    assert transfer_lake == {"anon": False, "authenticated": False, "service_role": False}
     assert not c.run("SELECT has_table_privilege('service_role', 'public.bench_lake_lease', 'UPDATE')")[0][0]

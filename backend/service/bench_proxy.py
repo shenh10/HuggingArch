@@ -3,10 +3,9 @@
 
 The service (`backend.service.bench.server`, 127.0.0.1) owns the lake and
 authenticates no one. This proxy does, as the bench routes did before they
-moved: a session (bearer JWT or the scheme's access cookie) — and on
-`POST /api/bench/upload`, as before, a personal access token too (`hbench
-upload`). Credentials that do not verify are 401 here and never reach the
-service. Then it forwards:
+moved: a session (bearer JWT or the scheme's access cookie), and a personal
+access token on the measurement pipeline's upload, nominate and promote routes.
+Credentials that do not verify are 401 here and never reach the service. Then it forwards:
 
   * headers built fresh — the body's `Content-Type`, and the three it alone
     sets: `X-HA-User` (the user id; empty when anonymous), `X-HA-Admin` (`1`
@@ -93,9 +92,17 @@ def _unavailable(why: str) -> JSONResponse:
 
 def _caller(request: Request) -> Optional[dict]:
     """The verified caller (401 for credentials that do not verify), None
-    when anonymous: a session — or a personal access token on an upload."""
+    when anonymous: a session — or a personal access token on the measurement
+    pipeline's upload, nominate and promote routes.  A one-hour session JWT is
+    not a credential a GPU box can use."""
     authorization = request.headers.get("authorization")
-    if request.method == "POST" and request.url.path == "/api/bench/upload":
+    parts = request.url.path.strip("/").split("/")
+    pipeline = (
+        request.method == "POST" and (
+            request.url.path in ("/api/bench/upload", "/api/bench/promote")
+            or (len(parts) in (4, 5) and parts[:2] == ["api", "bench"]
+                and parts[-1] == "contribute")))
+    if pipeline:
         return _auth.user_or_pat(authorization, _auth.session_cookie(request))
     return _auth.get_current_user(request, authorization)
 
@@ -185,7 +192,9 @@ async def forward(request: Request) -> Response:
 
 async def bench_health() -> dict:
     """`/health`'s Kernel Bench detail: the service's own health (its lake's
-    state, never a lake read there), or why it cannot be had."""
+    state, never a lake read there), or why it cannot be had.  A lake that is
+    starting a required data migration, or failed one, is reported at this
+    level as `degraded`; `/health` must not call an unmigrated lake `up`."""
     base = measurements.service_url()
     if not base:
         return {"state": "not_configured"}
@@ -197,7 +206,13 @@ async def bench_health() -> dict:
         return {"state": "unreachable", "reason": f"{type(e).__name__}: {e}"}
     if r.status_code != 200:
         return {"state": "unreachable", "reason": f"the service answered {r.status_code}"}
-    return {"state": "up", **r.json()}
+    body = r.json()
+    out = dict(body)
+    out.setdefault("state", "up")
+    lake = out.get("lake")
+    if isinstance(lake, dict) and lake.get("state") in ("degraded", "unavailable"):
+        out["state"] = "degraded"
+    return out
 
 
 def install(app: Any, health_detail: Callable[[str, Any], None]) -> None:

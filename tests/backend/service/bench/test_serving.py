@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from collections import namedtuple
 
 import httpx
@@ -68,6 +69,11 @@ def _gate(opened, **kw):
     return serving.Gate(annotate=make_annotator(), open_lake=opened, **kw)
 
 
+def _dev_schema(lake, **meta):
+    """An unleased lake that is allowed to write: its own development role."""
+    store.ensure_schema(lake, lake_role="development", **meta)
+
+
 def _no_holder(httpx_mock):
     httpx_mock.add_response(method="GET", url=LEASE_URL, json=[])
 
@@ -86,7 +92,7 @@ def test_a_new_lake_with_no_lease_holder_claims_it(env, opened, httpx_mock):
     _no_holder(httpx_mock)
     _claim(httpx_mock, "claimed")
     served = []
-    gate = _gate(opened, on_serving=lambda lake, backup: served.append((lake, backup)))
+    gate = _gate(opened, on_serving=lambda lake, backup, read_only=False: served.append((lake, backup)))
     lake = gate.reader()
     meta = store.meta(lake)
     assert meta["import_state"] == "none"
@@ -94,6 +100,8 @@ def test_a_new_lake_with_no_lease_holder_claims_it(env, opened, httpx_mock):
     assert gate.lease_state == "claimed" and served == [(lake, None)]
     req = httpx_mock.get_requests(method="POST", url=CLAIM_URL)[0]
     assert req.headers["apikey"] == TEST_SERVICE_KEY
+    assert meta["data_rules"] == serving.data_rules.registered_version()
+    assert gate.health()["data_rules"]["state"] == "current"
 
 
 def test_an_empty_lake_while_another_holds_the_lease_writes_nothing(env, opened, httpx_mock):
@@ -190,6 +198,57 @@ def test_the_lease_off_is_explicit(env, opened, httpx_mock, caplog):
     assert gate.health()["lease"] == "off"
 
 
+def test_an_unleased_copy_of_an_identified_lake_is_read_only(env, opened, make_rows, annotate):
+    """`LEASE=off` is not a licence to fork an authoritative lake_id."""
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    lake = opened()
+    _dev_schema(lake, lake_id="11111111-1111-4111-8111-111111111111")
+    store.set_meta(lake, lake_role="authority")
+    serving.data_rules.initialize(lake)
+    store.annotate_all(lake, annotate)
+    store.upload(lake, owner="11111111-1111-4111-8111-111111111111",
+                 upload_id="22222222-2222-4222-8222-222222222222", run_id=None,
+                 label=None, rows=make_rows(1), annotate=annotate)
+    gate = _gate(opened)
+    assert gate.reader().read(
+        "SELECT count(*) AS n FROM lake.measurements")[0]["n"] == 1
+    with pytest.raises(LakeUnavailable, match=r"read-only.*lease holder"):
+        gate.writer()
+    health = gate.health()
+    assert health["state"] == "serving" and health["read_only"] is True
+
+
+def test_a_read_only_copy_behind_the_data_rules_does_not_serve_unvalidated_rows(
+        env, opened):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    lake = opened()
+    _dev_schema(lake, lake_id="11111111-1111-4111-8111-111111111111")
+    store.set_meta(lake, lake_role="authority")
+    gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="read-only copy's data rules"):
+        gate.reader()
+    health = gate.health()
+    assert health["state"] == "degraded" and health["read_only"] is True
+    assert health["data_rules"]["state"] == "failed"
+
+
+def test_an_unleased_development_lake_has_its_own_writable_identity(env, opened):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    _dev_schema(opened(), lake_id="11111111-1111-4111-8111-111111111111")
+    gate = _gate(opened)
+    gate.writer()
+    assert store.meta(gate.lake)["lake_role"] == "development"
+
+
+def test_a_development_lake_cannot_become_the_authority_by_turning_the_lease_on(
+        env, opened):
+    _dev_schema(opened(), lake_id="11111111-1111-4111-8111-111111111111")
+    gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="development lake cannot claim"):
+        gate.reader()
+    assert gate.phase == "unavailable"
+
+
 def test_no_supabase_and_the_lease_on_is_503(env, opened, monkeypatch):
     monkeypatch.delenv("SUPABASE_URL")
     with pytest.raises(LakeUnavailable, match="Supabase is not configured"):
@@ -212,7 +271,7 @@ def test_a_lake_left_mid_import_is_refused(env, opened):
 @pytest.mark.parametrize("state", ["verified", "none"])
 def test_an_imported_or_importless_lake_serves(env, opened, state):
     env.setenv("BENCH_LAKE_LEASE", "off")
-    store.ensure_schema(opened(), lake_id="x", import_state=state)
+    _dev_schema(opened(), lake_id="x", import_state=state)
     gate = _gate(opened)
     gate.reader()
     assert gate.phase == "serving"
@@ -226,6 +285,82 @@ def test_a_lake_made_before_lake_meta_gets_an_identity(env, opened):
     assert meta["import_state"] == "none" and len(meta["lake_id"]) == 36
 
 
+def test_an_old_lake_migrates_its_data_rules_before_it_serves(
+        env, opened, make_rows, annotate, new_owner):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    lake = opened()
+    _dev_schema(lake, lake_id="x", import_state="none")
+    store.annotate_all(lake, annotate)
+    store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()), run_id=None,
+                 label=None, rows=make_rows(1), annotate=annotate)
+    assert "data_rules" not in store.meta(lake)
+    gate = _gate(opened)
+    gate.reader()
+    assert store.meta(lake)["data_rules"] == serving.data_rules.registered_version()
+    assert gate.health()["data_rules"] == {
+        "state": "current", "registered": serving.data_rules.registered_version(),
+        "lake": serving.data_rules.registered_version(),
+        "migration": {"rekeyed_rows": 0, "env_rekeyed_rows": 0,
+                      "dropped_shared_rows": 0, "reasons": {}},
+    }
+
+
+def test_a_lake_behind_is_degraded_while_it_migrates_and_failed_migrations_stay_degraded(
+        env, opened, monkeypatch):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    _dev_schema(opened(), lake_id="x", import_state="none")
+    gate = None
+    real = serving.data_rules.migrate
+
+    def migrating(lake):
+        health = gate.health()
+        assert health["state"] == "degraded"
+        assert health["data_rules"]["state"] == "behind"
+        assert "migrating" in health["reason"]
+        return real(lake)
+
+    monkeypatch.setattr(serving.data_rules, "migrate", migrating)
+    gate = _gate(opened)
+    gate.reader()
+    assert gate.phase == "serving"
+
+    def failed(_lake):
+        raise RuntimeError("the plan is truncated")
+
+    store.set_meta(opened(), data_rules="legacy")
+    monkeypatch.setattr(serving.data_rules, "migrate", failed)
+    failed_gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="the plan is truncated"):
+        failed_gate.reader()
+    health = failed_gate.health()
+    assert health["state"] == "degraded"
+    assert health["data_rules"]["state"] == "failed"
+    assert health["data_rules"]["error"] == "RuntimeError: the plan is truncated"
+
+
+def test_an_unregistered_lake_version_is_refused_before_any_schema_write(
+        env, opened, monkeypatch):
+    env.setenv("BENCH_LAKE_LEASE", "off")
+    _dev_schema(opened(), lake_id="x", import_state="none")
+    store.set_meta(opened(), data_rules="from-a-newer-deployment")
+
+    def refused(*_args, **_kwargs):
+        raise AssertionError("an unregistered lake must not reach ensure_schema")
+
+    monkeypatch.setattr(store, "ensure_schema", refused)
+    gate = _gate(opened)
+    with pytest.raises(LakeUnavailable, match="outside this deployment"):
+        gate.reader()
+    health = gate.health()
+    assert health["state"] == "degraded"
+    assert health["data_rules"] == {
+        "state": "failed", "registered": serving.data_rules.registered_version(),
+        "lake": "from-a-newer-deployment",
+        "error": "the lake's data rules are 'from-a-newer-deployment', outside "
+                 "this deployment's registered chain",
+    }
+
+
 # --- annotations --------------------------------------------------------------------------
 
 def test_every_input_is_annotated_in_memory_before_the_lake_serves(env, opened, make_rows):
@@ -233,7 +368,7 @@ def test_every_input_is_annotated_in_memory_before_the_lake_serves(env, opened, 
     given before it serves; nothing of it is stored."""
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
-    store.ensure_schema(lake, lake_id="x", import_state="none")
+    _dev_schema(lake, lake_id="x", import_state="none")
     store.annotate_all(lake, make_annotator())
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
@@ -242,7 +377,7 @@ def test_every_input_is_annotated_in_memory_before_the_lake_serves(env, opened, 
     other = make_annotator(prefix="sig2")
     seen = []
 
-    def on_serving(lk, backup):
+    def on_serving(lk, backup, read_only=False):
         seen.append(lk.read("SELECT * FROM lake.inputs i JOIN annot a USING (input_id)"))
     gate = serving.Gate(annotate=other, open_lake=opened, on_serving=on_serving)
     gate.reader()
@@ -255,7 +390,7 @@ def test_every_input_is_annotated_in_memory_before_the_lake_serves(env, opened, 
 def test_a_catalog_that_cannot_load_holds_the_startup(env, opened, make_rows):
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
-    store.ensure_schema(lake, lake_id="x", import_state="none")
+    _dev_schema(lake, lake_id="x", import_state="none")
     store.annotate_all(lake, make_annotator())
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
@@ -274,7 +409,7 @@ def test_startup_backs_up_before_writes(env, opened, tmp_path, make_rows, annota
     env.setenv("BENCH_LAKE_LEASE", "off")
     env.delenv("BENCH_LAKE_BACKUP")
     lake = opened()
-    store.ensure_schema(lake, lake_id="x", import_state="none")
+    _dev_schema(lake, lake_id="x", import_state="none")
     store.annotate_all(lake, annotate)
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
@@ -412,7 +547,7 @@ def test_the_gate_drops_stored_annotation_columns_of_an_old_lake(env, opened, ma
     works on it."""
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
-    store.ensure_schema(lake, lake_id="x", import_state="none")
+    _dev_schema(lake, lake_id="x", import_state="none")
     lake.transact(lambda cur: cur.execute(
         "ALTER TABLE lake.inputs ADD COLUMN signature VARCHAR"))
     gate = serving.Gate(annotate=make_annotator(), open_lake=opened)

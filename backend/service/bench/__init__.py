@@ -9,6 +9,8 @@ grouping labels) are computed in memory at startup and for each new input
             root-only directories); reads, write transactions with retry,
             the owner / inputs / maintainer / backup locks, the free-space check
   store     writes: upload, review state, deletion; the in-memory annotations
+  annotations the input rules and their revision (`rules_rev`) that decide
+            which rows a lookup key selects
   browse    the Kernel Bench page's views (envelope, rows, workload, curves,
             coverage, facets)
   sets      the batch pages: list, summary, rows, overlap, nominations
@@ -21,8 +23,7 @@ grouping labels) are computed in memory at startup and for each new input
   lookup    the measurements an estimate reads (rows per requested key, at a
             pinned snapshot), the owner's calibration report, the snapshot
             the shared rows last changed at
-  routes    the HTTP routes (`/api/bench/*`, `/internal/bench/*`) and the
-            annotation rules composed with kernel_bench's catalog
+  routes    the HTTP routes (`/api/bench/*`, `/internal/bench/*`)
   identity  who a request is for: the headers the HA API forwards
   server    the Kernel Bench service: `python -m backend.service.bench.server`,
             the one process that opens the lake (docs/measured_calibration.md §5.1)
