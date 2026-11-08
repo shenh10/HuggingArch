@@ -26,6 +26,7 @@ import httpx
 
 from backend.api._app import app
 from backend.service import auth as _auth
+from backend.service import rate_limit as _rate_limit
 from backend.service import agent_credentials as _creds
 from backend.service import crypto as _crypto
 from backend.service import spec_generations as _gens
@@ -215,6 +216,7 @@ async def upload_avatar(
     profiles.avatar_url and removes any previously stored avatar
     objects under <user_id>/. Returns the new URL.
     """
+    _rate_limit.starts_work()       # each upload is its own Storage relay
     user_id = user.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="No user_id in token")
@@ -289,6 +291,7 @@ async def upload_avatar(
 def delete_avatar(user: dict = Depends(_auth.require_user)):
     """Clear avatar_url + drop every avatar object under <user_id>/.
     Idempotent: succeeds even when nothing's stored."""
+    _rate_limit.starts_work()       # each delete is its own Storage relay
     user_id = user.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="No user_id in token")

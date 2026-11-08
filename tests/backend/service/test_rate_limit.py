@@ -52,9 +52,10 @@ class TestSlidingWindow:
             client.post("/analyze", json={"model_id": "x"}).status_code
             for _ in range(5)
         ]
-        # /analyze POSTs miss spec lookup → 4xx, but rate limiter
-        # runs BEFORE the route handler, so we still see the limiter's
-        # 429s for #4 and #5. Crucially, #1-#3 pass through to the
+        # Each /analyze starts its analysis (which then misses the spec
+        # lookup); the previous one has finished, so none joins another's
+        # work and every one is a start the limiter charges: #4 and #5
+        # are refused before their work begins, #1-#3 pass through to the
         # handler (returning whatever the handler decides).
         assert codes[3] == 429
         assert codes[4] == 429
@@ -92,6 +93,73 @@ class TestSlidingWindow:
         assert r.status_code == 429
         assert int(r.headers["Retry-After"]) > 0
         assert r.headers["X-RateLimit-Limit"] == "1"
+
+
+class TestCountsStartsNotRequests:
+    """The budget counts the work a client starts (`offload.within_deadline`
+    decides start vs join), not its requests: the Gallery polls its cold
+    GPU every second while the server answers 503 "still computing", and
+    37 such polls used to spend the 30-a-minute budget and 429 the page
+    before its GPU ever drew."""
+
+    @staticmethod
+    def _app(monkeypatch, started):
+        import asyncio
+
+        from fastapi import FastAPI
+        from fastapi.responses import JSONResponse
+
+        from backend.api import offload
+        from backend.service import rate_limit
+
+        monkeypatch.setitem(rate_limit._LIMITS, "/gallery/frontier", 30)
+        _reset_buckets(monkeypatch)
+        # Answer "still computing" at once; the work runs on.
+        monkeypatch.setattr(offload, "_deadline_s", 0.01)
+        monkeypatch.setattr(offload, "_start_hook", rate_limit.starts_work)
+        app = FastAPI()
+        app.middleware("http")(rate_limit.rate_limit_middleware)
+
+        @app.get("/gallery/frontier")
+        async def frontier(work: str):
+            async def start():
+                started.append(work)
+                await asyncio.sleep(60)
+            try:
+                return await offload.within_deadline(work, start)
+            except offload.StillComputing:
+                return JSONResponse({"reason": "still_computing"}, status_code=503)
+
+        return app
+
+    def test_polling_in_flight_work_is_never_limited(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        started: list = []
+        # One client, one loop: the polls find the work the first began.
+        with TestClient(self._app(monkeypatch, started)) as c:
+            codes = [c.get("/gallery/frontier", params={"work": "cold-gpu"}).status_code
+                     for _ in range(60)]
+        assert 429 not in codes, codes
+        assert set(codes) == {503}
+        assert started == ["cold-gpu"]
+
+    def test_starting_new_work_is_limited(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        started: list = []
+        with TestClient(self._app(monkeypatch, started)) as c:
+            codes = [c.get("/gallery/frontier", params={"work": f"gpu-{i}"}).status_code
+                     for i in range(31)]
+            # A refused start leaves nothing to join: asked again, it is
+            # still a start, and still refused.
+            again = c.get("/gallery/frontier", params={"work": "gpu-30"})
+            # Work the client already started is still its to poll.
+            poll = c.get("/gallery/frontier", params={"work": "gpu-0"})
+        assert codes[:30] == [503] * 30
+        assert codes[30] == 429
+        assert again.status_code == 429
+        assert int(again.headers["Retry-After"]) > 0
+        assert poll.status_code == 503
+        assert started == [f"gpu-{i}" for i in range(30)], "a refused start was begun"
 
 
 class TestKeyResolution:
@@ -211,6 +279,53 @@ class TestCoverage:
         assert expected == set(rate_limit._LIMITS), (
             f"unlimited threaded routes: {sorted(expected - set(rate_limit._LIMITS))}; "
             f"limited but not threaded: {sorted(set(rate_limit._LIMITS) - expected)}")
+
+    def test_every_limited_route_reaches_a_start(self):
+        """The limiter charges starts (`rate_limit.starts_work`), which the
+        core reports from `offload.within_deadline` and a route of its own
+        work calls itself. A limited handler that reaches neither would be
+        limited in name only. Derived: a function starts work when it calls
+        `within_deadline` / `starts_work` or a function that does (to a
+        fixed point over the API and service modules); every handler of a
+        limited route must."""
+        import ast
+        from pathlib import Path
+        from backend.service import rate_limit
+
+        backend = Path(rate_limit.__file__).resolve().parents[1]
+        files = [*sorted((backend / "api").glob("*.py")),
+                 *sorted((backend / "api" / "routes").glob("*.py")),
+                 *sorted((backend / "service" / "routes").glob("*.py"))]
+
+        def called(fn):
+            return {n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+                    for n in ast.walk(fn) if isinstance(n, ast.Call)
+                    and isinstance(n.func, (ast.Name, ast.Attribute))}
+
+        calls: dict = {}
+        handlers = []
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                calls.setdefault(fn.name, set()).update(called(fn))
+                handlers.extend(
+                    (dec.args[0].value, fn.name, called(fn)) for dec in fn.decorator_list
+                    if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)
+                    and dec.args and isinstance(dec.args[0], ast.Constant)
+                    and dec.args[0].value in rate_limit._LIMITS)
+        starters = {"within_deadline", "starts_work"}
+        while True:
+            more = {name for name, c in calls.items() if c & starters} - starters
+            if not more:
+                break
+            starters |= more
+        assert {"offload", "offload_response"} <= starters, "scanner broken"
+        assert {route for route, _name, _c in handlers} == set(rate_limit._LIMITS)
+        idle = sorted(f"{route} ({name})" for route, name, c in handlers
+                      if not c & starters)
+        assert not idle, f"limited handlers that start no work: {idle}"
 
     def test_fly_client_ip_wins_over_forwarded_for(self, client, monkeypatch):
         """`X-Forwarded-For` is client-supplied and must not pick the bucket."""

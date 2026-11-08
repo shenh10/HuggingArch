@@ -50,6 +50,7 @@ from pydantic import BaseModel
 from backend import supabase_env
 from backend.api._app import app
 from backend.service import auth as _auth
+from backend.service import rate_limit as _rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,7 @@ class _AdminRpcBody(BaseModel):
 
 @app.post("/api/auth/login")
 def login(body: _LoginBody, request: Request, response: Response):
+    _rate_limit.starts_work()       # each login is its own GoTrue relay
     session = _gotrue_token({
         "grant_type": "password",
         "email": body.email,
@@ -326,6 +328,7 @@ def exchange(body: _ExchangeBody, request: Request, response: Response):
     """Implicit-flow callback: the URL hash delivers tokens to JS (the one
     step Supabase cannot do server-side). Verify before trusting, set the
     cookies, and the JS discards its copy."""
+    _rate_limit.starts_work()       # each exchange is its own GoTrue relay
     claims = _auth.verify_supabase_jwt(body.access_token)
     # The client-supplied expires_in is a hint; never outlive the JWT.
     expires_in = body.expires_in or 3600

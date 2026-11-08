@@ -6,7 +6,9 @@ Importing it:
   • registers the service's HTTP routes against the shared `app`
     (`routes`, a side-effect import);
   • installs the rate-limit middleware (disabled cleanly when every
-    configured limit is 0, so self-hosters can opt out via env);
+    configured limit is 0, so self-hosters can opt out via env), and tells
+    it of every work a request starts (`offload.set_start_hook`: the core
+    decides start vs join, the limiter charges starts only);
   • forwards `/api/bench/*` to the Kernel Bench service, the process that
     owns the lake (`bench_proxy`, docs/measured_calibration.md §5.1);
   • injects the admin gate for the privileged core routes (op workers,
@@ -35,6 +37,7 @@ from typing import Optional
 
 from backend.api._access import set_admin_access_gate, set_owner_resolver
 from backend.api._app import app, health_detail
+from backend.api.offload import set_start_hook
 from backend.measure.cache import WriteBehindBackend
 from backend.api.gallery_overview import set_gallery_remote
 from backend.api.sweep_runtime import set_sweep_remote
@@ -51,6 +54,7 @@ def owner_of(authorization: Optional[str], cookie: Optional[str]) -> Optional[st
 
 
 rate_limit.install(app)
+set_start_hook(rate_limit.starts_work)
 bench_proxy.install(app, health_detail)
 set_admin_access_gate(_svc_auth.require_admin_if_enabled)
 set_owner_resolver(owner_of)

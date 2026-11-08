@@ -46,6 +46,11 @@ analysis, an estimate, a sweep, the gallery) hands its work here instead:
     (`report_partial`); the 503 carries the items a client does not have yet
     (`within_deadline(..., cursor=)`), so a page draws each as it lands
     instead of waiting for the slowest.
+  * Whether a request starts work or joins work already running (or held)
+    is decided here, in `within_deadline`, and nowhere else. Whoever meters
+    the work clients start — the service's rate limiter — is told of each
+    start (`set_start_hook`) and may refuse it by raising; a join, and the
+    retries a waiting page sends while its work runs, are not starts.
 
 `fn` is a top-level function and its arguments are picklable — the pool
 runs it in another process.
@@ -103,6 +108,10 @@ UNWATCHED_S = float(os.environ.get("HA_UNWATCHED_WORK_S", "120"))
 
 _off_process = False
 _deadline_s: Optional[float] = None
+#: Told, in the request's own task, that the request is about to start new
+#: work (`within_deadline`); raising refuses the work, which is then never
+#: begun. Set by the service layer (`set_start_hook`); None meters nothing.
+_start_hook: Optional[Callable[[], None]] = None
 
 
 class StillComputing(Exception):
@@ -192,6 +201,12 @@ def prestart_workers_later(delay_s: float = 5.0) -> None:
     exits before this fires."""
     if _off_process:
         asyncio.get_running_loop().call_later(delay_s, pool.prestart)
+
+
+def set_start_hook(hook: Optional[Callable[[], None]]) -> None:
+    """Who is told that a request starts new work (`_start_hook`)."""
+    global _start_hook
+    _start_hook = hook
 
 
 def set_deadline(deadline_s: Optional[float]) -> None:
@@ -622,11 +637,17 @@ async def within_deadline(key: str, start: Callable[[], Awaitable[_T]], *,
     when given, is the order the client wants its items in. `cursor` is
     `(tag, count)`: the work and how many of its published items the client
     already has; the 503 carries the rest (all of them when the tag is not
-    this work's — the work was cancelled and begun again)."""
+    this work's — the work was cancelled and begun again).
+
+    Beginning the work is a start (`_start_hook`, which may refuse it);
+    joining it is not. Work asked for by other work (`_current_work` is
+    set: a step inside a build) is that work's, not a request's start."""
     table = _table()
     _expire(table)
     work = table.get(key)
     if work is None:
+        if _start_hook is not None and _current_work.get() is None:
+            _start_hook()
         work = _Work()
         token = _current_work.set(work)
         try:
