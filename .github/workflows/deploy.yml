@@ -50,6 +50,10 @@ jobs:
     permissions:
       actions: read
       contents: read
+    # The engine hash this commit serves; the deploy job's post-deploy smoke
+    # waits for /inference/version to answer it (a rolling deploy).
+    outputs:
+      engine: ${{ steps.engine.outputs.engine }}
     steps:
       # The full suite ran on push (test.yml); this commit ships only if
       # that run passed. Waits while it runs.
@@ -88,6 +92,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci --prefix web
       - run: uv run ruff check backend/
+      - id: engine
+        run: echo "engine=$(uv run python -c 'from backend.fingerprint import engine_version; print(engine_version())')" >> "$GITHUB_OUTPUT"
       # What a release must do on its own: the web app builds, the shared
       # `web/src` modules still behave as their contract tests say, the
       # service layer stays out of the core, the app answers its root,
@@ -118,7 +124,9 @@ jobs:
     # The remote build installs torch + CUDA wheels, builds the web app and
     # warms the gallery for every model (`backend.warm_caches`) before the
     # rolling deploy; 15 minutes stopped being enough as the corpus grew.
-    timeout-minutes: 45
+    # Plus the post-deploy smoke: up to 15 minutes for the rollout to answer
+    # the new engine and 10 for the landing frontier.
+    timeout-minutes: 75
     # Only the main repo deploys. Compare against the literal repository
     # name: `github.repository == github.event.repository.full_name` holds
     # on every push event, forks included.
@@ -145,3 +153,16 @@ jobs:
           flyctl deploy --remote-only --strategy rolling \
             --build-arg HA_GIT_SHA=${{ github.sha }} \
             --build-arg HA_SKIP_WARM=$skip_warm
+
+      # What the release serves, by content: a shared Kernel Bench row's key
+      # comes back measured in an estimate, the landing frontier draws
+      # measured points and revisits from cache, and /health's lookups answer
+      # rows. Status shapes (200, model counts, `state == "reads"`) stayed
+      # green for weeks while lookups returned zero rows; this does not.
+      # Waits for the rollout to answer this commit's engine first. Stdlib
+      # only, so the runner's python3 runs it. A red smoke fails the run.
+      - name: post-deploy content smoke
+        run: |
+          python3 tools/post_deploy_smoke.py https://www.huggingarch.com \
+            --expect-version "${{ needs.smoke.outputs.engine }}" \
+            --version-wait 900 --gallery-wait 600
