@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 import tests.corpus_row as _corpus
 from backend.measure.scope import MeasurementScope
 from backend.service.bench import annotations as A
+from backend.service.bench import lake as lake_mod
 from backend.service.bench import store
 
 from ..conftest import BENCH_SECRET, as_user
@@ -155,6 +156,22 @@ class TestLookup:
                               json={"keys": [_key(_row(0))], "snapshot": 10 ** 9})
         assert r.status_code == 503, r.text
 
+    def test_cells_that_cannot_catch_up_are_503_not_a_lake_read(self, bench_client,
+                                                                bench_lake, monkeypatch):
+        """The lookup's cells file is its one read of a row's cells: behind
+        the pin and unable to catch up, the lookup is 503 (the client's
+        "measurements unavailable"), never answered from the lake's files."""
+        from backend.service.bench import lookup as LK
+        from backend.service.bench import routes as R
+        _upload(bench_client, ALICE, [_row(0)])
+        assert _lookup(bench_client, [_key(_row(0))], owner=ALICE)["rows"][0]
+        monkeypatch.setattr(R.cells, "refresh", lambda lake: None)
+        monkeypatch.setattr(LK.Cells, "CATCH_UP_S", 0.3)
+        _upload(bench_client, ALICE, [_row(1)])
+        r = bench_client.post("/internal/bench/lookup",
+                              json={"keys": [_key(_row(1))], "owner": ALICE})
+        assert r.status_code == 503 and "did not reach snapshot" in r.text, r.text
+
     def test_a_legacy_shape_is_found_under_the_current_key(self, bench_client, bench_lake,
                                                            monkeypatch):
         """Membership is the service's current annotations (`current_shape`,
@@ -205,6 +222,20 @@ class TestLookup:
         got = _lookup(bench_client, keys, owner=ALICE)
         assert got["excluded_mine"] == 0
         assert [len(k) for k in got["rows"]] == [0, 1]
+
+    def test_calibration_validates_itself_after_lookup_has_seen_the_row(
+            self, bench_client, bench_lake):
+        old = _corpus.row(contributor="old", shape_json=json.dumps(
+            {"B": 1, "H": 4, "s_ctx": 77}, sort_keys=True, separators=(",", ":")))
+        bench_client.get("/api/bench/list", headers=as_user(ALICE))
+        lake = lake_mod.get_lake()
+        store.upload(lake, owner=ALICE, upload_id=str(uuid.uuid4()), run_id=None,
+                     label=None, rows=[old], annotate=A.row_annotations)
+        got = _lookup(bench_client, [_key(old)], owner=ALICE)
+        assert len(got["rows"][0]) == 1
+        report = bench_client.get("/api/bench/calibration", headers=as_user(ALICE)).json()
+        assert report["rows_rejected"] == 1
+        assert "unknown symbol 'H'" in report["rejected_reasons"][0]["reason"]
 
     def test_bounds(self, bench_client, bench_lake):
         bench_client.get("/api/bench/list", headers=as_user(ALICE))

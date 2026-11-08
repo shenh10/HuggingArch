@@ -37,6 +37,11 @@ primary_region = 'nrt'
   HA_LANDING_WARM = 'off'
   HA_RUNTIME_WARM = 'off'
   SPEC_AGENT_MAX_CONCURRENT = '3'
+  # Kernel Bench's DuckDB limit. At the 384MB default the annotation build
+  # over a ~2M-input lake spills or runs out of memory; 1.5 GB holds it and
+  # the lookup cells file's reads (measured on a 4.28M-row lake: ~555 MB in
+  # use, nothing spilled; the bench process peaks ~2.3 GB of the 6 GB box).
+  BENCH_LAKE_MEMORY_LIMIT = '1536MB'
   HA_GALLERY_CACHE_DIR = '/app/.cache/huggingarch/gallery-cache'
   # The immutable canonical law pool is machine state, not image state.  It
   # lives on the persistent volume and is bootstrapped from the versioned

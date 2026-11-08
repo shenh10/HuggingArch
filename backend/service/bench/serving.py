@@ -25,7 +25,9 @@ under pytest) walks the startup once:
      lease to another machine (`bench_lake_transfer`);
   6. annotate every input in memory (`store.annotate_all` with the
      `annotate` the routes pass: only they may import kernel_bench) — the
-     grouping labels are computed, never stored;
+     grouping labels are computed, never stored; then `ready(lake)` (the
+     routes build the lookup's cells for the current snapshot,
+     `lookup.Cells.refresh`, so no lookup is answered before they exist);
   7. backups (mandatory; BENCH_LAKE_BACKUP=off opts out in development):
      back up what `current` lacks, then a `backup.Trigger` follows every
      write;
@@ -52,7 +54,7 @@ import os
 import threading
 import time
 import uuid
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -171,11 +173,13 @@ class Gate:
     def __init__(self, *, annotate: store.Annotate, open_lake: Callable[[], Lake] = get_lake,
                  lease: Callable[[], Optional[Lease]] = Lease.from_env,
                  backup: Callable[[], Optional[BackupConfig]] = BackupConfig.from_env,
+                 ready: Callable[[Lake], Any] = lambda lake: None,
                  on_serving: Callable[..., None] = lambda lake, backup, read_only=False: None,
                  restore: Callable[[], Optional[str]] = restore_from_env,
                  clock: Callable[[], float] = time.monotonic):
         self._open, self._lease, self._backup_config = open_lake, lease, backup
         self._annotate = annotate
+        self._ready = ready
         self._restore = restore
         self._on_serving, self._clock = on_serving, clock
         self._guard = threading.Lock()
@@ -328,6 +332,7 @@ class Gate:
                 self._set_data_rules(
                     "current", lake=migrated.version, migration=migrated.report())
         store.annotate_all(lake, self._annotate)
+        self._ready(lake)
         if not self.read_only:
             self._start_backups(lake)
         with self._guard:

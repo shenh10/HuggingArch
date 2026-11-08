@@ -19,7 +19,7 @@ from tests.backend.service.bench.pg import advisory_locks, scratch_database
 
 _ENV = ("BENCH_LAKE_CATALOG", "BENCH_LAKE_DATA", "BENCH_LAKE_CACHE",
         "BENCH_LAKE_S3_ENDPOINT", "BENCH_LAKE_S3_REGION", "BENCH_LAKE_S3_KEY",
-        "BENCH_LAKE_S3_SECRET", "BENCH_LAKE_MEMORY_LIMIT")
+        "BENCH_LAKE_S3_SECRET", "BENCH_LAKE_MEMORY_LIMIT", "BENCH_LAKE_SELECTION_LIMIT")
 
 
 @pytest.fixture
@@ -85,6 +85,14 @@ def test_the_lake_memory_limit_comes_from_env(clean_env):
     clean_env.setenv("BENCH_LAKE_DATA", "/x/data")
     clean_env.setenv("BENCH_LAKE_MEMORY_LIMIT", "2GB")
     assert LakeConfig.from_env().memory_limit == "2GB"
+
+
+def test_the_selection_limit_comes_from_env(clean_env):
+    clean_env.setenv("BENCH_LAKE_CATALOG", "/x/c.ducklake")
+    clean_env.setenv("BENCH_LAKE_DATA", "/x/data")
+    assert LakeConfig.from_env().selection_limit == "32MiB"
+    clean_env.setenv("BENCH_LAKE_SELECTION_LIMIT", "512MiB")
+    assert LakeConfig.from_env().selection_limit == "512MiB"
 
 
 # --- the root-only lake directory (docs/measured_calibration.md §4.5) ---

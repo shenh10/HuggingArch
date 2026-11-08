@@ -26,6 +26,16 @@ from tests.corpus_row import to_csv
 
 
 @pytest.fixture
+def cells(lake):
+    """The lookup's cells file for `lake`, built as the service builds it
+    before it serves (`lookup.Cells.refresh`), then following it."""
+    from backend.service.bench.lookup import Cells
+    c = Cells()
+    c.refresh(lake)
+    return c
+
+
+@pytest.fixture
 def lake(tmp_path):
     lk = Lake.open(LakeConfig(catalog=str(tmp_path / "catalog.ducklake"),
                               data=str(tmp_path / "data"),

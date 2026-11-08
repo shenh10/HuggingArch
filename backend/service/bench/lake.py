@@ -14,11 +14,19 @@ Configuration (environment):
   BENCH_LAKE_CACHE     local directory for spill and the remote-file cache
                        (default: `tmp/` beside a file catalog)
   BENCH_LAKE_MEMORY_LIMIT  DuckDB memory limit (default: 384MB)
+  BENCH_LAKE_SELECTION_LIMIT  the share of that memory the lookup's held
+                       selection table may take (`lookup.Selection`; default
+                       32MiB, ~460k measurements). A lake whose table would
+                       exceed it is looked up by the pinned query over its
+                       files. DuckDB's size grammar, as the memory limit; it
+                       must be below the memory limit (`Lake.open` refuses
+                       otherwise)
 
 One `Lake` per process, and one process (docs/measured_calibration.md §5.1): the Kernel Bench
 service (`server`) runs exactly one, and DuckDB locks a file catalog against
 a second. Settings (docs/measured_calibration.md §4.3): threads 4,
-memory_limit BENCH_LAKE_MEMORY_LIMIT (default 384MB),
+memory_limit BENCH_LAKE_MEMORY_LIMIT (default 384MB) — of which the held
+selection table may take BENCH_LAKE_SELECTION_LIMIT —
 preserve_insertion_order false, target_file_size 32 MB
 (Supabase Storage refuses objects over 50 MB). At most two analytical reads
 run at once (a process-wide semaphore); each request uses its own cursor.
@@ -110,6 +118,7 @@ class LakeConfig:
     cache_dir: str = ""     # BENCH_LAKE_CACHE; "" → beside the catalog (`spill_dir`)
     threads: int = 4
     memory_limit: str = "384MB"  # BENCH_LAKE_MEMORY_LIMIT
+    selection_limit: str = "32MiB"  # BENCH_LAKE_SELECTION_LIMIT
     max_concurrent_reads: int = 2
 
     @property
@@ -171,7 +180,9 @@ class LakeConfig:
                 raise LakeUnavailable(f"an s3:// data path needs {', '.join(missing)}")
         cache = os.environ.get("BENCH_LAKE_CACHE", "").strip()
         memory_limit = os.environ.get("BENCH_LAKE_MEMORY_LIMIT", "").strip()
-        overrides = {"cache_dir": cache, "memory_limit": memory_limit}
+        selection_limit = os.environ.get("BENCH_LAKE_SELECTION_LIMIT", "").strip()
+        overrides = {"cache_dir": cache, "memory_limit": memory_limit,
+                     "selection_limit": selection_limit}
         return cls(catalog=catalog, data=data, s3=s3,
                    **{name: value for name, value in overrides.items() if value})
 
@@ -241,6 +252,10 @@ class Lake:
     def __init__(self, con: duckdb.DuckDBPyConnection, config: LakeConfig):
         self._con = con
         self.config = config
+        #: `config.selection_limit` in bytes, parsed by DuckDB (the memory
+        #: limit's own grammar).
+        self.selection_bytes: int = con.execute(
+            "SELECT parse_formatted_bytes(?)", [config.selection_limit]).fetchone()[0]
         self._reads = threading.Semaphore(config.max_concurrent_reads)
         self._process_locks: dict[str, threading.Lock] = {}
         self._process_locks_guard = threading.Lock()
@@ -286,9 +301,18 @@ class Lake:
                 con.execute(f"ATTACH {_sql_text('ducklake:' + config.catalog)} AS lake "
                             f"(DATA_PATH {_sql_text(config.data)})")
             _set_lake_option(con, "target_file_size", "32MB", "32000000")
+            lake = cls(con, config)
+            memory = con.execute("SELECT parse_formatted_bytes(?)",
+                                 [config.memory_limit]).fetchone()[0]
         except duckdb.Error as e:
             raise LakeUnavailable(f"cannot attach the bench lake: {e}") from e
-        return cls(con, config)
+        if lake.selection_bytes >= memory:
+            con.close()
+            raise LakeUnavailable(
+                f"BENCH_LAKE_SELECTION_LIMIT ({config.selection_limit}) must be below "
+                f"BENCH_LAKE_MEMORY_LIMIT ({config.memory_limit}): the held selection "
+                "table lives in that memory")
+        return lake
 
     def read(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         """One read on a fresh cursor, under the read semaphore; rows as

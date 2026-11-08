@@ -102,7 +102,10 @@ def bench_gate(monkeypatch):
     monkeypatch.setattr(R, "shared_revision", lookup.SharedRevision())
     monkeypatch.setattr(R, "verdicts", lookup.Verdicts())
     monkeypatch.setattr(R, "lookup_stats", lookup.LookupStats())
-    gate = serving.Gate(annotate=R.row_annotations, on_serving=R._serving_started)
+    cells = lookup.Cells()
+    monkeypatch.setattr(R, "cells", cells)
+    gate = serving.Gate(annotate=R.row_annotations, ready=cells.refresh,
+                        on_serving=R._serving_started)
     monkeypatch.setattr(R, "gate", gate)
     yield gate
     if lake_mod._LAKE is not None:
