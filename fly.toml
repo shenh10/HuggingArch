@@ -52,6 +52,10 @@ primary_region = 'nrt'
   # lives on the persistent volume and is bootstrapped from the versioned
   # Supabase artifact by backend.sol_pool_artifact at container start.
   HA_SOL_POOL_DIR = '/app/.cache/huggingarch/sol-pool'
+  # Serving-walk records stay parsed per process that reads walks (the API,
+  # each compute worker, a warm): the cost is this budget × those processes,
+  # so it is sized against the VM's memory, not the pool's records.
+  HA_SOL_POOL_PIN_BYTES = '192MiB'
   # Empty means “read this engine version's index”. Empty overrides stale
   # machine-level values left by earlier Fly configurations.
   HA_SOL_POOL_ARTIFACT = ''

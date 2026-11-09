@@ -69,6 +69,10 @@ Each cache directory is also byte-bounded by one knob
 sweeps'; the tiers under a directory split it, oldest entries evicted
 first), so a full warm — or the orphaned keys a code edit leaves behind —
 cannot fill the volume the lake and the sol pool also live on.
+The sol pool's serving-walk records are additionally pinned per process
+(`HA_SOL_POOL_PIN_BYTES`): a pinned record is parsed once per process and
+survives the pool's hot LRU, bounded by that budget — the machine pays it
+once per process that reads walks.
 
 ### Continuous integration
 

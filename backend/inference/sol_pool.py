@@ -11,6 +11,17 @@ index, while the records themselves are appended to JSON Lines shards. The
 index carries ``(shard, offset, length, digest)`` per record, so a reader
 seeks one record instead of parsing a whole bundle. Only the records a
 consumer asks for enter Python objects.
+
+Beside the small hot LRU every pool process keeps by default, a reader may
+pin the records it re-reads on every cold build — the Gallery's serving
+walks. A pinned record is never evicted, by the hot tier's churn or by
+anything else. The byte budget (`pinBytes`, `HA_SOL_POOL_PIN_BYTES` on the
+default pool) is an admission cap, not an eviction rule: once the pinned
+set is full further pin requests are refused (the record stays an ordinary
+read, and `pinRefused` counts them) rather than dropping a record already
+promised residency or letting it fall back into the LRU — the two layers
+are separate answers, not a fallback chain. Sizing the cap is the
+operator's, per process, against the machine.
 """
 from __future__ import annotations
 
@@ -27,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 from backend.measure.scope import ResultIdentity, make_key
+from backend.measure.cache import deep_size_of
 from backend.code_trace.memo import memoize
 from backend.code_trace.provider import TRACES, Trace, provider
 
@@ -47,10 +59,10 @@ class RecordSlot:
 
 
 def _reopen(root: str, hotRecords: int, hotBytes: int,
-            shardBytes: int) -> "SolPool":
+            shardBytes: int, pinBytes: int) -> "SolPool":
     """`SolPool.__reduce__`'s constructor: the pool at `root`, as cut."""
     return SolPool(root, hotRecords=hotRecords, hotBytes=hotBytes,
-                   shardBytes=shardBytes)
+                   shardBytes=shardBytes, pinBytes=pinBytes)
 
 
 class SolPool:
@@ -58,11 +70,20 @@ class SolPool:
 
     def __init__(self, root: os.PathLike[str] | str, *,
                  hotRecords: int = 256, hotBytes: int = 8 << 20,
-                 shardBytes: int = defaultShardBytes):
+                 shardBytes: int = defaultShardBytes, pinBytes: int = 0):
         self.root = pathlib.Path(root)
         self.shardBytes = int(shardBytes)
         self._hot: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._hotSizes: dict[tuple[str, str], int] = {}
+        #: Records a reader pinned: never touched by the hot tier's
+        #: eviction, dropped oldest-first only by their own byte budget.
+        self._pinned: OrderedDict[tuple[str, str], Any] = OrderedDict()
+        self._pinnedSizes: dict[tuple[str, str], int] = {}
+        self._pinBytesTarget = int(pinBytes)
+        #: Pin requests refused by the admission cap, for a health answer,
+        #: and how many of those this process has logged (throttled).
+        self.pinRefused = 0
+        self._pinRefusalLog = 0
         self._hotBytesTarget = int(hotBytes)
         self._hotRecordsTarget = int(hotRecords)
         self._lock = threading.Lock()
@@ -74,7 +95,8 @@ class SolPool:
         a `RecordView` a worker hands back stays a seekable view instead of
         failing to pickle (the measured Scaling sweep's 500)."""
         return (_reopen, (str(self.root), self._hotRecordsTarget,
-                          self._hotBytesTarget, self.shardBytes))
+                          self._hotBytesTarget, self.shardBytes,
+                          self._pinBytesTarget))
 
     def write(self, identity: ResultIdentity,
               records: Iterable[tuple[str, Any]], *,
@@ -273,17 +295,61 @@ class SolPool:
         """One record, seeking its byte range; missing, corrupt, or computed
         by code the running code no longer matches (its trace) is a miss. A
         record read hands its trace to the computations open around the
-        read: what they read depends on the code that computed it."""
-        trace = self.recordTrace(key, recordId)
-        p = provider()
-        if trace is None or not p.valid(trace):
-            return None
-        p.merge(trace)
+        read: what they read depends on the code that computed it. This is
+        the LRU path: the record's only in-memory home is the hot tier."""
         cacheKey = (key, recordId)
         with self._lock:
             if cacheKey in self._hot:
                 self._hot.move_to_end(cacheKey)
                 return self._hot[cacheKey]
+        read = self._read(key, recordId)
+        if read is None:
+            return None
+        value, jsonBytes = read
+        self._keep(cacheKey, value, jsonBytes)
+        return value
+
+    def pinned_record(self, key: str, recordId: str) -> Any:
+        """The pin layer's read: the same seeking and trace rule as
+        `record`, and only the pin tier for a home.
+
+        A record this path reads is one its caller re-reads on every cold
+        build (the Gallery's serving walks), so residency is the point: a
+        pinned record is never evicted. The admission cap refuses — by
+        count — rather than letting the record fall into the LRU: the two
+        layers are separate answers, not a fallback chain, so a refused pin
+        re-reads from disk and `pinRefused` says the cap is too small for
+        the walks this process builds."""
+        cacheKey = (key, recordId)
+        with self._lock:
+            if cacheKey in self._pinned:
+                self._pinned.move_to_end(cacheKey)
+                return self._pinned[cacheKey]
+        read = self._read(key, recordId)
+        if read is None:
+            return None
+        value, _ = read
+        # Admitted by what the record costs the process — the parsed
+        # object — not by the bytes it occupies on disk.
+        if not self._keepPinned(cacheKey, value, deep_size_of(value)):
+            self._pinRefusalLog += 1
+            if self._pinRefusalLog == 1 or self._pinRefusalLog % 1000 == 0:
+                logger.warning(
+                    "SOL pool pin cap (%d bytes) refused a record "
+                    "(%d refusals): raise HA_SOL_POOL_PIN_BYTES, or this "
+                    "process re-parses its walks on every build",
+                    self._pinBytesTarget, self.pinRefused)
+        return value
+
+    def _read(self, key: str, recordId: str) -> Optional[tuple[Any, int]]:
+        """One record from disk: trace-checked, digest-checked, parsed, with
+        its JSON byte length (the hot LRU's size convention); None on every
+        kind of miss. Caching is the caller's layer, not this read's."""
+        trace = self.recordTrace(key, recordId)
+        p = provider()
+        if trace is None or not p.valid(trace):
+            return None
+        p.merge(trace)
         index = self._index(key)
         slot = index and index["records"].get(recordId)
         if slot is None:
@@ -301,8 +367,7 @@ class SolPool:
             logger.debug("SOL pool record read failed for %s/%s",
                          key, recordId, exc_info=True)
             return None
-        self._keep(cacheKey, value, recordSlot.length)
-        return value
+        return value, recordSlot.length
 
     def sequence(self, key: str) -> Optional["RecordView"]:
         """The bundle's records as a lazy `Sequence`.
@@ -328,6 +393,8 @@ class SolPool:
         with self._lock:
             self._hot.clear()
             self._hotSizes.clear()
+            self._pinned.clear()
+            self._pinnedSizes.clear()
 
     def _directory(self, key: str) -> pathlib.Path:
         return self.root / key[:2] / key
@@ -362,6 +429,27 @@ class SolPool:
                 del self._hot[oldest]
                 del self._hotSizes[oldest]
 
+    def _keepPinned(self, cacheKey: tuple[str, str], value: Any,
+                    size: int) -> None:
+        """Admit a record to the pin tier; False when the cap refuses it.
+
+        Admission is the only rule: a pinned record is never evicted, so
+        the cap cannot be met by dropping one. A record larger than the
+        whole cap is refused rather than pinned alone, and refusals are
+        counted (`pinRefused`), not silently evicted later."""
+        if self._pinBytesTarget <= 0:
+            return False
+        with self._lock:
+            if sum(self._pinnedSizes.values()) + size > self._pinBytesTarget:
+                self.pinRefused += 1
+                return False
+            # One home per record: pinning takes it out of the hot tier.
+            self._hot.pop(cacheKey, None)
+            self._hotSizes.pop(cacheKey, None)
+            self._pinned[cacheKey] = value
+            self._pinnedSizes[cacheKey] = size
+            return True
+
     @staticmethod
     def _atomic_json(path: pathlib.Path, value: Any) -> None:
         temporary = path.with_suffix(
@@ -393,12 +481,18 @@ class RecordView(Sequence[Any]):
 
 @memoize(maxsize=1)
 def defaultPool() -> SolPool:
-    """The process's local SOL pool, configured by ``HA_SOL_POOL_DIR``."""
+    """The process's local SOL pool, configured by ``HA_SOL_POOL_DIR``.
+
+    The pin tier's budget is ``HA_SOL_POOL_PIN_BYTES`` (a size or a byte
+    count; default 192 MiB). It is paid once per process that pins — the
+    API, every compute worker, a warm — so it is sized against the machine,
+    not against the pool's records."""
     root = os.environ.get(
         "HA_SOL_POOL_DIR",
         pathlib.Path.home() / ".cache" / "huggingarch" / "sol-pool",
     )
-    return SolPool(root)
+    from backend.measure.cache import env_bytes
+    return SolPool(root, pinBytes=env_bytes("HA_SOL_POOL_PIN_BYTES", 192 << 20))
 
 
 def recordId(*parts: Any) -> str:
