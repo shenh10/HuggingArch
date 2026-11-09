@@ -19,7 +19,11 @@ from pathlib import Path
 from textwrap import dedent
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+# The repository root, four parents up (tests/backend/arch/quant_schemes).
+# One level short once inserted `tests/` itself at sys.path[0], and any later
+# `import scripts.…` resolved to `tests/scripts` — the publish tests' import
+# failed only under full-tree collection, where this module imports first.
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
