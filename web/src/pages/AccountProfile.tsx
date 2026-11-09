@@ -295,7 +295,15 @@ function AgentCredForm({
     return () => clearTimeout(t);
   }, [loadModels]);
 
+  // A custom endpoint serves its own models; the agent CLI's built-in default
+  // is the vendor's, so the server rejects an endpoint without a model.
+  const needsModel = !!base.trim() && !model.trim();
+
   const save = async () => {
+    if (needsModel) {
+      setStatus("Pick a default model: a custom endpoint does not serve the agent's built-in default.");
+      return;
+    }
     setStatus("Saving…");
     try {
       await accountJson("PUT", "/api/account/agent-credentials", {
@@ -382,7 +390,11 @@ function AgentCredForm({
             return next;
           })}
         />
-        <p className="text-xs text-gray-400 mt-1">Blank default uses the endpoint catalog default. A task left on default follows the row above, or the site default.</p>
+        <p className={`text-xs mt-1 ${needsModel ? "text-red-600" : "text-gray-400"}`}>
+          {needsModel
+            ? "A custom endpoint needs a default model — the agent's built-in default is the vendor's own model."
+            : "Blank default uses the agent's built-in model (vendor endpoint only). A task left on default follows the row above, or the site default."}
+        </p>
       </div>
       <div className="flex flex-wrap items-center justify-between gap-3 mt-3">
         <label className="inline-flex items-center gap-2 text-sm text-gray-700">
@@ -394,7 +406,7 @@ function AgentCredForm({
           {onCancel && (
             <button type="button" className="px-3 py-2 text-sm border border-gray-300 rounded-lg" onClick={onCancel}>Cancel</button>
           )}
-          <button type="button" className={BTN} onClick={() => void save()}>{mode === "edit" ? "Update" : "Save key"}</button>
+          <button type="button" className={BTN} disabled={needsModel} onClick={() => void save()}>{mode === "edit" ? "Update" : "Save key"}</button>
         </div>
       </div>
     </div>

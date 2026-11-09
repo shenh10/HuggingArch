@@ -469,6 +469,8 @@ def put_agent_credential(
             )
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
     except (_creds.TaskModelsUnavailable, _creds.CredentialNamesUnavailable) as e:
         raise HTTPException(status_code=503, detail=f"Could not save credential: {e}.") from None
     except _crypto.CredentialsKeyMissing:

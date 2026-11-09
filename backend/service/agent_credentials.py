@@ -73,6 +73,25 @@ class CredentialsUnavailable(CredentialRefusal):
                 "moment to {verb}.")
 
 
+class CredentialModelRequired(CredentialRefusal):
+    """The credential points its agent at a custom endpoint but names no
+    model for this run. The CLI's built-in default model belongs to the
+    vendor's own endpoint (Codex's is an OpenAI model), so another endpoint
+    rejects it — refuse the run instead of sending a model it cannot serve."""
+    status = "credential_model_required"
+    template = ("Your saved agent credential sets a custom endpoint but no "
+                "model. Pick a model for it in account settings to {verb}.")
+
+
+def require_model_for_endpoint(base_url: Optional[str],
+                               model: Optional[str]) -> None:
+    """A credential with a custom endpoint must name its model: blank means
+    the agent CLI's own default, which only the vendor's endpoint serves."""
+    if (base_url or "").strip() and not (model or "").strip():
+        raise ValueError("A custom endpoint needs a model: pick the model "
+                         "this endpoint serves.")
+
+
 VALID_AGENTS = tuple(AGENT_ENV_VARS.keys())
 
 
@@ -436,6 +455,7 @@ def upsert(
     if agent_cli not in AGENT_ENV_VARS:
         raise ValueError(f"Unknown agent_cli: {agent_cli!r}")
     name = normalize_name(name)
+    require_model_for_endpoint(base_url, model)
     if task_models is not None:
         task_models = normalize_task_models(task_models)
     url, key = _supabase()
@@ -497,6 +517,7 @@ def update_fields(
     if agent_cli not in AGENT_ENV_VARS:
         raise ValueError(f"Unknown agent_cli: {agent_cli!r}")
     name = normalize_name(name)
+    require_model_for_endpoint(base_url, model)
     if task_models is not None:
         task_models = normalize_task_models(task_models)
     url, key = _supabase()
@@ -731,10 +752,14 @@ def resolve_env(user_id: str, agent_cli: Optional[str] = None, *,
             "(rotation?): %s", user_id, cli, e,
         )
         raise CredentialDecryptError("saved credential could not be decrypted") from e
+    model = run_model(row, cli, task)
+    if row.get("base_url") and not model:
+        # Rows saved before the write-time rule (require_model_for_endpoint).
+        raise CredentialModelRequired(
+            f"{cli} credential has endpoint {row['base_url']!r} and no model")
     return {
         "agent_cli": cli,
-        "env": _env_for(cli, api_key, row.get("base_url"),
-                        run_model(row, cli, task)),
+        "env": _env_for(cli, api_key, row.get("base_url"), model),
     }
 
 
