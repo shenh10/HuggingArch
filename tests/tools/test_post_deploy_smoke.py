@@ -17,8 +17,10 @@ from tools.post_deploy_smoke import (
     check_estimate,
     check_frontier,
     check_health,
+    check_lake,
     check_revisit,
     lake_keys_in_estimate,
+    page_frontier_path,
 )
 
 _ENV = {"activation": "bf16", "kv": "bf16", "metadata": "fp32",
@@ -73,8 +75,9 @@ def _frontier(lookups_answer: bool) -> dict:
 
 
 def _health(lookups_answer: bool) -> dict:
-    return {"status": "ok", "detail": {"kernel_bench": {"state": "up", "lookups": {
-        "lookups": 61, "keys": 125700, "rows": 4100 if lookups_answer else 0}}}}
+    return {"status": "ok", "detail": {"kernel_bench": {
+        "state": "up", "lake": {"state": "serving"}, "lookups": {
+            "lookups": 61, "keys": 125700, "rows": 4100 if lookups_answer else 0}}}}
 
 
 def _run(lookups_answer: bool) -> Report:
@@ -87,7 +90,9 @@ def _run(lookups_answer: bool) -> Report:
     # The lake's two keys, not the zero-cost row nor the key the lake lacks.
     assert sorted(r["op"] for r in hits) == ["linear", "rmsnorm"]
     check_estimate(rep, "estimate", hits, est)
-    check_frontier(rep, "H100-SXM", 200, _frontier(lookups_answer))
+    serving = check_lake(rep, _health(lookups_answer))
+    check_frontier(rep, "H100-SXM", 200, _frontier(lookups_answer),
+                   lake_serving=serving, lake_gpus=["H100-SXM"])
     check_revisit(rep, "H100-SXM", 200, 0.4)
     check_health(rep, _health(lookups_answer))
     return rep
@@ -115,12 +120,64 @@ def test_engine_error_and_slow_revisit_fail():
     rep = Report(out=lambda _s: None)
     body = _frontier(True)
     body["models"][1]["measured_track"] = {"state": "engine_error"}
-    check_frontier(rep, "H100-SXM", 200, body)
+    check_frontier(rep, "H100-SXM", 200, body, lake_serving=True, lake_gpus=["H100-SXM"])
     check_revisit(rep, "H100-SXM", 200, 7.0)
-    check_frontier(rep, "H100-SXM", 503, {"retry_after_s": 5})
+    check_frontier(rep, "H100-SXM", 503, {"retry_after_s": 5}, lake_serving=True,
+                   lake_gpus=["H100-SXM"])
     assert any("engine_error" in f for f in rep.fails)
     assert any("revisit" in f for f in rep.fails)
     assert any("answered 200 (got 503)" in f for f in rep.fails)
+
+
+def _unavailable_frontier() -> dict:
+    """Production, 2026-11-09: every model drawn with the lake unavailable."""
+    return {"config": {"gpu_sku": "H100-SXM"}, "models": [
+        {"model_id": f"m/{i}", "measured_track": {"state": "unavailable"},
+         "frontier": {"1024": [{"tps_user": 60.0, "tps_gpu": 1000.0}]},
+         "frontier_measured": {}} for i in range(63)]}
+
+
+def test_an_unavailable_frontier_under_a_serving_lake_fails():
+    """The smoke passed this as "0/0 reading models have measured points":
+    with nothing reading, the measured-points check was never asked. With
+    the lake serving every track must read, and the lake's GPU must draw
+    measured points."""
+    rep = Report(out=lambda _s: None)
+    assert check_lake(rep, _health(True))
+    check_frontier(rep, "H100-SXM", 200, _unavailable_frontier(),
+                   lake_serving=True, lake_gpus=["H100-SXM", "B200"])
+    joined = "\n".join(rep.fails)
+    assert len(rep.fails) == 2, joined
+    assert "every measured track reads (0/63" in joined
+    assert "draws measured points (0/0)" in joined
+
+
+def test_a_gpu_the_lake_holds_no_rows_for_needs_no_measured_points():
+    """Reading tracks on a GPU without shared decode rows draw nothing
+    measured, and that is not a failure; their tracks must still read."""
+    rep = Report(out=lambda _s: None)
+    body = _frontier(False)
+    check_frontier(rep, "H100-SXM", 200, body, lake_serving=True, lake_gpus=["B200"])
+    assert rep.fails == []
+    check_frontier(rep, "H100-SXM", 200, _unavailable_frontier(), lake_serving=True,
+                   lake_gpus=["B200"])
+    assert len(rep.fails) == 1 and "every measured track reads" in rep.fails[0]
+
+
+def test_a_lake_that_does_not_serve_fails():
+    rep = Report(out=lambda _s: None)
+    health = _health(True)
+    health["detail"]["kernel_bench"]["lake"] = {"state": "unavailable"}
+    assert not check_lake(rep, health)
+    assert "lake is serving (state unavailable)" in rep.fails[0]
+
+
+def test_the_frontier_request_is_the_pages():
+    """The page sends its landing GPU and the server's default floors
+    explicitly (`web/src/pages/Gallery.tsx`)."""
+    path = page_frontier_path("H100-SXM", {"comm_latency_us": 2.0, "launch_floor_us": 1.0,
+                                           "gpu_memory_fraction": 0.9})
+    assert path == "/gallery/frontier?gpu_sku=H100-SXM&comm_latency_us=2.0&launch_floor_us=1.0"
 
 
 def test_dtype_disagreement_is_not_a_lake_hit():

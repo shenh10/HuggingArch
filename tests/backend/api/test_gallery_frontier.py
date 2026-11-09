@@ -9,6 +9,8 @@ context is empty, no room for a request draws nothing).
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import backend.api.gallery_frontier as f
@@ -1158,7 +1160,8 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
 
     from backend.api import offload
 
-    monkeypatch.setattr(f, "_frontier_scope", lambda: ("none-scope", "none"))
+    track = (f.NO_MEASUREMENTS, "none")
+    monkeypatch.setattr(f, "_frontier_scope", lambda: track)
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
 
@@ -1181,12 +1184,12 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
     async def scenario():
         with pytest.raises(offload.StillComputing) as info:
             await offload.within_deadline(
-                f.frontier_request_key(view), lambda: f.build_frontier(view),
-                hint=["b/2"])
+                f.frontier_request_key(view, track),
+                lambda: f.build_frontier(view), hint=["b/2"])
         partial = info.value.partial
         offload.set_deadline(None)
         whole = await offload.within_deadline(
-            f.frontier_request_key(view), lambda: f.build_frontier(view))
+            f.frontier_request_key(view, track), lambda: f.build_frontier(view))
         return partial, whole
 
     monkeypatch.setattr(offload, "_deadline_s", 0.15)
@@ -1200,6 +1203,116 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
     assert computed == ["b/2", "a/1"]
     assert [m["model_id"] for m in whole["models"]] == ["a/1", "b/2", "c/3"]
     assert {k: whole[k] for k in partial["head"]} == partial["head"]
+
+def _route_scenario(monkeypatch, scopes, states_by_call):
+    """Two requests to `/gallery/frontier` (the route coroutine, one event
+    loop): the first misses the deadline and its finished response is held
+    for a retry; the lake's answer between them is `scopes[i]`. Each build
+    draws its one model under `states_by_call[n]` (the n-th build's state,
+    or the track's when None). Returns the second response and how many
+    builds drew under the request's track (not counting the SOL partial).
+    """
+    import asyncio
+
+    from backend.api import offload
+    from backend.api.routes import gallery as route
+
+    calls = {"scope": 0, "builds": 0}
+
+    def scope():
+        got = scopes[min(calls["scope"], len(scopes) - 1)]
+        calls["scope"] += 1
+        return got
+
+    def read(model_id, view, track=None, *, cache_only=False):
+        if cache_only:
+            return {}
+        time.sleep(0.3)
+        if track[1] == "none":               # the SOL partial a "reads" build publishes first
+            return {"drawn": {"model_id": model_id, "measured_track": {"state": "none"}}}
+        state = states_by_call[min(calls["builds"], len(states_by_call) - 1)]
+        calls["builds"] += 1
+        return {"drawn": {"model_id": model_id,
+                          "measured_track": {"state": state or track[1]}}}
+
+    monkeypatch.setattr(f, "_frontier_scope", scope)
+    monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
+    monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1"])
+    monkeypatch.setattr(f, "_frontier_read", read)
+    ask = dict(gpu_sku="B200", gpu_memory_fraction=0.9, comm_latency_us=2.0,
+               launch_floor_us=1.0, draft_tokens=0, acceptance_rate=0.7,
+               priority="", have_tag=0, have=0)
+
+    async def scenario():
+        with pytest.raises(offload.StillComputing):
+            await route.gallery_frontier(**ask)
+        await asyncio.sleep(0.6)             # finished, held for the retry
+        offload.set_deadline(None)
+        return await route.gallery_frontier(**ask)
+
+    monkeypatch.setattr(offload, "_deadline_s", 0.1)
+    try:
+        second = asyncio.run(scenario())
+    finally:
+        offload.set_deadline(None)
+    return second, calls["builds"]
+
+
+def test_a_response_drawn_while_the_lake_was_unavailable_is_not_served_once_it_answers(
+        monkeypatch):
+    """Production, 2026-11-09: after Kernel Bench came back, the bare
+    frontier request kept answering every model "unavailable" — the whole
+    response, held for a retry, was keyed on the view alone. Its identity
+    includes the track it was drawn under (`frontier_request_key`)."""
+    from backend.measure.scope import MeasurementScope
+    lake = MeasurementScope(None, "lake", 1, 1, "r")
+    second, builds = _route_scenario(
+        monkeypatch, [(f.NO_MEASUREMENTS, "unavailable"), (lake, "reads")], [None])
+    assert [m["measured_track"]["state"] for m in second["models"]] == ["reads"]
+    assert builds == 2
+
+
+def test_a_response_degraded_mid_request_is_not_held(monkeypatch):
+    """Under a "reads" track a model whose fold the lake failed mid-request
+    is drawn "unavailable": that response is not the track's answer, so it
+    is not held for the retry (`offload.report_degraded`)."""
+    from backend.measure.scope import MeasurementScope
+    lake = MeasurementScope(None, "lake", 1, 1, "r")
+    second, builds = _route_scenario(
+        monkeypatch, [(lake, "reads")], ["unavailable", None])
+    assert [m["measured_track"]["state"] for m in second["models"]] == ["reads"]
+    assert builds == 2
+
+
+def test_a_bare_frontier_request_and_its_explicit_defaults_are_one_identity(monkeypatch):
+    """The page sends the floors explicitly; the smoke and a bare link do
+    not. Both are one view, so one response identity."""
+    from fastapi.testclient import TestClient
+
+    import backend.api  # noqa: F401  # registers routes
+    from backend.api._app import app
+    from backend.api.routes import gallery as route
+
+    keys: list = []
+
+    async def capture(key, start, **_kw):
+        keys.append(key)
+        return {}
+
+    async def track(_view):
+        return (f.NO_MEASUREMENTS, "none")
+
+    monkeypatch.setattr(route, "within_deadline", capture)
+    monkeypatch.setattr(route, "frontier_track", track)
+    client = TestClient(app)
+    for params in ({"gpu_sku": "B200"},
+                   {"gpu_sku": "B200", "comm_latency_us": "2", "launch_floor_us": "1"},
+                   {"gpu_sku": "B200", "comm_latency_us": "2.0",
+                    "launch_floor_us": "1.0", "gpu_memory_fraction": "0.9",
+                    "draft_tokens": "0", "acceptance_rate": "0.7"}):
+        assert client.get("/gallery/frontier", params=params).status_code == 200
+    assert len(keys) == 3 and len(set(keys)) == 1
+
 
 def test_a_measured_cache_hit_returns_without_computing(monkeypatch):
     """The lake being readable never invalidates a drawing already kept for

@@ -129,6 +129,27 @@ def test_restore_round_trip_and_checks(tmp_path, lake, make_rows, annotate, new_
         restore(bucket, str(tmp_path / "damaged"))
 
 
+def test_a_failed_restore_leaves_no_catalog_and_the_next_refuses_naming_it(
+        tmp_path, lake, make_rows, annotate, new_owner):
+    """The catalog takes its name only once the restored lake opened and its
+    counts matched: a restore failing its check leaves no `catalog.ducklake`
+    (which the next start would open as a lake), and the next restore
+    refuses the directory, naming what is in it."""
+    bucket = LocalBucket(str(tmp_path / "bucket"))
+    _up(lake, new_owner(), make_rows(20), annotate)
+    Backup(bucket).run(lake)
+    key = _json(bucket, "current")["manifest"]
+    manifest = _json(bucket, key)
+    manifest["counts"]["measurements"] += 1
+    (bucket.root / key).write_text(json.dumps(manifest))
+    dest = tmp_path / "failed"
+    with pytest.raises(RuntimeError, match="rows"):
+        restore(bucket, str(dest))
+    assert not (dest / "catalog.ducklake").exists()
+    with pytest.raises(RuntimeError, match=r"empty directory.*catalog\.ducklake\.restoring"):
+        restore(bucket, str(dest))
+
+
 def test_gc_keeps_by_manifest(tmp_path, lake, make_rows, annotate, new_owner, monkeypatch):
     bucket = LocalBucket(str(tmp_path / "bucket"))
     b = Backup(bucket)

@@ -15,10 +15,17 @@ none of them could fail. This smoke asserts content instead:
    is one the lake holds (same dtypes) comes back `measured`. Zero-cost rows
    (views, transposes: `measured_reason == "zero_launch"`) are always
    "measured" and are excluded — they say nothing about lookups.
-2. Gallery: `/gallery/frontier` for the landing GPU (polled while 503) answers
-   200 with models, no model's measured track is `engine_error`, and some
-   model whose track `reads` has measured frontier points; a revisit answers
-   200 within 5 s (the cache serves it).
+2. Gallery: the request the Gallery page sends for its landing GPU — the
+   landing GPU of the page's own axes (`web/src/gallery/axes.json`) and the
+   floors of `/inference/defaults`, explicitly — polled while 503, answers
+   200 with models and no model's measured track is `engine_error`. With the
+   lake serving (`/health`'s `kernel_bench.lake.state`, which must be
+   `serving`) every model's measured track must be `reads`: a frontier that
+   says "unavailable" (or "none") under a serving lake is the failure of
+   2026-11-09, which passed this smoke as "0/0 reading models have measured
+   points". When the lake holds shared decode rows for the GPU (browse's
+   `gpu` facet) some model must draw measured points; a GPU without rows is
+   not asked to. A revisit of the same request answers 200 within 5 s.
 3. Health: `kernel_bench.lookups` must not report keys asked with zero rows
    answered.
 
@@ -34,9 +41,11 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 # How many (model, gpu, batch) reproductions to try before giving up, and the
@@ -139,7 +148,24 @@ def check_estimate(rep: Report, label: str, hits: list, estimate: dict) -> None:
     rep.check(len(measured) > 0, f"{label}: decode measures at least one non-zero-cost row")
 
 
-def check_frontier(rep: Report, gpu: str, status: Optional[int], body: Optional[dict]) -> None:
+def lake_state(health: Optional[dict]) -> Optional[str]:
+    """The Kernel Bench lake's state as `/health` reports it
+    (`kernel_bench.lake.state`: `serving` when it serves)."""
+    kb = ((health or {}).get("detail") or {}).get("kernel_bench") or {}
+    return (kb.get("lake") or {}).get("state")
+
+
+def check_lake(rep: Report, health: Optional[dict]) -> bool:
+    """The lake must serve: this smoke asks whether the site reads it."""
+    state = lake_state(health)
+    return rep.check(state == "serving", f"health: the Kernel Bench lake is serving (state {state})")
+
+
+def check_frontier(rep: Report, gpu: str, status: Optional[int], body: Optional[dict], *,
+                   lake_serving: bool, lake_gpus: Iterable[str]) -> None:
+    """The frontier answered, and its measured tracks are what the lake's
+    state says they must be: all `reads` under a serving lake, and measured
+    points drawn when the lake holds shared decode rows for `gpu`."""
     rep.check(status == 200, f"frontier {gpu} answered 200 (got {status})")
     models = (body or {}).get("models") or []
     rep.check(len(models) > 0, f"frontier {gpu} has models ({len(models)})")
@@ -156,8 +182,16 @@ def check_frontier(rep: Report, gpu: str, status: Optional[int], body: Optional[
              f"{drawn}/{reading} reading models have measured points")
     rep.check(states.get("engine_error", 0) == 0,
               f"frontier {gpu}: no measured track is engine_error ({states.get('engine_error', 0)})")
-    if reading:
-        rep.check(drawn > 0, f"frontier {gpu}: some model that reads measurements draws measured points")
+    if lake_serving:
+        rep.check(bool(models) and reading == len(models),
+                  f"frontier {gpu}: with the lake serving every measured track reads "
+                  f"({reading}/{len(models)}; states {dict(states)})")
+    if gpu in set(lake_gpus):
+        rep.check(drawn > 0, f"frontier {gpu}: the lake holds shared decode rows for {gpu}, "
+                             f"and some model draws measured points ({drawn}/{reading})")
+    else:
+        rep.note(f"frontier {gpu}: the lake holds no shared decode rows for {gpu}; "
+                 "measured points are not required")
 
 
 def check_revisit(rep: Report, gpu: str, status: Optional[int], seconds: float) -> None:
@@ -223,10 +257,26 @@ def wait_for_version(c: Client, expect: str, wait_s: float) -> bool:
         time.sleep(15)
 
 
-def run_estimate(rep: Report, c: Client) -> None:
+def shared_decode_gpus(c: Client) -> list:
+    """The GPUs the lake holds shared decode measurements for (browse's
+    `gpu` facet)."""
     _, browse = c.call("/api/bench/browse?view=rows&source=shared&phase=decode&page_size=1",
                        timeout=120)
-    gpus = ((browse or {}).get("facets") or {}).get("gpu") or []
+    return list(((browse or {}).get("facets") or {}).get("gpu") or [])
+
+
+def wait_for_lake(c: Client, wait_s: float) -> Optional[dict]:
+    """`/health`, polled until the lake serves or `wait_s` passes."""
+    deadline = time.time() + wait_s
+    while True:
+        _, health = c.call("/health", timeout=60)
+        if lake_state(health) == "serving" or time.time() > deadline:
+            return health
+        print(f"  lake {lake_state(health)}, waiting for it to serve", flush=True)
+        time.sleep(15)
+
+
+def run_estimate(rep: Report, c: Client, gpus: list) -> None:
     if not rep.check(bool(gpus), "browse lists GPUs with shared decode measurements"):
         return
     rows: list = []
@@ -258,9 +308,30 @@ def run_estimate(rep: Report, c: Client) -> None:
     rep.check(False, f"no estimate reproduced a shared measurement's key in {tried} tries")
 
 
-def run_gallery(rep: Report, c: Client, wait_s: float) -> None:
+#: The Gallery page's axes, as its bundle is built from them: the landing GPU.
+GALLERY_AXES = Path(__file__).resolve().parents[1] / "web" / "src" / "gallery" / "axes.json"
+
+
+def page_frontier_path(landing_gpu: str, defaults: dict) -> str:
+    """The `/gallery/frontier` request the Gallery page sends on landing
+    (`web/src/pages/Gallery.tsx`): its landing GPU and the floors of
+    `/inference/defaults`, explicitly, no draft."""
+    query = {"gpu_sku": landing_gpu}
+    for name in ("comm_latency_us", "launch_floor_us"):
+        if defaults.get(name) is not None:
+            query[name] = str(defaults[name])
+    return "/gallery/frontier?" + urllib.parse.urlencode(query)
+
+
+def run_gallery(rep: Report, c: Client, wait_s: float, *, lake_serving: bool,
+                lake_gpus: list) -> None:
+    landing = json.loads(GALLERY_AXES.read_text())["landing_gpu"]
+    _, defaults = c.call("/inference/defaults", timeout=60)
+    if not rep.check(isinstance(defaults, dict), "/inference/defaults answered"):
+        return
+    path = page_frontier_path(landing, defaults)
+    rep.note(f"frontier request (as the page sends it): {path}")
     deadline = time.time() + wait_s
-    path = "/gallery/frontier"   # the route's default is the landing GPU
     while True:
         status, body = c.call(path, timeout=120)
         if status != 503 or time.time() > deadline:
@@ -268,13 +339,12 @@ def run_gallery(rep: Report, c: Client, wait_s: float) -> None:
         after = float((body or {}).get("retry_after_s") or 5)
         rep.note(f"frontier 503 ({(body or {}).get('reason')}), retry in {after:.0f}s")
         time.sleep(min(max(after, 1.0), 30.0))
-    gpu = ((body or {}).get("config") or {}).get("gpu_sku") or "landing"
-    check_frontier(rep, gpu, status, body)
+    check_frontier(rep, landing, status, body, lake_serving=lake_serving, lake_gpus=lake_gpus)
     if status != 200:
         return
     t0 = time.time()
-    status, _ = c.call(f"/gallery/frontier?gpu_sku={urllib.request.quote(gpu)}", timeout=60)
-    check_revisit(rep, gpu, status, time.time() - t0)
+    status, _ = c.call(path, timeout=60)
+    check_revisit(rep, landing, status, time.time() - t0)
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -292,8 +362,10 @@ def main(argv: Optional[list] = None) -> int:
             wait_for_version(c, a.expect_version, a.version_wait),
             f"deployed engine {a.expect_version} answers /inference/version"):
         return _summary(rep)
-    run_estimate(rep, c)
-    run_gallery(rep, c, a.gallery_wait)
+    lake_serving = check_lake(rep, wait_for_lake(c, a.gallery_wait))
+    gpus = shared_decode_gpus(c)
+    run_estimate(rep, c, gpus)
+    run_gallery(rep, c, a.gallery_wait, lake_serving=lake_serving, lake_gpus=gpus)
     _, health = c.call("/health", timeout=60)
     check_health(rep, health)
     return _summary(rep)

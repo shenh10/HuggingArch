@@ -603,10 +603,20 @@ def restore(bucket: Bucket, dest: str, *, snapshot: Optional[int] = None) -> Lak
     directory `dest`: `catalog.ducklake` and `data/` at the paths the
     manifest names, every object checked against its sha256; the catalog
     pointed at `dest/data/`; opened, and its row counts checked against the
-    manifest. Returns the config to open the restored lake with."""
+    manifest. Returns the config to open the restored lake with.
+
+    `dest` must be empty — a sanity check, not a policy: the service makes
+    nothing of a lake's in a directory before a catalog has attached there
+    (`Lake.open`), so anything present is state someone left, named in the
+    refusal. The catalog is downloaded under a working name and takes its
+    own name last, once the restored lake has opened and its counts match:
+    a `catalog.ducklake` is always a verified restore, and a failed restore
+    leaves pieces the next one refuses, never a lake the next start opens."""
     root = Path(dest)
-    if root.exists() and any(root.iterdir()):
-        raise RuntimeError(f"restore needs an empty directory, {dest} is not")
+    present = sorted(e.name for e in root.iterdir()) if root.exists() else []
+    if present:
+        raise RuntimeError(f"restore needs an empty directory, {dest} holds "
+                           f"{', '.join(present)}")
     backup = Backup(bucket)
     if snapshot is None:
         cur = backup.current()
@@ -625,7 +635,8 @@ def restore(bucket: Bucket, dest: str, *, snapshot: Optional[int] = None) -> Lak
             raise RuntimeError(f"{obj_key}: sha256 {got}, the manifest says {sha}")
 
     catalog = root / "catalog.ducklake"
-    fetch(manifest["catalog"]["key"], manifest["catalog"]["sha256"], catalog)
+    restoring = root / "catalog.ducklake.restoring"
+    fetch(manifest["catalog"]["key"], manifest["catalog"]["sha256"], restoring)
     data = root / "data"
     private_dir(str(data))
     for f in manifest["files"]:
@@ -633,11 +644,10 @@ def restore(bucket: Bucket, dest: str, *, snapshot: Optional[int] = None) -> Lak
         if data.resolve() not in target.parents:
             raise RuntimeError(f"the manifest names a path outside the data directory: {f['path']}")
         fetch(f"data/{f['sha256']}", f["sha256"], target)
-    _set_data_path(catalog, str(data))
-    if _latest_snapshot(catalog) != int(manifest["snapshot"]):
+    _set_data_path(restoring, str(data))
+    if _latest_snapshot(restoring) != int(manifest["snapshot"]):
         raise RuntimeError("the catalog object is not at the manifest's snapshot")
-    config = LakeConfig(catalog=str(catalog), data=str(data))
-    lake = Lake.open(config)
+    lake = Lake.open(LakeConfig(catalog=str(restoring), data=str(data)))
     try:
         for t in store.TABLES:
             n = lake.read(f"SELECT count(*) AS n FROM lake.{t}")[0]["n"]
@@ -645,4 +655,8 @@ def restore(bucket: Bucket, dest: str, *, snapshot: Optional[int] = None) -> Lak
                 raise RuntimeError(f"restored lake.{t} has {n} rows, the manifest {manifest['counts'][t]}")
     finally:
         lake.close()
-    return config
+    wal = restoring.with_name(restoring.name + ".wal")
+    if wal.exists():
+        raise RuntimeError(f"the restored catalog left a write-ahead log after closing: {wal}")
+    os.replace(restoring, catalog)
+    return LakeConfig(catalog=str(catalog), data=str(data))

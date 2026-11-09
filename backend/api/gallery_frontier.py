@@ -25,8 +25,10 @@ another HBM fraction walks its own card alone and keeps no class walk.
 
 The SOL half is cached under scope `none`. Kernel Bench's measured plan is an
 explicit later layer, never a reason to expand the canonical law into rows.
-One request reads the lake's version once and draws every
-model under that answer (`build_frontier`). A track the lake cannot give —
+One request reads the lake's version once (`frontier_track`), is
+identified by that answer (`frontier_request_key`) and draws every model
+under it (`build_frontier`): a whole response drawn while the lake was
+unavailable is never served once it answers. A track the lake cannot give —
 its version unanswered, or its rows' lookup failing mid-request — draws the
 SOL drawing, labelled "unavailable": one drawing per view, kept under scope
 `none` (`_Stored.view_key`), so a lake that flaps reads it back rather than
@@ -81,6 +83,7 @@ from backend.api.offload import (
     PrioritySlots,
     ensure_spec_generation,
     map_off_loop,
+    report_degraded,
     report_partial,
     report_progress,
     run_off_loop,
@@ -1092,12 +1095,26 @@ def _read_entry(entry: dict, view: FrontierView) -> dict:
     return _Stored(entry.get("model_id", ""), None).drawn(view, entry)
 
 
-def frontier_request_key(view: FrontierView) -> str:
-    """The identity of one frontier request: concurrent requests for one
-    view on the same spec generation join one build
-    (`offload.within_deadline`)."""
+def frontier_request_key(view: FrontierView, track: Track) -> str:
+    """The identity of one frontier response: the view, the spec generation
+    and the measured track it is drawn under (`frontier_track`: the lake's
+    scope and its state). Concurrent requests for one view under one lake
+    answer join one build, and a response held for a retry
+    (`offload.within_deadline`) is only ever served under the track it was
+    drawn under: one drawn while the lake was unavailable is not the answer
+    once the lake answers, nor one of an older snapshot after a new one."""
+    scope, state = track
     return of_render("gallery-frontier-request", spec_generation(),
-                     view.key_parts(), NO_MEASUREMENTS).key
+                     [*view.key_parts(), state], scope).key
+
+
+async def frontier_track(view: FrontierView) -> Track:
+    """The measured track a request for `view` is answered under
+    (`_view_scope`), read once per request, before its identity
+    (`frontier_request_key`) — one `/internal/bench/version`, off the
+    event loop and outside the compute pool (it is a request, not
+    compute)."""
+    return await asyncio.to_thread(_view_scope, view)
 
 
 def _frontier_read(model_id: str, view: FrontierView,
@@ -1346,23 +1363,29 @@ async def _compute_frontier(model_id: str, view: FrontierView,
                             track, traces, name=model_id)
 
 
-async def build_frontier(view: FrontierView) -> dict:
+async def build_frontier(view: FrontierView,
+                         track: Optional[Track] = None) -> dict:
     """Every model's decode frontier under `view`, `_model_concurrency`
     models computing at a time, reporting how many have finished and
     publishing each as it lands (`report_partial`), so a page draws it
     without waiting for the slowest. Every model is read first, at once: a
     kept one lands without waiting behind one that computes. Which model
     computes next is the client's order (`offload.urgency`: picked, then on
-    screen). The lake's version is read
-    once (`_view_scope`) and every model is drawn under that one answer: one
-    response reads one lake, and an unanswering lake costs one timeout
-    rather than one per model. A spec refined meanwhile serves nothing
-    (`ensure_spec_generation`)."""
+    screen). Every model is drawn under one lake answer, `track` — the one
+    the request's identity names (`frontier_request_key`), read here
+    (`frontier_track`) when the caller has none (the warm): one response
+    reads one lake, and an unanswering lake costs one timeout rather than
+    one per model. A model whose fold the lake fails mid-request is drawn
+    "unavailable" under a "reads" track; such a response is not that
+    track's answer, so it is handed to the requests waiting on it and held
+    for none (`offload.report_degraded`). A spec refined meanwhile serves
+    nothing (`ensure_spec_generation`)."""
     generation = spec_generation()
     model_ids = sorted(iter_snapshot_ids())
     head = _frontier_head(view)
     report_partial(head=head)
-    track = await run_off_loop(_view_scope, view)
+    if track is None:
+        track = await frontier_track(view)
     slots = PrioritySlots(_model_concurrency())
     done = 0
     report_progress(done, len(model_ids))
@@ -1397,6 +1420,10 @@ async def build_frontier(view: FrontierView) -> dict:
 
     models = list(await asyncio.gather(*[one(m) for m in model_ids]))
     ensure_spec_generation(generation)
+    if track[1] != "unavailable" and any(
+            (m.get("measured_track") or {}).get("state") == "unavailable"
+            for m in models):
+        report_degraded()
     return {
         **head,
         "models": models,

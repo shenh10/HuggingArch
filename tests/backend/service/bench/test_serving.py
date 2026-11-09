@@ -6,6 +6,7 @@ meanwhile."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from collections import namedtuple
@@ -510,6 +511,36 @@ def test_restore_fills_an_empty_volume_once(env, tmp_path, make_rows, annotate):
     finally:
         lake.close()
     assert serving.restore_from_env() is None
+
+
+def test_a_start_that_made_no_lake_leaves_the_directory_for_the_restore(
+        env, tmp_path, make_rows, annotate):
+    """Production, 2026-11-09: a start failed before its lake existed, and
+    the lake directory it left held the service's own `staging/` and `tmp/`;
+    the restore that followed refused it. Nothing of a lake's is made before
+    a catalog attaches (`Lake.open`), so the next start restores into the
+    directory as it was; the scratch dirs appear only with the lake."""
+    n = _backed_up_lake(tmp_path, make_rows, annotate)
+    vol = tmp_path / "vol" / "bench_lake"
+    vol.mkdir(parents=True, mode=0o700)
+    env.setenv("BENCH_LAKE_CATALOG", str(vol / "catalog.ducklake"))
+    env.setenv("BENCH_LAKE_DATA", str(vol / "data"))
+    env.setenv("BENCH_LAKE_BACKUP_DATA", str(tmp_path / "bucket"))
+    env.setenv("BENCH_LAKE_MEMORY_LIMIT", "not-a-size")   # DuckDB refuses the connection
+    with pytest.raises(LakeUnavailable):
+        Lake.open(LakeConfig.from_env())
+    assert list(vol.iterdir()) == []
+    env.delenv("BENCH_LAKE_MEMORY_LIMIT")
+    env.setenv("HUGGINGARCH_BENCH_RESTORE", "on")
+    assert serving.restore_from_env() == str(vol / "catalog.ducklake")
+    config = LakeConfig.from_env()
+    assert {os.path.abspath(d) for d in (config.spill_dir, config.staging_dir)} <= {
+        str(p) for p in vol.iterdir()}
+    lake = Lake.open(config)
+    try:
+        assert lake.read("SELECT count(*) AS n FROM lake.measurements")[0]["n"] == n
+    finally:
+        lake.close()
 
 
 def test_restore_is_off_unless_asked(env, tmp_path):

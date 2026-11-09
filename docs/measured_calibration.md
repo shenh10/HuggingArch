@@ -576,7 +576,14 @@ volume, the service fills the lake directory from the backup's `current`
 snapshot before anything opens it (`serving.restore_from_env`): every object
 is checked against its sha256 and the row counts against the manifest. A
 partly filled directory or a backup without `current` is refused, never
-replaced by an empty lake. With a lake already present the switch does
+replaced by an empty lake; the refusal names what the directory holds.
+The service makes nothing of a lake's in its directory before a catalog has
+attached there (`Lake.open`: data, spill and staging come after the attach),
+so a start that failed before it had a lake leaves the directory as it found
+it. The restored catalog takes the name `catalog.ducklake` last, after the
+restored lake has opened and its row counts match: a failed restore leaves
+`catalog.ducklake.restoring` and its data, which the next restore refuses,
+never a catalog the next start would open. With a lake already present the switch does
 nothing. A lake built elsewhere is uploaded as a backup snapshot with
 `scripts/bench_lake_backup_now.py` and then restored this way.
 

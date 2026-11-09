@@ -33,7 +33,8 @@ run at once (a process-wide semaphore); each request uses its own cursor.
 
 The lake's local directories — a file catalog's directory, a local data
 directory, the spill directory — are root-only (docs/measured_calibration.md §4.5): `Lake.open`
-creates a missing one with mode 0700 and refuses (`LakeUnavailable`) one not
+creates a missing one with mode 0700 (the catalog's directory before the
+catalog attaches, the others only after) and refuses (`LakeUnavailable`) one not
 owned by the process user or granting any group / other permission. The
 untrusted spec agents run as another user and must not read or change the
 measurements.
@@ -265,9 +266,17 @@ class Lake:
     def open(cls, config: LakeConfig) -> "Lake":
         """Attach the lake and apply the settings. The tables are the
         store's (`store.ensure_schema`, applied once at startup by the
-        composition root); the lake knows no schema."""
-        for d in config.private_dirs():
-            private_dir(d)
+        composition root); the lake knows no schema.
+
+        Of the lake's directories only a file catalog's own directory is
+        made (and checked) before the catalog attaches — the catalog file is
+        created in it. The rest (data, spill, staging) are made once the
+        catalog has attached: a start that fails before there is a lake
+        leaves nothing of one behind, so the next start's restore decision
+        (`serving.restore_from_env`: no catalog, an empty directory) reads
+        the directory as the operator left it."""
+        if config.root is not None:
+            private_dir(config.root)
         try:
             con = duckdb.connect(config={
                 "threads": config.threads,
@@ -300,6 +309,12 @@ class Lake:
             else:
                 con.execute(f"ATTACH {_sql_text('ducklake:' + config.catalog)} AS lake "
                             f"(DATA_PATH {_sql_text(config.data)})")
+            try:
+                for d in config.private_dirs():
+                    private_dir(d)
+            except LakeUnavailable:
+                con.close()
+                raise
             _set_lake_option(con, "target_file_size", "32MB", "32000000")
             lake = cls(con, config)
             memory = con.execute("SELECT parse_formatted_bytes(?)",

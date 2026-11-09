@@ -14,7 +14,7 @@ from backend.api.gallery_overview import (
 from fastapi import HTTPException, Query
 
 from backend.api.gallery_frontier import (FrontierView, build_frontier,
-                                          frontier_request_key)
+                                          frontier_request_key, frontier_track)
 from backend.inference.defaults import (COMM_LATENCY_US_DEFAULT,
                                         GPU_MEMORY_FRACTION_DEFAULT,
                                         LAUNCH_FLOOR_US_DEFAULT)
@@ -96,7 +96,11 @@ async def gallery_frontier(
     view = FrontierView(gpu_sku, float(gpu_memory_fraction),
                         float(comm_latency_us), float(launch_floor_us),
                         int(draft_tokens), float(acceptance_rate))
+    # The lake's answer is read per request and is part of the response's
+    # identity: a response drawn under one track is never served under
+    # another (`frontier_request_key`).
+    track = await frontier_track(view)
     return await within_deadline(
-        frontier_request_key(view), lambda: build_frontier(view),
+        frontier_request_key(view, track), lambda: build_frontier(view, track),
         hint=[m for m in priority.split(",") if m] if priority else None,
         cursor=(have_tag, have))

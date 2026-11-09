@@ -408,13 +408,17 @@ class _Work:
     got (`report_progress`), how many compute jobs it finished, and how many
     requests wait on it now."""
 
-    __slots__ = ("__weakref__", "abandoned", "asked_at", "held_until", "hint",
+    __slots__ = ("__weakref__", "abandoned", "asked_at", "degraded",
+                 "held_until", "hint",
                  "jobs_done", "left_at", "news", "partial_head",
                  "partial_items", "progress", "tag", "task", "waiting")
 
     def __init__(self) -> None:
         self.task: "asyncio.Task[Any]"
         self.abandoned = False
+        #: The result is not its key's answer (`report_degraded`): it goes
+        #: to the requests waiting on it and is held for none.
+        self.degraded = False
         self.held_until: Optional[float] = None
         self.progress: Optional[Tuple[int, int]] = None
         self.jobs_done = 0
@@ -537,6 +541,17 @@ def report_partial(item: Any = None, *,
     published.set()
 
 
+def report_degraded() -> None:
+    """Say that the result the work this task runs for is about to return is
+    not its key's answer — a part of it fell back because something it reads
+    failed mid-work (the lake that answered its version, then not its rows).
+    The requests waiting on it get it; it is not held for a retry
+    (`_settle`), which asks again. A no-op outside a request."""
+    work = _current_work.get()
+    if work is not None:
+        work.degraded = True
+
+
 class _News(Exception):
     """The work published something the waiting client does not have."""
 
@@ -591,11 +606,13 @@ def _table() -> Dict[str, _Work]:
 
 def _settle(table: Dict[str, _Work], key: str, work: _Work) -> None:
     """The work is done: forget it, or hold a successful result whose caller
-    gave up so the retry finds it."""
+    gave up so the retry finds it — unless the work said the result is not
+    its key's answer (`report_degraded`)."""
     if table.get(key) is not work:
         return
     task = work.task
-    if not work.abandoned or task.cancelled() or task.exception() is not None:
+    if (not work.abandoned or work.degraded or task.cancelled()
+            or task.exception() is not None):
         del table[key]
         return
     work.held_until = time.monotonic() + _HOLD_S
