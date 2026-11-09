@@ -4,8 +4,8 @@ Bench lake, owned by an admin user.
 
 Each file is validated by the CLI/CI gate (`validate_text`) and stored as
 one batch of the owner's, already shared — exactly what an admin's
-`hbench upload --public` stores (`store.upload`, annotated by
-`row_annotations`). A file holds one run (its rows' `run_id`).
+`hbench upload --public` stores (`store.upload`; the service's derived
+file annotates the new inputs when it reaches the upload). A file holds one run (its rows' `run_id`).
 
 Idempotent: a row whose 12-column identity the owner already holds is
 skipped, and a file whose every row is such a duplicate writes no batch, so
@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.inference import benchmarks as _benchmarks
 from backend.service.bench import lake as _lake
 from backend.service.bench import store as _store
-from backend.service.bench.routes import row_annotations, run_of
+from backend.service.bench.routes import run_of
 
 
 def main() -> int:
@@ -48,7 +48,6 @@ def main() -> int:
 
     lake = _lake.get_lake()
     _store.ensure_schema(lake)
-    _store.annotate_all(lake, row_annotations)     # as the server's startup does
     stored = skipped = 0
     for path in files:
         with open(path, encoding="utf-8") as f:
@@ -60,7 +59,7 @@ def main() -> int:
             return 1
         res = _store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()), run_id=run_id,
                             label=f"shared:{os.path.basename(path)}", rows=rows,
-                            annotate=row_annotations, status="shared", decided_by=owner)
+                            status="shared", decided_by=owner)
         stored += res.inserted
         skipped += res.duplicates
         print(f"{res.inserted:5d} rows from {path}"
