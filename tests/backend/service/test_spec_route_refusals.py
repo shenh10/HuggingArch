@@ -29,6 +29,10 @@ def world(monkeypatch, tmp_path):
 
     started = []
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))
+    # The host's own claude credential: the core routes and an admin with no
+    # stored key run on it.
+    monkeypatch.setenv("SPEC_AGENT_CLI", "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "host-key")
     monkeypatch.setattr(spec_worker, "get_agent_binary", lambda: "claude")
     monkeypatch.setattr("shutil.which", lambda b: f"/usr/bin/{b}")
     monkeypatch.setattr(spec_worker, "acquire", lambda key: "ok")
@@ -225,7 +229,9 @@ def test_undecryptable_credentials(world, monkeypatch, route):
 
 
 @pytest.mark.parametrize("route", SERVICE)
-def test_admin_without_credentials_runs_on_host_agent(world, monkeypatch, route):
+def test_admin_undecryptable_key_is_not_replaced_by_the_host(world, monkeypatch, route):
+    """An admin's stored key that this server cannot decrypt is refused like
+    anyone's — never silently swapped for the host's credentials."""
     from backend.service import agent_credentials as creds
     from backend.service import auth
 
@@ -233,7 +239,34 @@ def test_admin_without_credentials_runs_on_host_agent(world, monkeypatch, route)
         raise creds.CredentialDecryptError("x")
     monkeypatch.setattr(auth, "is_admin", lambda uid: True)
     monkeypatch.setattr(creds, "resolve_env", undecryptable)
+    assert _call(route, monkeypatch)["status"] == "credential_undecryptable"
+    assert world == []
+
+
+@pytest.mark.parametrize("route", SERVICE)
+def test_admin_without_a_key_runs_on_host_credentials(world, monkeypatch, route):
+    from backend.service import agent_credentials as creds
+    from backend.service import auth
+    monkeypatch.setattr(auth, "is_admin", lambda uid: True)
+    monkeypatch.setattr(creds, "resolve_env", lambda uid, **kw: None)
     assert _call(route, monkeypatch)["status"] == "started"
+
+
+@pytest.mark.parametrize("route", ["service_generate", "core_generate",
+                                   "core_refine", "service_refine"])
+def test_host_run_without_host_credentials(world, monkeypatch, route):
+    """A run on the host's credentials when the host has none is refused
+    before it starts, not left to the agent CLI's "please log in"."""
+    from backend.service import agent_credentials as creds
+    from backend.service import auth
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(auth, "is_admin", lambda uid: True)
+    monkeypatch.setattr(creds, "resolve_env", lambda uid, **kw: None)
+    out = _call(route, monkeypatch)
+    assert out["status"] == "host_credentials_missing"
+    assert "ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN" in out["message"]
+    assert world == []
 
 
 @pytest.mark.parametrize("route", SERVICE)

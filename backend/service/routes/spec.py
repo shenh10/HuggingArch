@@ -190,9 +190,10 @@ def _preflight(user_id: str, is_admin: bool, verb: str) -> tuple[dict | None, di
     The core route's agent-CLI check, then the BYOK gate: resolve the
     caller's own agent + credential env, with the model the credential pins
     for this run (`verb` is its task key: generate / refine). A non-admin with no stored key is
-    rejected — the run spends the user's key, not the host's. Admins may run
-    with the selected host agent's allowlisted credentials (resolved None);
-    unrelated server environment variables stay hidden. Last, the per-user
+    rejected — the run spends the user's key, not the host's. An admin with
+    no stored key may run with the selected host agent's allowlisted
+    credentials (resolved None) when the host has them; a stored key that
+    cannot be decrypted is refused for everyone. Last, the per-user
     hourly quota (admins exempt), checked without recording a start."""
     refused = preflight.agent_cli_refusal()
     if refused:
@@ -200,15 +201,13 @@ def _preflight(user_id: str, is_admin: bool, verb: str) -> tuple[dict | None, di
     try:
         resolved = _creds.resolve_env(user_id, task=verb)
     except _creds.CredentialDecryptError:
-        # Stored but undecryptable: tell a non-admin the truth (re-enter),
-        # not the misleading "add a key". An admin keeps the host-credential
-        # fallback (the error is already logged for operators).
-        if not is_admin:
-            return None, {
-                "success": False, "status": "credential_undecryptable",
-                "message": "Your saved agent API key could not be decrypted — please re-enter it in account settings.",
-            }
-        resolved = None
+        # Stored but undecryptable: the truth (re-enter), not the misleading
+        # "add a key" — and never the host's credentials instead, admin or
+        # not: the caller chose their own key.
+        return None, {
+            "success": False, "status": "credential_undecryptable",
+            "message": "Your saved agent API key could not be decrypted — please re-enter it in account settings.",
+        }
     except _creds.CredentialRefusal as exc:
         # None of the caller's keys can be chosen, or they could not be
         # read: never the host's instead.
@@ -218,6 +217,10 @@ def _preflight(user_id: str, is_admin: bool, verb: str) -> tuple[dict | None, di
             "success": False, "status": "no_credentials",
             "message": f"Add your own agent API key in account settings to {verb} specs.",
         }
+    if resolved is None:
+        refused = preflight.host_credentials_refusal()
+        if refused:
+            return None, refused
     if not is_admin and not _quota_room(user_id):
         return None, {
             "success": False, "status": "quota_exceeded",

@@ -3,6 +3,7 @@
 The core routes (`/generate-spec`, `/refine-spec`) and the signed-in service
 routes (`/api/spec/generate`, `/api/spec/refine`) refuse a run for the same
 reasons with the same responses: the agent CLI is misconfigured or missing,
+a run on the host's credentials has none to use,
 the Hugging Face repo is missing / gated / has no config, the model already
 has a spec, or its run lock is taken. Each check returns the refusal body,
 or None to go on.
@@ -21,6 +22,7 @@ from typing import Optional
 from fastapi.responses import JSONResponse
 
 from backend import spec_worker
+from backend.agents.base import HostCredentialsMissing, host_has_credentials
 from backend.analyzer import classify_config_fetch_failure
 from backend.arch.loader import SpecLoader
 from backend.arch.snapshots import load_config as load_snapshot_config
@@ -39,6 +41,18 @@ def agent_cli_refusal() -> Optional[dict]:
     if not shutil.which(agent_binary):
         return {"success": False, "message": "Coding agent CLI not installed"}
     return None
+
+
+def host_credentials_refusal() -> Optional[dict]:
+    """Refusal when a run on the host's own credentials could not
+    authenticate: the server's environment holds no credential for the
+    configured agent (the agent's private HOME has no login state to fall
+    back on — `AgentBackend._run_cwd_and_env` refuses the same run at spawn)."""
+    cli = spec_worker.get_agent_cli()
+    if host_has_credentials(cli):
+        return None
+    return {"success": False, "status": "host_credentials_missing",
+            "message": str(HostCredentialsMissing(cli))}
 
 
 def probe_repo(model_id: str) -> tuple[Optional[dict], Optional[dict]]:

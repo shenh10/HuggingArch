@@ -25,6 +25,7 @@ import httpx
 
 from backend import supabase_rest
 from backend.api._app import app
+from backend.api._spec_preflight import host_credentials_refusal
 from backend.service import auth as _auth
 from backend.service import spec_generations as _gens
 from backend.service import agent_credentials as _creds
@@ -391,7 +392,7 @@ def admin_review_spec(
     admin: dict = Depends(_auth.require_admin),
 ):
     """Start an agent review of any generation (admin). Uses the admin's own
-    BYOK creds if set, else falls back to host credentials. Returns
+    BYOK creds if set, else the host's credentials when it has them. Returns
     {status:"started", run_key}; poll GET /api/spec/review-status."""
     admin_id = admin.get("sub")
     rec = _gens.get(record_id)
@@ -403,10 +404,16 @@ def admin_review_spec(
     try:
         resolved = _creds.resolve_env(admin_id, task="review")
     except _creds.CredentialDecryptError:
-        resolved = None  # admin may fall back to host credentials
+        # The admin's own key, unreadable: never the host's instead.
+        return {"status": "credential_undecryptable",
+                "message": "Your saved agent API key could not be decrypted — please re-enter it in account settings."}
     except _creds.CredentialRefusal as exc:
         # The admin's own keys cannot be chosen or read: not the host's.
         return exc.refusal("run a review")
+    if resolved is None:
+        refused = host_credentials_refusal()
+        if refused:
+            return {"status": refused["status"], "message": refused["message"]}
     return launch_review(
         rec, reviewer_id=admin_id, reviewer_role="admin",
         agent_cli=(resolved or {}).get("agent_cli"),

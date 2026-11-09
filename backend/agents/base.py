@@ -121,6 +121,20 @@ def host_agent_credentials(agent_cli: str) -> dict:
             if name in os.environ}
 
 
+class HostCredentialsMissing(RuntimeError):
+    """A run on the host's own credentials, for an agent whose credential
+    variables the server's environment does not hold. In a private agent HOME
+    the CLI has no other way to authenticate (no login state, no keychain), so
+    the run is refused at spawn instead of the CLI failing on "please log in"."""
+
+    def __init__(self, agent_cli: str):
+        names = AGENT_ENV_VARS[agent_cli].credentials
+        super().__init__(
+            f"This server has no {agent_cli} credentials ({' / '.join(names)} "
+            "unset). Add your own agent API key in account settings.")
+        self.agent_cli = agent_cli
+
+
 def host_has_credentials(agent_cli: str) -> bool:
     """Whether the server's environment holds a credential for `agent_cli` —
     any of its credential variables, non-empty. An endpoint or a model name
@@ -275,6 +289,10 @@ class AgentBackend(ABC):
         child_env = self._merge_env(env)
         if not workspace:
             return PROJECT_ROOT, child_env
+        # The overlay leaf's HOME holds no login state, so a host run (env
+        # None) authenticates only through the credential variables.
+        if env is None and not host_has_credentials(self.cli_name):
+            raise HostCredentialsMissing(self.cli_name)
         from backend.spec_worker.overlay import resolve_run_workspace
         run_cwd = resolve_run_workspace(workspace)
         workspace_path = Path(run_cwd)

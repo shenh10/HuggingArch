@@ -20,7 +20,7 @@ import time
 from typing import IO, Callable, Generator, Optional
 
 from backend.agents import get_backend
-from backend.agents.base import AgentEnd
+from backend.agents.base import AgentEnd, HostCredentialsMissing
 
 from .scrub import scrub_paths
 
@@ -467,10 +467,11 @@ def stream_agent_core(
                 done_data["usage"] = latest_usage
             yield _log_and_yield(done_data)
         except Exception as e:
-            # A CLI that cannot be started (not installed, not executable) is
-            # an agent that is not available; anything else failed here.
+            # A CLI that cannot be started (not installed, not executable, no
+            # credentials to start it with) is an agent that is not available;
+            # anything else failed here.
             end = (AgentEnd.AGENT_UNAVAILABLE
-                   if proc is None and isinstance(e, OSError)
+                   if proc is None and isinstance(e, (OSError, HostCredentialsMissing))
                    else AgentEnd.FAILED)
             done_data = {"type": "done", "success": False, "message": str(e),
                          "agent_end": end.value}

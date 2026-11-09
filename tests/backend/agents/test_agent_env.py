@@ -243,6 +243,9 @@ def test_runner_starts_codex_and_kimi_with_target_root(tmp_path, monkeypatch):
     monkeypatch.setenv("HA_USER_SPECS_ROOT", str(tmp_path / "user_specs"))
     workspace = overlay.new_run_overlay("user-a", "Qwen/Example", kind="generate")
     leaf = str(workspace.resolve())
+    # Host runs: the host holds each agent's credential.
+    monkeypatch.setenv("OPENAI_API_KEY", "host-openai")
+    monkeypatch.setenv("KIMI_MODEL_API_KEY", "host-kimi")
 
     for cli, backend_cls in (("codex", CodexBackend), ("kimi", KimiBackend)):
         spawned = {}
@@ -392,6 +395,9 @@ def _overlay_leaf(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))
     monkeypatch.setenv("HA_USER_SPECS_ROOT", str(tmp_path / "user_specs"))
+    # Host runs: the host holds each agent's credential.
+    monkeypatch.setenv("OPENAI_API_KEY", "host-openai")
+    monkeypatch.setenv("KIMI_MODEL_API_KEY", "host-kimi")
     workspace = overlay.new_run_overlay("user-a", "Qwen/Example", kind="generate")
     return workspace, str(workspace.resolve())
 
@@ -513,3 +519,20 @@ def test_kimi_byok_env_passes_through_as_kimi_model_family(tmp_path, monkeypatch
     assert env["KIMI_MODEL_NAME"] == "kimi-user-model"
     assert env["KIMI_MODEL_API_KEY"] == "sk-u"
     assert env["KIMI_MODEL_BASE_URL"] == "https://api.example/v1"
+
+
+def test_host_run_in_a_private_home_without_credentials_is_refused(monkeypatch, tmp_path):
+    """The overlay's HOME carries no login state, so a host run (env None)
+    with no credential variable cannot authenticate: refused at spawn, as an
+    agent that is not available — not left to the CLI's "please log in"."""
+    import pytest
+    from backend.agents.base import HostCredentialsMissing
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr("backend.spec_worker.overlay.resolve_run_workspace",
+                        str)
+    with pytest.raises(HostCredentialsMissing):
+        ClaudeBackend()._run_cwd_and_env(None, str(tmp_path))
+    # A BYOK run carries its own key; the host's absence is irrelevant.
+    _, env = ClaudeBackend()._run_cwd_and_env({"ANTHROPIC_API_KEY": "k"}, str(tmp_path))
+    assert env["ANTHROPIC_API_KEY"] == "k"

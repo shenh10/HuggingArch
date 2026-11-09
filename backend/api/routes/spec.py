@@ -67,7 +67,7 @@ async def generate_spec(req: GenerateSpecRequest):
     """Trigger the configured agent CLI to generate a spec for an unknown model."""
     if supabase_env.jwt_verification_available():
         return _ANON_DISABLED_RESPONSE
-    refused = preflight.agent_cli_refusal()
+    refused = preflight.agent_cli_refusal() or preflight.host_credentials_refusal()
     if refused:
         return refused
 
@@ -146,7 +146,7 @@ async def refine_spec(req: RefineSpecRequest):
     """Trigger the configured agent CLI to refine a spec with params discrepancy."""
     if supabase_env.jwt_verification_available():
         return _ANON_DISABLED_RESPONSE
-    refused = preflight.agent_cli_refusal()
+    refused = preflight.agent_cli_refusal() or preflight.host_credentials_refusal()
     if refused:
         return refused
 
