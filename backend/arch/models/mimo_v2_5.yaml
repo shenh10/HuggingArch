@@ -333,25 +333,19 @@ model:
 # the `attention_output` role.
 quant_context:
   per_role:
-    # The FULL-attention class only. Its fused QKV is blocked per SEGMENT,
-    # each ceil-padded on its own, with the K segment blocked per head inside
-    # that: 96 + 4x2 + 4 = 108 rows where the flat rule gives
-    # ceil(13568/128) = 106, and the file says [108, 32].
-    #
-    # Scoped by ROLE rather than by tensor name, and it has to be: the windowed
-    # class holds the same leaf under the same name, differing only in
-    # `n_kv_heads` (8 against 4), and its scale IS flat at 116 — a number the
-    # segmented expression cannot produce for either class. The spec already
-    # separates them, giving the windowed component the `attention_swa` slot,
-    # so `per_role` can say two different things where a name pattern could
-    # say only one.
+    # The checkpoint stores four interleaved [Q|K|V] chunks. Each chunk,
+    # including its partial final block, owns one scale grid: full attention
+    # has 4 * ceil((13568 / 4) / 128) = 108 rows; SWA has 116.
+    # SGLang's fused loader uses the global KV-head count (4), including for
+    # SWA, whose local component binds eight KV heads.
     attention: { method: fp8, block_h: 128, block_w: 128,
-                 scale_shape: ["((n_heads * d_head + block_h - 1) // block_h)
-                                + n_kv_heads * ((d_head + block_h - 1) // block_h)
-                                + ((n_kv_heads * d_v_head + block_h - 1) // block_h)",
+                 block_scale_layout: { kind: tp_interleaved, checkpoint_tp: 4, world: tp_attention },
+                 scale_shape: ["chunks_per_rank * ((out // chunks_per_rank + block_h - 1) // block_h)",
                                "(in + block_w - 1) // block_w"] }
-    # Flat, and therefore nothing to declare — it falls through to the scheme.
-    attention_swa: { method: fp8, block_h: 128, block_w: 128 }
+    attention_swa: { method: fp8, block_h: 128, block_w: 128,
+                     block_scale_layout: { kind: tp_interleaved, checkpoint_tp: 4, world: tp_attention },
+                     scale_shape: ["chunks_per_rank * ((out // chunks_per_rank + block_h - 1) // block_h)",
+                                   "(in + block_w - 1) // block_w"] }
     ffn_dense: { method: fp8, block_h: 128, block_w: 128 }
     ffn_moe:   { method: fp8, block_h: 128, block_w: 128 }
     attention_output: { method: none }

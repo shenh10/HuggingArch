@@ -75,6 +75,12 @@ def _scale_block_refusal(row: Dict[str, Any]) -> Optional[str]:
     order they are packed in is the framework's; sglang wants every merged
     partition whole and avoids DeepSeek-V3's case by not merging it).
 
+    An explicit `block_scale_layout` can instead state that checkpoint TP
+    chunks own the grids. The selected loader either merges whole chunks
+    (SGLang) or gathers heads (vLLM), then requantizes a fresh rank-local
+    fused grid. Logical Q/K/V boundaries need no block alignment on those
+    paths. See docs/fp8_tp_interleaved.md for the audited source contracts.
+
     A per-GROUP scale (GPTQ / AWQ, Marlin) is refused on a ragged reduction
     width whether or not it was cut: Marlin and AWQ raise on a K that is
     not a whole number of groups at any degree (vLLM `marlin_utils`
@@ -110,6 +116,19 @@ def _scale_block_refusal(row: Dict[str, Any]) -> Optional[str]:
         grouped = gran.startswith("per-group:")
         if width_k and shard.k_local % width_k and (shard.cuts_k or grouped):
             return refusal("d_reduce", shard.k_local, width_k)
+        layout = shard.block_scale_layout
+        loader = layout.get("loader") if layout is not None else None
+        if layout is not None and layout.get("load_refusal"):
+            return str(layout["load_refusal"])
+        if loader:
+            # SGLang loads whole checkpoint chunks at matching TP. At lower
+            # TP it dequantizes those chunks, deinterleaves Q/K/V and
+            # requantizes the entire fused rank matrix, padding its final
+            # block. vLLM can also gather individual heads from those
+            # chunks and requantize at higher TP, replicating KV as needed.
+            # Neither loader cuts scale blocks at logical Q/K/V boundaries.
+            # The reduction-axis check above still applies.
+            continue
         if not width_n or not shard.n_local % width_n:
             continue
         if shard.cuts_n:
@@ -511,6 +530,7 @@ def _build_jobs_over_points(
             timed_stacks=frozenset({stack}),
             precision=precision,
             gpu=card,
+            allow_load_refusals=True,
             breakdown=False,
         ) for stack in stacks]
 
@@ -549,6 +569,7 @@ def _build_jobs_over_points(
                 include_aux_timing=True,
                 precision=precision,
                 gpu=card,
+                allow_load_refusals=True,
                 breakdown=False,
             )
 

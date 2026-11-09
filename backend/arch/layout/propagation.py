@@ -436,7 +436,7 @@ class LayoutPropagation(Rule):
         layout cuts it; any other axis is one partition, the tensor's global
         extent beside the rank's."""
         out: Dict[Any, Any] = {}
-        for row in physical_artifacts(analysis):
+        for row in physical_artifacts(analysis, stored_only=True):
             if row.surface != STORED:
                 continue
             layout = row.runtime_layout
