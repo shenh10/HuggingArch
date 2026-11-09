@@ -1035,10 +1035,14 @@ def _write_json(path: str, value: Any) -> None:
         logger.debug("code_trace: %s not kept", path, exc_info=True)
 
 
-#: The process's trace bodies (`HA_CODE_TRACE_DIR`; default beside the other
+#: Where trace bodies are kept. A cache entry on disk is served only while
+#: its trace body can be read, so this must persist as long as the caches
+#: whose entries name it (in production: on the same volume).
+TRACE_DIR_ENV = "HA_CODE_TRACE_DIR"
+#: The process's trace bodies (`TRACE_DIR_ENV`; default beside the other
 #: local caches).
 TRACES = TraceStore(os.environ.get(
-    "HA_CODE_TRACE_DIR",
+    TRACE_DIR_ENV,
     os.path.join(os.path.expanduser("~"), ".cache", "huggingarch",
                  "code-traces")))
 

@@ -1,8 +1,7 @@
 import json
 import tarfile
 
-from backend.gallery_cache_artifact import (
-    _install, _marker_matches, _safe_archive)
+from backend.gallery_cache_artifact import GALLERY_CACHE
 from backend.fingerprint import engine_version
 
 
@@ -13,7 +12,7 @@ def test_safe_archive_rejects_non_json(tmp_path):
     source.write_text("{}", encoding="utf-8")
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(source.parent, arcname="gallery")
-    assert _safe_archive(archive) == 1
+    assert GALLERY_CACHE.check(archive) == 1
 
     bad = tmp_path / "bad.tar.gz"
     payload = tmp_path / "bad-source" / "gallery" / "entry.txt"
@@ -22,7 +21,7 @@ def test_safe_archive_rejects_non_json(tmp_path):
     with tarfile.open(bad, "w:gz") as tar:
         tar.add(payload.parent, arcname="gallery")
     try:
-        _safe_archive(bad)
+        GALLERY_CACHE.check(bad)
     except ValueError:
         pass
     else:
@@ -44,7 +43,7 @@ def test_install_merges_artifact_into_runtime_cache(tmp_path):
     (root / "runtime-only" / "local.json").write_text("{}", encoding="utf-8")
     (root / "frontier-views").mkdir()
     (root / "frontier-views" / "stale.json").write_text("{}", encoding="utf-8")
-    installed = _install(
+    installed = GALLERY_CACHE.install(
         archive, root, "gallery-cache-v1/test/cache.tar.gz", "digest")
 
     assert installed == 2
@@ -57,8 +56,9 @@ def test_install_merges_artifact_into_runtime_cache(tmp_path):
         "artifact": "gallery-cache-v1/test/cache.tar.gz",
         "sha256": "digest",
         "files": 2,
+        "traces": [],
     }
-    assert _marker_matches(root, "gallery-cache-v1/test/cache.tar.gz", "digest")
+    assert GALLERY_CACHE.installed(root, "gallery-cache-v1/test/cache.tar.gz", "digest")
 
 
 def test_index_selects_an_immutable_digest_addressed_artifact():

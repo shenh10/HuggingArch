@@ -5,58 +5,32 @@ machine therefore needs only one download per engine version: fetch the
 compressed archive, verify its digest, and unpack it on the persistent volume.
 Per-record remote reads belong in ``SolPool`` itself (the next step for this
 layer); this module is the smaller startup boundary that lets a new machine
-reuse a complete warm corpus without baking it into the image.
+reuse a complete warm corpus without baking it into the image. The transport
+(index, download, digest) is `backend.release_artifacts`'.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
-import sys
 import tarfile
 import tempfile
-import urllib.request
 
-from backend.fingerprint import cache_engine_version
-from backend.release_artifacts import artifact_to_pull
+from backend.release_artifacts import fetch_verified
 
 
-DEFAULT_BUCKET = "sol-pool"
+DIR_ENV = "HA_SOL_POOL_DIR"
+PIN_ENV = "HA_SOL_POOL_ARTIFACT"
+#: The directories (by environment variable) a pull writes into, which must
+#: outlive a restart (`tests/meta/test_volume_dirs.py`).
+VOLUME_DIRS = (DIR_ENV,)
 
 
 def _pool_root() -> Path:
     return Path(os.environ.get(
-        "HA_SOL_POOL_DIR", str(Path.home() / ".cache/huggingarch/sol-pool")))
-
-
-def _index_path() -> str:
-    from backend.inference.sol_data import walkRecordSchema
-    return f"{walkRecordSchema}/{cache_engine_version()}/index.json"
-
-
-def _request(url: str, key: str, timeout: float):
-    request = urllib.request.Request(url, headers={
-        "Authorization": f"Bearer {key}",
-        "apikey": key,
-        "Accept": "application/octet-stream",
-    })
-    return urllib.request.urlopen(request, timeout=timeout)
-
-
-def _download(url: str, key: str, destination: Path, timeout: float) -> None:
-    with _request(url, key, timeout) as response, destination.open("wb") as out:
-        shutil.copyfileobj(response, out, length=1024 * 1024)
-
-
-def _digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        DIR_ENV, str(Path.home() / ".cache/huggingarch/sol-pool")))
 
 
 def _safe_archive(archive: Path) -> None:
@@ -144,45 +118,17 @@ def _unpack(archive: Path, root: Path, artifact: str, digest: str) -> None:
 
 def pull(timeout: float = 900.0) -> int:
     """Fetch, verify and unpack the configured artifact; 0 on success/no-op."""
-    from backend.supabase_env import configured, service_role
-    if not configured():
-        print("SOL pool artifact: Supabase is not configured",
-              file=sys.stderr, flush=True)
-        return 0
-    base, key = service_role()
-    base = base.rstrip("/")
-    bucket = os.environ.get("HA_ARTIFACT_BUCKET",
-                            os.environ.get("HA_SOL_POOL_BUCKET", DEFAULT_BUCKET))
-    selected = artifact_to_pull(
-        os.environ.get("HA_SOL_POOL_ARTIFACT", ""), _index_path(),
-        cache_engine_version(), base, key, bucket, min(30.0, timeout), _request)
-    if selected is None:
-        print("SOL pool artifact: none for this engine; "
-              "runtime warm will build it", flush=True)
-        return 0
-    artifact, expected = selected
-    object_url = f"{base}/storage/v1/object/{bucket}/{artifact}"
-
+    from backend.inference.sol_data import walkRecordSchema
     root = _pool_root()
-    if _has_bootstrap(root, artifact, expected):
-        print(f"SOL pool artifact: {root} already has this complete corpus",
-              flush=True)
-        return 0
 
-    archive = root.parent / f".{root.name}.{os.getpid()}.tar.gz"
-    root.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        print(f"SOL pool artifact: downloading {artifact}", flush=True)
-        _download(object_url, key, archive, timeout)
-        actual = _digest(archive)
-        if actual != expected:
-            raise ValueError(
-                f"SOL pool artifact digest mismatch: {actual} != {expected}")
+    def install(archive: Path, artifact: str, digest: str) -> None:
         _safe_archive(archive)
-        _unpack(archive, root, artifact, expected)
-    finally:
-        archive.unlink(missing_ok=True)
-    return 0
+        _unpack(archive, root, artifact, digest)
+
+    return fetch_verified(
+        "SOL pool", walkRecordSchema, PIN_ENV, root,
+        lambda artifact, digest: _has_bootstrap(root, artifact, digest),
+        install, timeout)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -190,9 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=["pull"])
     parser.add_argument("--timeout", type=float, default=900.0)
     arguments = parser.parse_args(argv)
-    if arguments.command == "pull":
-        return pull(arguments.timeout)
-    return 2
+    return pull(arguments.timeout)
 
 
 if __name__ == "__main__":

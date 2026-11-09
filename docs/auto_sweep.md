@@ -632,6 +632,15 @@ measured views are folded live and are deliberately excluded.
 deterministic artifact clears stale machine-local measured views before
 merging its entries; runtime warm can then add more entries beside them.
 
+The Scaling sweep's finished answers are the same kind of layer
+(`HA_SWEEP_CACHE_DIR`, `backend.sweep_cache_artifact`,
+`sweep-cache-v1/<engine>/index.json`); the unfinished `steps/` beside them
+never ship. Both result-cache artifacts carry the code traces their entries
+name, installed into `HA_CODE_TRACE_DIR` on the volume: an entry is served
+only while its trace can be read. Publishing uses Supabase's resumable
+upload for every object, through the environment's proxy only when one is
+configured.
+
 Gallery and Scaling project a serving-law record in-process. The compiled CSE
 graph is memoized by its law content for the process's lifetime; there is no
 durable projection cache or remote tier. Only the serving-law pool above is

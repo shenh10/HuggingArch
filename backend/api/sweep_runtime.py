@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import pathlib
 import dataclasses
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, FrozenSet, Iterator, List, Mapping,
@@ -24,6 +23,7 @@ from backend.arch.loader import get_default_loader
 from backend.code_trace.provider import recording
 from backend.fingerprint import engine_version, result_version
 from backend.hf.metadata import fetch_config
+from backend.sweep_cache_artifact import SWEEP_CACHE
 from backend.measure.cache import (DiskBackend, KeyedCache, MemoryBackend,
                                    TieredBackend, env_bytes, private_copy)
 from backend.api._models import (
@@ -93,12 +93,8 @@ def resolved_spec_for(model_id: str) -> Any:
     return resolved if resolved is not None and resolved.spec is not None else None
 
 
-_SWEEP_CACHE_DIR = pathlib.Path(
-    os.environ.get(
-        "HA_SWEEP_CACHE_DIR",
-        pathlib.Path.home() / ".cache" / "huggingarch" / "sweep",
-    )
-)
+# Declared once with the artifact that bootstraps it at container start.
+_SWEEP_CACHE_DIR = SWEEP_CACHE.directory()
 # Both sweep tiers share the directory's one budget (the directory is the
 # disk the operator sizes); finished answers keep the larger share, the
 # unfinished steps of one running sweep the smaller.

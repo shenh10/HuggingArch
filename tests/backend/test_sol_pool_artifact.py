@@ -1,7 +1,8 @@
 import json
 import tarfile
 
-from backend.sol_pool_artifact import _digest, _has_bootstrap, _unpack
+from backend.release_artifacts import digest as _digest
+from backend.sol_pool_artifact import _has_bootstrap, _unpack
 
 
 def test_digest_reads_hash_object_by_chunks(tmp_path):

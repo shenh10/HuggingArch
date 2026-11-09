@@ -55,9 +55,15 @@ at deploy so the service can report which code it runs (the image has no
 `fly.toml` sets the VM (`shared-cpu-1x`, 2 GB), a 3 GB volume
 `huggingarch_cache` mounted at `/app/.cache`, rate limits (`ANALYZE_RPM`,
 `INFERENCE_RPM`), `SPEC_AGENT_MAX_CONCURRENT`, and the result-cache directories
-`HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR`
-under `/app/var` — outside the
-volume, so the mount does not hide the caches baked into the image.
+`HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR` with the code-trace bodies their
+entries name (`HA_CODE_TRACE_DIR`) — on the volume, so they survive a restart.
+Nothing is baked into the image for them; at start `scripts/entrypoint.sh`
+merges each engine version's published artifact into them
+(`backend.release_artifacts`; publish with
+`python -m backend.{gallery,sweep}_cache_artifact publish --cache-dir DIR`).
+A directory that holds files baked into the image must stay outside the
+volume instead, or the mount hides them; `tests/meta/test_volume_dirs.py`
+checks every directory a start-time pull writes is under the mount.
 Each cache directory is also byte-bounded by one knob
 (`HA_GALLERY_CACHE_BYTES` for the gallery's, `HA_SWEEP_CACHE_BYTES` for the
 sweeps'; the tiers under a directory split it, oldest entries evicted

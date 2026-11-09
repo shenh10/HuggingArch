@@ -94,7 +94,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     HA_GALLERY_CACHE_DIR=/app/.cache/huggingarch/gallery-cache \
     HA_SOL_POOL_DIR=/app/var/sol-pool \
     HA_SOL_POOL_ONLY=0 \
-    HA_SWEEP_CACHE_DIR=/app/var/sweep-cache \
+    # Nothing is baked for the sweep answers (the builder's warm runs with
+    # HA_SOL_POOL_ONLY), so they live on the volume with the trace bodies
+    # their entries name; scripts/entrypoint.sh merges the published artifact.
+    HA_SWEEP_CACHE_DIR=/app/.cache/huggingarch/sweep-cache \
+    HA_CODE_TRACE_DIR=/app/.cache/huggingarch/code-traces \
     # The corpus admitter's per-(base, environment) baseline cache, on the
     # persistent volume so a restart does not re-measure the corpus.
     # Consumed by backend/service/admission.py.

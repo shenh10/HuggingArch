@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.hf.metadata import fetch_config
@@ -24,6 +22,7 @@ from backend.measure import pool
 from backend.inference.capacity import sweep_points
 from backend.inference.parallel_config import ParallelConfig
 from backend.fingerprint import result_version
+from backend.gallery_cache_artifact import GALLERY_CACHE
 from backend.measure.cache import (
     DiskBackend, KeyedCache, MemoryBackend, TieredBackend, env_bytes,
 )
@@ -70,12 +69,8 @@ def _model_concurrency() -> int:
 #   • an engine change → the engine fingerprint changes → every key misses.
 # The cache is content-addressed (filename = sha of the key), so a stale entry
 # is never served — a changed input simply lands on a different file.
-_GALLERY_CACHE_DIR = pathlib.Path(
-    os.environ.get(
-        "HA_GALLERY_CACHE_DIR",
-        pathlib.Path.home() / ".cache" / "huggingarch" / "gallery",
-    )
-)
+# Declared once with the artifact that bootstraps it at container start.
+_GALLERY_CACHE_DIR = GALLERY_CACHE.directory()
 # The gallery's disk tiers all live under that one directory, so they share
 # one operator budget — the directory is the disk the operator sizes — and
 # the split among the tiers is a code fact, not three more knobs: the

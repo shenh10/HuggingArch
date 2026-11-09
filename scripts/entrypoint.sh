@@ -36,6 +36,7 @@ cache="${HA_CACHE_ROOT:-/app/.cache}"
 # exactly the regression this bootstrap exists to prevent.
 python -m backend.sol_pool_artifact pull || exit $?
 python -m backend.gallery_cache_artifact pull || exit $?
+python -m backend.sweep_cache_artifact pull || exit $?
 chown root:root "$cache" && chmod 0755 "$cache"
 for d in "${HF_HOME:-}" "${HUGGINGARCH_HF_META_CACHE_DIR:-}" "${HA_SPEC_RUNS_ROOT:-}" \
          "${HA_USER_SPECS_ROOT:-}" "${HA_ADMISSION_CACHE_DIR:-}"; do
