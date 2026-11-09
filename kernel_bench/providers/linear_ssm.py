@@ -1375,8 +1375,13 @@ def _sglang_dilated_conv1d_update_build(inv, env, inputs) -> BenchCase:
     The state write is inside the timed call because it is inside the
     framework's: the next step's window is this call's tail, and a step
     that does not advance the window is not the step a server runs.
+
+    The launch is torch's own `F.conv1d`, a CPU provider env runs it as
+    one (the cross-check does); unlike the CUDA-only wrapper bodies this
+    build carries no CUDA requirement, and the guard copy-pasted from
+    them made every CPU-only CI run red while GPU boxes passed it by
+    accident of the machine, not the env.
     """
-    _require_cuda()
     import torch
     import torch.nn.functional as F
 
