@@ -989,10 +989,7 @@ class _Stored(NamedTuple):
         for record_name in recordIds:
             if record_name not in wantedNames:
                 continue
-            # The walk's records are re-read on every cold build of this
-            # model and card class, so they enter the pool's pin tier: the
-            # parse is paid once per process, not once per rebuild.
-            item = sharedSolPool.pinned_record(bundle_key, record_name)
+            item = sharedSolPool.record(bundle_key, record_name)
             if item is None:
                 return None
             layouts.append(item)

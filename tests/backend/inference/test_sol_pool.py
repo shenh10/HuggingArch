@@ -82,69 +82,6 @@ def test_the_hot_cache_budget_counts_json_bytes(tmp_path):
     assert list(pool._hot) == [(who.key, "record-1")]
 
 
-def test_a_pinned_record_survives_the_hot_tiers_churn(tmp_path):
-    """The Gallery's serving walks re-read their records on every cold
-    build; pinned, a record stays parsed whatever the hot LRU does."""
-    pool = SolPool(tmp_path, hotRecords=1, hotBytes=1, pinBytes=1 << 20)
-    who = identity("pinned")
-    records = [(f"record-{i}", {"padding": "x" * 10_000}) for i in range(3)]
-    assert pool.write(who, records)
-
-    assert pool.pinned_record(who.key, "record-0") is not None
-    assert pool.record(who.key, "record-1") is not None   # churns the hot LRU
-    assert pool.record(who.key, "record-2") is not None
-    assert list(pool._pinned) == [(who.key, "record-0")]
-    assert pool.record(who.key, "record-2") is not None   # still not pinned
-    assert list(pool._pinned) == [(who.key, "record-0")]
-
-
-def test_the_pin_cap_refuses_new_pins_and_never_drops_a_pinned_record(tmp_path):
-    """A pinned record was promised residency: the cap is an admission
-    rule, not an eviction rule. Past it further pins are refused — counted,
-    and never quietly kept in the LRU instead: a refused pin re-reads from
-    disk, so the layers stay separate answers rather than a fallback."""
-    pool = SolPool(tmp_path, hotRecords=0, hotBytes=1, pinBytes=15_000)
-    who = identity("budget")
-    records = [(f"record-{i}", {"padding": "x" * 10_000}) for i in range(3)]
-    assert pool.write(who, records)
-
-    assert pool.pinned_record(who.key, "record-0") is not None
-    assert list(pool._pinned) == [(who.key, "record-0")]
-    assert pool.pinned_record(who.key, "record-1") is not None  # refused
-    assert list(pool._pinned) == [(who.key, "record-0")]        # still
-    assert list(pool._hot) == []                                # no fallback
-    assert pool.pinRefused == 1
-    assert pool.pinned_record(who.key, "record-0") == records[0][1]
-    assert pool.pinRefused == 1                                 # a hit
-
-
-def test_a_record_larger_than_the_whole_pin_cap_is_refused(tmp_path):
-    pool = SolPool(tmp_path, hotRecords=8, pinBytes=5_000)
-    who = identity("toolarge")
-    assert pool.write(who, [("record-0", {"padding": "x" * 10_000})])
-    assert pool.pinned_record(who.key, "record-0") is not None
-    assert list(pool._pinned) == [] and list(pool._hot) == []
-    assert pool.pinRefused == 1
-
-
-def test_a_pool_without_a_pin_budget_reads_pins_from_disk(tmp_path):
-    pool = SolPool(tmp_path, pinBytes=0)
-    who = identity("nopin")
-    assert pool.write(who, [("record-0", {"v": 1})])
-    assert pool.pinned_record(who.key, "record-0") == {"v": 1}
-    assert list(pool._pinned) == [] and list(pool._hot) == []
-    assert pool.record(who.key, "record-0") == {"v": 1}
-    assert list(pool._hot) == [(who.key, "record-0")]
-
-
-def test_a_pool_crossing_a_process_keeps_its_pin_budget(tmp_path):
-    import pickle
-
-    pool = SolPool(tmp_path, pinBytes=123_456)
-    back = pickle.loads(pickle.dumps(pool))
-    assert back is not pool and back._pinBytesTarget == 123_456
-
-
 def test_a_view_crosses_a_process_boundary(tmp_path):
     """A worker hands a pool view back to the server process (the measured
     Scaling sweep's theory half): it is pickled as where the pool is, and
