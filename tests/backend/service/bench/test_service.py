@@ -353,7 +353,7 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
     monkeypatch.setattr(A, "current_shape", current_shape)
     monkeypatch.setattr(A, "physical_identity", physical_identity)
     monkeypatch.setattr(A, "_catalog", lambda: Catalog)
-    A._shape_identity.cache_clear()
+    A._shape_identity_of.cache_clear()
     try:
         shape = _row(0)["shape_json"]
         rows = [
@@ -364,7 +364,7 @@ def test_repeated_op_shapes_compute_their_physical_identity_once(monkeypatch):
         ]
         answers = [A.row_annotations(row) for row in rows]
     finally:
-        A._shape_identity.cache_clear()
+        A._shape_identity_of.cache_clear()
     assert calls == {"shape": 1, "identity": 1}
     assert {answer["catalog_kernel"] for answer in answers} == {"A", "B"}
 

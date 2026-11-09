@@ -55,20 +55,27 @@ jobs:
     outputs:
       engine: ${{ steps.engine.outputs.engine }}
     steps:
-      # The full suite ran on push (test.yml); this commit ships only if
-      # that run passed. Waits while it runs.
+      # The full suite runs on every push to main and on a dispatch that
+      # asks for a deploy (test.yml); this commit ships only if that run
+      # passed. A push's run registers moments after this workflow starts,
+      # so a run not found yet is waited for, not treated as absent.
       - name: The tests workflow passed on this commit
-        if: ${{ inputs.skip_tests != true && github.event_name != 'push' }}
+        if: ${{ inputs.skip_tests != true }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          deadline=$(( $(date +%s) + 900 ))
           while :; do
             run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow test.yml \
                     --commit "$GITHUB_SHA" --limit 1 --json status,conclusion,url \
                     --jq '.[0] // empty')
             if [ -z "$run" ]; then
-              echo "::error::no tests run for $GITHUB_SHA (push it to main first)"; exit 1
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::no tests run appeared for $GITHUB_SHA within 15 minutes"; exit 1
+              fi
+              echo "no tests run yet for $GITHUB_SHA — waiting for it to register"; sleep 30
+              continue
             fi
             status=$(jq -r .status <<<"$run"); conclusion=$(jq -r .conclusion <<<"$run")
             url=$(jq -r .url <<<"$run")

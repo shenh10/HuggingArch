@@ -43,10 +43,11 @@ primary_region = 'nrt'
   # use, nothing spilled; the bench process peaks ~2.3 GB of the 6 GB box).
   BENCH_LAKE_MEMORY_LIMIT = '1536MB'
   HA_GALLERY_CACHE_DIR = '/app/.cache/huggingarch/gallery-cache'
-  # The gallery cache shares the 3 GB volume with the bench lake and the sol
-  # pool; this is its whole share (the tiers under the directory split it,
-  # oldest entries evicted first).
-  HA_GALLERY_CACHE_BYTES = '1GiB'
+  # The gallery cache shares the 6 GB volume with the bench lake, the sol
+  # pool and the sweep cache; this is its whole share (the tiers under the
+  # directory split it, oldest entries evicted first) — sized to hold one
+  # GPU's full frontier entry set locally.
+  HA_GALLERY_CACHE_BYTES = '2GiB'
   # The immutable canonical law pool is machine state, not image state.  It
   # lives on the persistent volume and is bootstrapped from the versioned
   # Supabase artifact by backend.sol_pool_artifact at container start.

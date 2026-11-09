@@ -24,16 +24,24 @@ def _catalog():
     return providers
 
 
-@lru_cache(maxsize=1)
-def _shape_identity(op: str, shape_json: str) -> tuple[dict, str, str]:
+def _shape_identity(op: str, shape_json: Any) -> tuple[dict, str, str]:
     """One op/shape's catalog shape and physical identity.
 
     Startup streams inputs ordered by ``(op, shape_json)``, so this one-entry
     memo computes the expensive physical half once for every duplicate input
     in that run without keeping a per-process shape table. It is the same
     annotation road ``row_annotations`` always takes; callers never derive it.
+    A row's shape arrives as the lake's text or as parsed JSON (the
+    vocabulary tests hand it parsed); the memo is keyed by the canonical
+    spelling either way, so an unhashable dict never reaches the cache.
     """
-    shape = current_shape(op, _store.canonical_json(shape_json))
+    return _shape_identity_of(op, _store.canonical_json(shape_json))
+
+
+@lru_cache(maxsize=1)
+def _shape_identity_of(op: str, canonical: str) -> tuple[dict, str, str]:
+    """The memoized half of `_shape_identity`, keyed by canonical text."""
+    shape = current_shape(op, canonical)
     identity = physical_identity(op, shape)
     return shape, identity["signature"], identity["physical_shape"]
 
