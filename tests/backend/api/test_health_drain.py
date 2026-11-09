@@ -76,7 +76,7 @@ def test_running_job_thread_is_in_flight_until_it_finishes():
     assert rt.in_flight() == []
 
 
-def test_admission_during_drain_answers_503(monkeypatch):
+def test_admission_during_drain_answers_503(host_credentials, monkeypatch):
     """Through a real route: the claim raises, the app answers 503."""
     monkeypatch.setattr(preflight, "agent_cli_refusal", lambda: None)
     monkeypatch.setattr(preflight, "probe_repo", lambda mid: ({}, None))

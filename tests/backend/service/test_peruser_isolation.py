@@ -339,7 +339,7 @@ def test_refine_requires_login(client, monkeypatch):
     assert r.status_code == 401  # require_user, no token
 
 
-def test_refine_no_spec_to_refine(client, user_token, monkeypatch):
+def test_refine_no_spec_to_refine(host_credentials, client, user_token, monkeypatch):
     """A user with no prior generation has nothing to refine — no job started."""
     monkeypatch.setenv("HA_PERUSER_SPECGEN", "1")
     import backend.service.routes.spec as S
@@ -362,7 +362,7 @@ def test_refine_no_spec_to_refine(client, user_token, monkeypatch):
     assert started == []  # never acquired a run / spent tokens
 
 
-def test_refine_seeds_overlay_and_starts(client, user_token, tmp_path, monkeypatch):
+def test_refine_seeds_overlay_and_starts(host_credentials, client, user_token, tmp_path, monkeypatch):
     """The user's stored spec is seeded into a run overlay and a keyed job
     starts against it (agent-free — start_job stubbed)."""
     monkeypatch.setenv("HA_PERUSER_SPECGEN", "1")
@@ -391,8 +391,7 @@ def test_refine_seeds_overlay_and_starts(client, user_token, tmp_path, monkeypat
     assert seeded.read_text() == "name: foo\n"
 
 
-def test_refine_job_carries_the_seed_bundle_to_publication(
-        client, user_token, tmp_path, monkeypatch):
+def test_refine_job_carries_the_seed_bundle_to_publication(host_credentials, client, user_token, tmp_path, monkeypatch):
     """The prompt prep result must carry the same normalized seed to publish."""
     monkeypatch.setenv("HA_PERUSER_SPECGEN", "1")
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))
@@ -442,8 +441,7 @@ def test_refine_job_carries_the_seed_bundle_to_publication(
     assert captured["seed_bundle"].proposal_files == (proposal,)
 
 
-def test_refine_peruser_off_takes_global_path(
-        client, user_token, tmp_path, monkeypatch):
+def test_refine_peruser_off_takes_global_path(host_credentials, client, user_token, tmp_path, monkeypatch):
     """Auth ON but per-user isolation explicitly OFF → refine mirrors generate's
     global path: keyed by model_id (no user overlay owner), not a special
     'unavailable'. The write root is still a kind-isolated `__anonymous__` leaf.
@@ -509,8 +507,7 @@ def test_stop_fix_requires_record_id(client, user_token):
     assert r.status_code == 422
 
 
-def test_in_flight_generate_and_refine_use_different_overlay_roots(
-        client, user_token, tmp_path, monkeypatch):
+def test_in_flight_generate_and_refine_use_different_overlay_roots(host_credentials, client, user_token, tmp_path, monkeypatch):
     monkeypatch.setenv("HA_PERUSER_SPECGEN", "1")
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))
     import backend.service.routes.spec as S
@@ -541,8 +538,7 @@ def test_in_flight_generate_and_refine_use_different_overlay_roots(
     assert (gen_root / ".agent-home").is_dir()
 
 
-def test_peruser_off_in_flight_generate_and_refine_use_different_overlay_roots(
-        client, user_token, tmp_path, monkeypatch):
+def test_peruser_off_in_flight_generate_and_refine_use_different_overlay_roots(host_credentials, client, user_token, tmp_path, monkeypatch):
     """HA_PERUSER_SPECGEN=0 still isolates generate vs refine write roots."""
     monkeypatch.setenv("HA_PERUSER_SPECGEN", "0")
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))
@@ -571,8 +567,7 @@ def test_peruser_off_in_flight_generate_and_refine_use_different_overlay_roots(
     assert (ref_root / ".agent-home").is_dir()
 
 
-def test_custom_in_flight_generate_and_refine_use_different_overlay_roots(
-        client, tmp_path, monkeypatch):
+def test_custom_in_flight_generate_and_refine_use_different_overlay_roots(host_credentials, client, tmp_path, monkeypatch):
     """Core custom generate/refine write to distinct `__anonymous__` leaves,
     not the shared custom-cache spec.yaml."""
     monkeypatch.setenv("HA_SPEC_RUNS_ROOT", str(tmp_path / "runs"))

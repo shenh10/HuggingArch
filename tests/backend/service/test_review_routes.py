@@ -117,7 +117,7 @@ def test_admin_review_non_admin_403(client, user_token, monkeypatch, httpx_mock)
     assert r.status_code == 403
 
 
-def test_admin_review_started_host_fallback(client, admin_token, monkeypatch, httpx_mock):
+def test_admin_review_started_host_fallback(host_credentials, client, admin_token, monkeypatch, httpx_mock):
     mock_admins_yes(httpx_mock, "admin-uuid-1")
     monkeypatch.setattr(_gens, "get", lambda rid: {"id": rid, "model_id": "m", "user_id": "someone",
                                                    "spec_yaml": "x", "new_component_yamls": []})

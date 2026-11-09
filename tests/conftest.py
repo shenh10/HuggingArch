@@ -226,3 +226,24 @@ def resolved(spec_loader):
         return resolve_snapshot(model_id, spec_loader)
 
     return _resolve
+
+
+@pytest.fixture(autouse=True)
+def _no_host_agent_credentials(monkeypatch):
+    """Every test starts on a host that holds no agent credential, as CI's
+    runner does: each credential variable the agents declare
+    (`AGENT_ENV_VARS[...].credentials`) is unset. Without this a test's
+    outcome depends on the developer's shell — a run that a host login lets
+    start locally is refused on CI (`host_credentials_missing`). A test whose
+    premise is a host that can authenticate asks for `host_credentials`."""
+    from backend.agents.base import AGENT_ENV_VARS
+    for agent in AGENT_ENV_VARS.values():
+        for name in agent.credentials:
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture
+def host_credentials(monkeypatch):
+    """A host that holds an Anthropic key: runs on the host's credentials
+    may start."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-host-test")

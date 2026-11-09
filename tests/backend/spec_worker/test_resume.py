@@ -384,7 +384,7 @@ def test_service_resume_runs_the_continuation_prep(tmp_path, monkeypatch):
     assert (leaf / "models" / "meta__Foo.yaml").is_file()
 
 
-def test_core_resume_without_a_draft_refuses_and_releases(tmp_path, monkeypatch):
+def test_core_resume_without_a_draft_refuses_and_releases(host_credentials, tmp_path, monkeypatch):
     import asyncio
     from backend.api.routes import spec as core
     from backend.api._models import GenerateSpecRequest
@@ -436,7 +436,7 @@ def test_service_status_offers_continue_after_an_interrupt(tmp_path, monkeypatch
     assert out["state"] == "interrupted" and out["resumable"] is True
 
 
-def test_core_new_generate_over_a_kept_draft_needs_start_over(tmp_path, monkeypatch):
+def test_core_new_generate_over_a_kept_draft_needs_start_over(host_credentials, tmp_path, monkeypatch):
     import asyncio
     from backend.api.routes import spec as core
     from backend.api._models import GenerateSpecRequest
