@@ -1,0 +1,38 @@
+name: memory watch
+
+# The site's own /health names the machine's memory (`detail.memory`,
+# `used_pct` off MemAvailable). This probe fails — and so mails the repo's
+# watchers — when the site is unreachable or memory is past its threshold,
+# which is the warning an OOM never gave. A cron workflow runs only from
+# the default branch.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe /health memory
+        env:
+          HEALTH_URL: https://huggingarch.com/health
+          MAX_USED_PCT: "85"
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS --max-time 30 "$HEALTH_URL")"
+          HEALTH="$body" MAX="$MAX_USED_PCT" python3 - <<'PY'
+          import json, os, sys
+          health = json.loads(os.environ["HEALTH"])
+          memory = (health.get("detail") or {}).get("memory") or {}
+          used, total, available = (memory.get(k) for k in
+                                    ("used_pct", "total_mb", "available_mb"))
+          print(f"memory: used {used}% · available {available} MB "
+                f"of {total} MB")
+          if used is None:
+              sys.exit("no memory in /health — is the deploy that adds it out?")
+          if float(used) > float(os.environ["MAX"]):
+              sys.exit(f"memory used {used}% is past {os.environ['MAX']}%")
+          PY

@@ -60,6 +60,28 @@ def run_in_background(start):
     return start
 
 
+def _memory_report() -> dict:
+    """The machine's memory as `/health`'s `detail.memory` — what an
+    approaching OOM looks like before it kills the process. `used_pct` is
+    read off `MemAvailable`, the kernel's own estimate of what is left once
+    reclaimable cache is reclaimed, not a naive total-minus-free."""
+    info: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                key, _, value = line.partition(":")
+                info[key] = int(value.strip().split()[0]) // 1024  # kB → MB
+    except OSError:
+        return {"error": "no /proc/meminfo"}
+    total, available = info.get("MemTotal"), info.get("MemAvailable")
+    return {
+        "total_mb": total,
+        "available_mb": available,
+        "used_pct": (round(100.0 * (total - available) / total, 1)
+                     if total and available is not None else None),
+    }
+
+
 #: Named reports the service layer adds to `/health`'s `detail` (the Kernel
 #: Bench service's health). Each is called per request and must be cheap and
 #: bounded (a coroutine is awaited); one that raises is reported as its
@@ -82,6 +104,9 @@ async def health_details() -> dict:
         except Exception as e:      # /health itself must never fail
             out[name] = {"error": f"{type(e).__name__}: {e}"}
     return out
+
+
+health_detail("memory", _memory_report)
 
 
 @asynccontextmanager
