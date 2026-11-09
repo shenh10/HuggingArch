@@ -642,52 +642,69 @@ function CurveFacet({ op, facet, curves, axes, initiallyOpen, kernelOf }: {
   );
 }
 
-function BatchCurves({ ops, empty }: { ops: OpCurves[]; empty: string }) {
+/** The curves of the ops in view: the curves view lists the ops (a
+ *  signature each), and each op asks for its own curves when it comes near
+ *  the viewport — one answer with every op's curves was tens of megabytes. */
+function BatchCurves({ ops, query, empty }: {
+  ops: OpCurves[]; query: Record<string, string | number | undefined>; empty: string;
+}) {
   if (!ops.length) return <div className="text-center text-gray-400 text-sm py-8">{empty}</div>;
-  const facetOf = curveGrouping(ops.flatMap((o) => o.curves || []));
   return (
     <div id="curve-charts" className="space-y-8">
-      {ops.map((o) => {
-        const curves = o.curves || [];
-        const head = (
-          <div className="text-xs font-medium text-gray-700 mb-1">
-            {o.signature}
-            {o.too_many ? null : (
-              <span className="ml-2 text-gray-400 font-normal">
-                {curves.length < (o.curves_total || 0)
-                  ? `${curves.length.toLocaleString()} of ${(o.curves_total || 0).toLocaleString()} shapes (the longest curves)`
-                  : `${curves.length.toLocaleString()} shape${curves.length === 1 ? "" : "s"}`}
-                {o.unplaced ? ` · ${o.unplaced.toLocaleString()} not drawn (no token axis, or no registered signature)` : ""}
-              </span>
-            )}
-          </div>
-        );
-        if (o.too_many || !curves.length) return (
-          <div key={o.signature} data-op={o.signature}>
-            {head}
-            <div className="text-xs text-gray-400 py-6 text-center">
-              {o.too_many ? "more than 50,000 op shapes — narrow the filters to draw this op"
-                : o.unplaced ? "no op shape has a token axis its registered signature declares" : "no op shape has a measured utilization (MFU or MBU)"}
-            </div>
-          </div>
-        );
-        // Facets, the one with the most curves first (and open).
-        const facets = uniq(curves.map(facetOf)).sort((a, b) =>
-          curves.filter((c) => facetOf(c) === b).length - curves.filter((c) => facetOf(c) === a).length || a.localeCompare(b));
-        const axes = uniq(curves.map((c) => c.axis));
-        const kernelOf = kernelColors(curves);
-        return (
-          <div key={o.signature} data-op={o.signature}>
-            {head}
-            <div className="space-y-4">
-              {facets.map((facet, i) => (
-                <CurveFacet key={facet} op={o.signature} facet={facet} axes={axes} initiallyOpen={i === 0} kernelOf={kernelOf}
-                            curves={curves.filter((c) => facetOf(c) === facet)} />
-              ))}
-            </div>
-          </div>
-        );
-      })}
+      {ops.map((o) => <OpCurveSection key={o.signature} signature={o.signature} query={query} />)}
+    </div>
+  );
+}
+
+/** One op's curves, asked (the curves view with the op's `signature`) once
+ *  the section is near the viewport. */
+function OpCurveSection({ signature, query }: {
+  signature: string; query: Record<string, string | number | undefined>;
+}) {
+  const [nearRef, near] = useNearViewport();
+  const got = useBrowse<never>(near ? { ...query, view: "curves", signature } : null);
+  const o: OpCurves | null = got.data ? (got.data.ops?.[0] ?? { signature, curves: [] }) : null;
+  const curves = o?.curves || [];
+  const head = (
+    <div className="text-xs font-medium text-gray-700 mb-1">
+      {signature}
+      {!o || o.too_many ? null : (
+        <span className="ml-2 text-gray-400 font-normal">
+          {curves.length < (o.curves_total || 0)
+            ? `${curves.length.toLocaleString()} of ${(o.curves_total || 0).toLocaleString()} shapes (the longest curves)`
+            : `${curves.length.toLocaleString()} shape${curves.length === 1 ? "" : "s"}`}
+          {o.unplaced ? ` · ${o.unplaced.toLocaleString()} not drawn (no token axis, or no registered signature)` : ""}
+        </span>
+      )}
+    </div>
+  );
+  // Until its answer lands an op holds a chart row's height, so only the
+  // ops near the viewport ask at once.
+  if (!o || o.too_many || !curves.length) return (
+    <div data-op={signature} ref={nearRef} style={o ? undefined : { minHeight: 300 }}>
+      {head}
+      <div className="text-xs text-gray-400 py-6 text-center">
+        {!o ? (got.error || "Loading…")
+          : o.too_many ? "more than 50,000 op shapes — narrow the filters to draw this op"
+          : o.unplaced ? "no op shape has a token axis its registered signature declares" : "no op shape has a measured utilization (MFU or MBU)"}
+      </div>
+    </div>
+  );
+  // Facets, the one with the most curves first (and open).
+  const facetOf = curveGrouping(curves);
+  const facets = uniq(curves.map(facetOf)).sort((a, b) =>
+    curves.filter((c) => facetOf(c) === b).length - curves.filter((c) => facetOf(c) === a).length || a.localeCompare(b));
+  const axes = uniq(curves.map((c) => c.axis));
+  const kernelOf = kernelColors(curves);
+  return (
+    <div data-op={signature} ref={nearRef}>
+      {head}
+      <div className="space-y-4">
+        {facets.map((facet, i) => (
+          <CurveFacet key={facet} op={signature} facet={facet} axes={axes} initiallyOpen={i === 0} kernelOf={kernelOf}
+                      curves={curves.filter((c) => facetOf(c) === facet)} />
+        ))}
+      </div>
     </div>
   );
 }
@@ -788,8 +805,10 @@ export function Corpus() {
     const cs = table.data.contexts || [];
     if (batch && !context && cs.length) setContext(String(cs[0]));
   }, [view, table.data, batch, context]);
+  // The curves' scope: the ops it lists, and each op's curves under it.
+  const curvesQuery = { ...scope, ...(view === "rows" && envKey ? { key: envKey } : {}) };
   const curves = useBrowse<never>(hydrated && (view === "envelope" || view === "rows") && !curvesHidden
-    ? { ...scope, view: "curves", ...(view === "rows" && envKey ? { key: envKey } : {}) } : null);
+    ? { ...curvesQuery, view: "curves" } : null);
   const coverage = useBrowse<never>(hydrated && view === "providers"
     ? { source, run: runId, upload, owner, gpu, dtype, phase, view: "coverage" } : null);
   // A view that lists nothing until it is scoped still needs the dropdowns
@@ -1278,7 +1297,7 @@ export function Corpus() {
             saturation — the tokens where the line turns compute-bound — is in each point&apos;s tooltip and the pinned table. Click a line to pin it and step through its points. The row with the most shapes is open; click a
             row&apos;s title to open the others.
           </p>
-          {curvesHidden ? null : curves.data ? <BatchCurves ops={curveOps} empty={noneMatch} /> : (
+          {curvesHidden ? null : curves.data ? <BatchCurves ops={curveOps} query={curvesQuery} empty={noneMatch} /> : (
             <p className="text-xs text-gray-400 py-6 text-center">{curves.error || "Loading…"}</p>
           )}
         </section>

@@ -9,12 +9,14 @@ compared whole.
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import json
 import math
 import random
 import sys
 import uuid
+from typing import Optional
 from pathlib import Path
 
 import pytest
@@ -23,8 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from backend.inference.benchmark_identity import workload_coordinates
 from backend.inference.op_calibration import measured_utilization
+from backend.inference.benchmark_identity import canonical_identity_json
 from backend.service.bench import browse as browse_mod, store
-from backend.service.bench.browse import Query, Refused, browse
+from backend.service.bench.browse import Query, Refused
+from backend.service.bench.derived import Derived
 from backend.service.bench.lake import Lake, LakeConfig
 from tests.corpus_row import row as corpus_row
 
@@ -56,7 +60,7 @@ def annotate_with(catalog: dict, fold_note: bool = True):
         shape = json.loads(inp["shape_json"])
         if fold_note:
             shape.pop("note", None)
-        physical = store.canonical_json(shape)
+        physical = canonical_identity_json(shape)
         batch, context = workload_coordinates(inp["phase"], physical)
         return {"signature": f"sig:{inp['op']}", "physical_shape": physical,
                 "workload_batch": batch, "workload_context": context,
@@ -131,12 +135,48 @@ def _open(tmp: Path) -> Lake:
     lk = Lake.open(LakeConfig(catalog=str(tmp / "catalog.ducklake"), data=str(tmp / "data"),
                               cache_dir=str(tmp / "cache")))
     store.ensure_schema(lk)
-    store.annotate_all(lk, annotate_with(CATALOG))
+    _ANNOTATORS[lk] = annotate_with(CATALOG)
     return lk
 
 
+# The annotation rules each test lake is read under (`_open`, `build`, or a
+# test naming other ones), and the derived file per (lake, rules, placement
+# axes): a view reads the file built under the rules and axes it names.
+_ANNOTATORS: dict = {}
+_DERIVED: dict = {}
+
+
+def derived_for(lk: Lake, axes: Optional[dict] = None) -> Derived:
+    """The lake's derived file under its annotator and `axes` (the curves'
+    placement; AXES by default), refreshed now: another annotator or other
+    axes are other rules, and rebuild it."""
+    axes = AXES if axes is None else axes
+    ann = _ANNOTATORS[lk]
+    key = (id(lk), id(ann), json.dumps(axes, sort_keys=True))
+    if key not in _DERIVED:
+        rules = f"{id(ann)}:{key[2]}"
+        _DERIVED[key] = Derived(annotate=ann, rules=lambda: rules, tokens=lambda: axes)
+    _DERIVED[key].refresh(lk)
+    return _DERIVED[key]
+
+
+def browse(lk: Lake, q: Query) -> dict:
+    """`browse.browse` over the lake's derived file (`derived_for`, the
+    curves' axes from the query's `call_tokens`). A curves query is answered
+    as the page asks it: the ops listed, then each op's curves by name."""
+    d = derived_for(lk, q.filters.get("call_tokens"))
+    if q.view != "curves":
+        return browse_mod.browse(lk, q, d)
+    listed = browse_mod.browse(lk, q, d)["ops"]
+    assert all(set(o) == {"signature"} for o in listed)
+    return {"ops": [browse_mod.browse(lk, dataclasses.replace(
+        q, filters={**q.filters, "signature": o["signature"]}), d)["ops"][0] for o in listed]}
+
+
 def build(lk: Lake, batches, annotate, seed: int = 7) -> list[dict]:
-    """Upload `batches`; return the reference records of every row."""
+    """Upload `batches`; return the reference records of every row (the lake
+    read under `annotate`)."""
+    _ANNOTATORS[lk] = annotate
     rnd = random.Random(seed)
     meta = {}
     for owner, status, within, run_id, n in batches:
@@ -146,7 +186,7 @@ def build(lk: Lake, batches, annotate, seed: int = 7) -> list[dict]:
                    "kernel_impl": "kb" if rows[0]["kernel_impl"] != "kb" else "ka"}
         upload_id = str(uuid.uuid4())
         res = store.upload(lk, owner=owner, upload_id=upload_id, run_id=run_id, label=None,
-                           rows=rows, annotate=annotate,
+                           rows=rows,
                            status="private" if status == "shared" and within else status)
         assert res.inserted == n
         if status == "shared" and within:
@@ -160,9 +200,10 @@ def build(lk: Lake, batches, annotate, seed: int = 7) -> list[dict]:
 def reference(lk: Lake, meta: dict) -> list[dict]:
     """The reference records of every row of `meta` (spec_hash → upload),
     with its input's annotations as `annot` holds them."""
+    derived_for(lk)
     stored = lk.read("SELECT m.id, m.spec_hash, a.signature, a.physical_shape, a.catalog_kernel,"
                      " a.workload_batch, a.workload_context FROM lake.measurements m"
-                     " LEFT JOIN annot a USING (input_id)")
+                     f" LEFT JOIN {store.ANNOT} a USING (input_id)")
     out = []
     for s in stored:
         r, owner, status, within, run_id, upload_id = meta[s["spec_hash"]]
@@ -174,7 +215,7 @@ def reference(lk: Lake, meta: dict) -> list[dict]:
             "timing_method": r.get("timing_method") or None,
             "id": str(s["id"]), "shape_json": json.loads(r["shape_json"]),
             "dtype_env_json": json.loads(r["dtype_env_json"]),
-            "dtype_text": store.canonical_json(r["dtype_env_json"]),
+            "dtype_text": canonical_identity_json(r["dtype_env_json"]),
             "signature": s["signature"], "physical_shape": s["physical_shape"],
             "catalog_kernel": s["catalog_kernel"], "workload_batch": s["workload_batch"],
             "workload_context": s["workload_context"],
@@ -896,7 +937,6 @@ def test_the_rows_view_lists_measurements_and_failures_together(tmp_path):
     (Query(view="workload", filters={"model": "m1"}), "pick a model and a phase to see its workloads"),
     (Query(view="workload", filters={"model": "m1", "phase": "decode"}, sort="date"),
      "workload rows do not sort by date"),
-    (Query(view="curves"), "the curves view needs call_tokens {total, factor, runs}"),
 ])
 def test_refusals(corpus, q, message):
     lk, _ = corpus
@@ -926,22 +966,25 @@ def test_workload_candidates_bound(corpus, monkeypatch):
 def _uploaded(lk: Lake, rows: list[dict], owner: str, status: str, annotate) -> dict:
     """Upload `rows` as one batch; their `meta` entries for `reference`."""
     upload_id = str(uuid.uuid4())
-    store.upload(lk, owner=owner, upload_id=upload_id, run_id=None, label=None, rows=rows,
-                 annotate=annotate, status=status)
+    store.upload(lk, owner=owner, upload_id=upload_id, run_id=None, label=None, rows=rows, status=status)
     return {r["spec_hash"]: (r, owner, status, False, None, upload_id) for r in rows}
 
 
 def test_a_catalog_change_takes_effect_at_the_next_start(tmp_path):
-    """Annotations are computed at start, never stored: a process starting
-    under another catalog groups every row by it at once."""
+    """Annotations are derived under the annotation rules: under another
+    catalog (other rules) the derived file is rebuilt, and every row is
+    grouped by the new rules at once."""
     lk = _open(tmp_path)
     try:
         meta = _uploaded(lk, _csv_rows(random.Random(3), 120), A, "shared", annotate_with(CATALOG))
         # `note` no longer folds (more physical ops) and kc becomes catalog kernel KC
-        new = annotate_with({**CATALOG, "kc": "KC"}, fold_note=False)
-        assert store.annotate_all(lk, new) == len({
-            (r["op"], r["phase"], r["kernel_impl"], store.canonical_json(r["shape_json"]))
+        new = _ANNOTATORS[lk] = annotate_with({**CATALOG, "kc": "KC"}, fold_note=False)
+        assert derived_for(lk).refresh(lk)["how"] == "current"
+        assert lk.read(f"SELECT count(*) AS n FROM {store.ANNOT} WHERE signature IS NOT NULL"
+                       )[0]["n"] == len({
+            (r["op"], r["phase"], r["kernel_impl"], canonical_identity_json(r["shape_json"]))
             for r, *_ in meta.values() if r["op"] != "pending"})
+        del new
         rows = reference(lk, meta)
         assert any(r["shape_json"].get("note") for r in rows)
         for sort in ("latency", "candidates"):
@@ -953,8 +996,8 @@ def test_a_catalog_change_takes_effect_at_the_next_start(tmp_path):
 
 
 def test_an_uploaded_input_is_in_envelopes_at_once(tmp_path):
-    """An upload's new inputs are annotated in the same process before they
-    commit: the next view groups them; a refused one (no signature) is a
+    """An upload's new inputs are annotated by the refresh the next view
+    waits for: that view groups them; a refused one (no signature) is a
     placeholder — in the rows, in no envelope."""
     lk = _open(tmp_path)
     try:
@@ -992,7 +1035,7 @@ def test_one_shape_cut_by_two_deployments_is_one_envelope(tmp_path):
                 {**base, "spec_hash": f"{next(_seq):016x}", "latency_us": "3.0",
                  "parallel": "ep_moe=8"}]
         store.upload(lk, owner=A, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                     rows=rows, annotate=annotate_with(CATALOG), status="shared")
+                     rows=rows, status="shared")
         items = browse(lk, query("shared"))["items"]
         assert len(items) == 1
         env = items[0]
@@ -1155,3 +1198,26 @@ def test_a_capped_context_is_no_context_run():
         from backend.inference.op_signatures import register_signature
         register_signature(OpSignature(name="bad", inputs=(TensorLayout("q", ("B", "s_kv")),),
                                        attends_at_most=("n_topk_keys",)))
+
+
+@pytest.mark.parametrize("view", ["curves", "envelope", "rows", "workload", "coverage"])
+def test_no_view_reads_the_lakes_files(corpus, view, monkeypatch):
+    """Every view is a read of the derived file (`browse.ROWS`, `GROUPS`,
+    `BATCHES`, `PLACEMENT`): computed per request over the lake's files,
+    the views took 2-11 s on a 4.28M-row lake and the page's concurrent
+    requests ran past the API's limit. Curves first: the one that read most."""
+    lk, rows = corpus
+    derived_for(lk)
+    seen: list = []
+    real = lk.read
+
+    def read(sql, params=()):
+        seen.append(sql)
+        return real(sql, params)
+    monkeypatch.setattr(lk, "read", read)
+    r = next(r for r in rows if r["workload_batch"] is not None)
+    f = ({"model": r["model"], "phase": r["phase"], "batch": r["workload_batch"],
+          "context": r["workload_context"]} if view == "workload" else {})
+    browse(lk, query("union", view=view, filters=f))
+    assert seen and not [q for q in seen if "lake.measurements" in q or "lake.batches" in q
+                         or "lake.inputs" in q]

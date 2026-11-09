@@ -40,10 +40,10 @@ def test_the_legacy_migration_is_idempotent_and_removes_refused_shared_rows(
     rows[0]["op"] = "removed_op"
     owner = new_owner()
     store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()),
-                 run_id="r", label=None, rows=rows, annotate=annotate,
+                 run_id="r", label=None, rows=rows,
                  status="shared")
     store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()),
-                 run_id="r", label=None, rows=[rows[1]], annotate=annotate,
+                 run_id="r", label=None, rows=[rows[1]],
                  status="shared")
     rows_now = lake.read("SELECT id, op FROM lake.measurements")
     kept_id = next(row["id"] for row in rows_now if row["op"] != "removed_op")

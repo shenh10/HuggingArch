@@ -17,8 +17,9 @@ space — `Lake.require_free`):
 The loop (`start`) waits 300 s before its first cycle, rests three times
 each cycle's duration (at least 30 s), and backs off exponentially up to
 600 s on errors. The routes module starts it with the lake and the backup
-once the lake serves (`serving.Gate`'s `on_serving`). Annotations are not
-maintained: they live in memory (`store.annotate_all`).
+once the lake serves (`serving.Gate`'s `on_serving`). The derived file
+(annotations, lookup cells, browse tables) is not maintained here: its own
+refresh follows the lake (`derived.Derived`).
 """
 from __future__ import annotations
 

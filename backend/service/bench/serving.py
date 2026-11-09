@@ -23,11 +23,12 @@ under pytest) walks the startup once:
      lake on another machine (a cloned volume) — does not, and neither does
      an unreachable lease (fail closed; retried). Only an operator moves the
      lease to another machine (`bench_lake_transfer`);
-  6. annotate every input in memory (`store.annotate_all` with the
-     `annotate` the routes pass: only they may import kernel_bench) — the
-     grouping labels are computed, never stored; then `ready(lake)` (the
-     routes build the lookup's cells for the current snapshot,
-     `lookup.Cells.refresh`, so no lookup is answered before they exist);
+  6. `ready(lake)`: the routes bring the lake's derived file to the
+     current snapshot (`derived.Derived.refresh`: the annotations, the
+     lookup's cells, the browse tables — reused from the file a previous
+     start left when it is this lake's under these rules, followed by the
+     change feed; rebuilt otherwise), so no read is answered before they
+     exist;
   7. backups (mandatory; BENCH_LAKE_BACKUP=off opts out in development):
      back up what `current` lacks, then a `backup.Trigger` follows every
      write;
@@ -170,7 +171,7 @@ class _Degraded(Exception):
 class Gate:
     """The process's Kernel Bench lake behind the startup checks."""
 
-    def __init__(self, *, annotate: store.Annotate, open_lake: Callable[[], Lake] = get_lake,
+    def __init__(self, *, open_lake: Callable[[], Lake] = get_lake,
                  lease: Callable[[], Optional[Lease]] = Lease.from_env,
                  backup: Callable[[], Optional[BackupConfig]] = BackupConfig.from_env,
                  ready: Callable[[Lake], Any] = lambda lake: None,
@@ -178,7 +179,6 @@ class Gate:
                  restore: Callable[[], Optional[str]] = restore_from_env,
                  clock: Callable[[], float] = time.monotonic):
         self._open, self._lease, self._backup_config = open_lake, lease, backup
-        self._annotate = annotate
         self._ready = ready
         self._restore = restore
         self._on_serving, self._clock = on_serving, clock
@@ -331,7 +331,6 @@ class Gate:
             else:
                 self._set_data_rules(
                     "current", lake=migrated.version, migration=migrated.report())
-        store.annotate_all(lake, self._annotate)
         self._ready(lake)
         if not self.read_only:
             self._start_backups(lake)

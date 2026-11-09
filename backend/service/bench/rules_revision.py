@@ -23,6 +23,7 @@ from backend.arch.eval import formats as _eval_formats
 from backend.arch.spec_migrate import measured_row_migration
 from backend.fingerprint import shared_data_version
 from backend.inference.benchmark_identity import (
+    canonical_identity_json,
     current_shape,
     workload_coordinates,
 )
@@ -31,7 +32,6 @@ from backend.inference.op_calibration import physical_identity
 from backend.inference.op_signatures import all_signatures
 from backend.service.bench import annotations as _annotations
 from backend.service.bench import data_rules as _data_rules
-from backend.service.bench import store as _store
 
 
 @dataclass(frozen=True)
@@ -56,7 +56,7 @@ _RULE_INPUTS: tuple[RuleInput, ...] = (
               "derives workload batch and context from a shape"),
     RuleInput("physical_identity", physical_identity,
               "projects an op and shape to the physical lookup key"),
-    RuleInput("canonical_json", _store.canonical_json,
+    RuleInput("canonical_identity_json", canonical_identity_json,
               "canonicalizes identity JSON before it is stored or projected"),
     RuleInput("validate_row", validate_row,
               "owns whether a row is valid under the current schema"),

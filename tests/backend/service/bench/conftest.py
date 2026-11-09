@@ -1,8 +1,10 @@
 """Fixtures for the Kernel Bench lake tests (backend/service/bench).
 
   lake          a fresh local lake per test (a .ducklake catalog file and a
-                data directory under tmp_path), schema applied, its in-memory
-                annotations built (`store.annotate_all`)
+                data directory under tmp_path), schema applied
+  derived       its derived file, built as the service builds it before it
+                serves (`derived.Derived.refresh`), then following it
+  derive        `derive(lake, annotate)`: a Derived over `annotate`, built
   make_rows     valid CSV-row dicts (strings, as `validate_text` yields them),
                 distinct identities, any field overridable
   annotate      a deterministic stand-in for `bench.annotations.row_annotations`
@@ -13,26 +15,33 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 import pytest
 
 from backend.inference.benchmark_identity import workload_coordinates
 from backend.inference.benchmarks import validate_text
+from backend.inference.benchmark_identity import canonical_identity_json
 from backend.service.bench import store
+from backend.service.bench.derived import Derived
 from backend.service.bench.lake import Lake, LakeConfig
 from tests.corpus_row import row as corpus_row
 from tests.corpus_row import to_csv
 
 
+def derive(lake: Lake, annotate: Callable[[Mapping[str, Any]], dict],
+           rules: Optional[str] = None, **kw: Any) -> Derived:
+    """A `Derived` over `annotate`, brought to the lake's snapshot. Its
+    rules' revision names the annotator (`rules`, else the function object
+    itself): another annotator is other rules, and rebuilds the file."""
+    d = Derived(annotate=annotate, rules=lambda: rules or f"{annotate.__qualname__}@{id(annotate)}", **kw)
+    d.refresh(lake)
+    return d
+
+
 @pytest.fixture
-def cells(lake):
-    """The lookup's cells file for `lake`, built as the service builds it
-    before it serves (`lookup.Cells.refresh`), then following it."""
-    from backend.service.bench.lookup import Cells
-    c = Cells()
-    c.refresh(lake)
-    return c
+def derived(lake, annotate):
+    return derive(lake, annotate, rules="test")
 
 
 @pytest.fixture
@@ -41,7 +50,6 @@ def lake(tmp_path):
                               data=str(tmp_path / "data"),
                               cache_dir=str(tmp_path / "cache")))
     store.ensure_schema(lk)
-    store.annotate_all(lk, make_annotator())
     yield lk
     lk.close()
 
@@ -68,7 +76,7 @@ def make_rows() -> Callable[..., list[dict]]:
 
 def make_annotator(prefix: str = "sig") -> Callable[[Mapping[str, Any]], dict]:
     def annotate(inp: Mapping[str, Any]) -> dict:
-        shape = store.canonical_json(inp["shape_json"])
+        shape = canonical_identity_json(inp["shape_json"])
         batch, context = workload_coordinates(inp["phase"], shape)
         return {"signature": f"{prefix}:{inp['op']}", "physical_shape": shape,
                 "workload_batch": batch, "workload_context": context,

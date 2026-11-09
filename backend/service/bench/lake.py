@@ -426,8 +426,7 @@ class Lake:
     @contextmanager
     def inputs_lock(self) -> Iterator[None]:
         """Serialize registering new `inputs` entries across processes, so
-        two uploads (of any owners) never both add the same input (nor its
-        in-memory annotations, `store.annotate_all`). Taken after
+        two uploads (of any owners) never both add the same input. Taken after
         `owner_lock` when an upload brings inputs the lake lacks."""
         with self._advisory("bench:inputs", wait=True):
             yield

@@ -15,7 +15,7 @@ from backend.inference.op_calibration import measured_utilization
 from backend.service.bench import store
 from backend.service.bench.lake import Lake, LakeConfig
 from backend.service.bench.store import SetRef
-from tests.backend.service.bench.conftest import _rows, make_annotator
+from tests.backend.service.bench.conftest import _rows, derive
 from tests.backend.service.bench.pg import scratch_database
 
 
@@ -26,7 +26,7 @@ def _md5_upper(text: str) -> int:
 
 def _up(lake, owner, rows, annotate, *, run_id="run-1", upload_id=None, **kw):
     return store.upload(lake, owner=owner, upload_id=upload_id or str(uuid.uuid4()),
-                        run_id=run_id, label="lbl", rows=rows, annotate=annotate, **kw)
+                        run_id=run_id, label="lbl", rows=rows, **kw)
 
 
 def _count(lake, sql="SELECT count(*) AS n FROM lake.measurements", params=()):
@@ -89,13 +89,13 @@ def test_a_lake_with_stored_annotations_opens_and_serves(tmp_path, make_rows, an
         assert [r["column_name"] for r in lk.read(
             "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' "
             "AND table_name = 'inputs' ORDER BY ordinal_position")] == ["input_id", *store.INPUT_KEY]
-        assert store.annotate_all(lk, annotate) == 1
-        [a] = lk.read("SELECT * FROM annot")
+        d = derive(lk, annotate)
+        [a] = lk.read(f"SELECT * FROM {store.ANNOT}")
         assert a["signature"] == annotate(key)["signature"] != "stale:sig"
         # the old input is known: an upload of its row registers nothing new
         r = _up(lk, owner, [row], annotate, status="shared")
         assert r.inserted == 1 and _count(lk, "SELECT count(*) AS n FROM lake.inputs") == 1
-        [e] = browse(lk, Query(source="shared"))["items"]
+        [e] = browse(lk, Query(source="shared"), d)["items"]
         assert e["key"]["signature"] == annotate(key)["signature"]
     finally:
         lk.close()
@@ -146,7 +146,6 @@ def test_a_lake_written_before_a_column_existed_gains_it_and_keeps_serving(
             assert cols[c] == store.MEASUREMENT_TYPES[c], c
         # And the upgraded lake still takes rows — the half that actually
         # broke, and which a column-list assertion alone would not catch.
-        store.annotate_all(lk, annotate)
         r = _up(lk, owner, rows, annotate, status="shared")
         assert r.inserted == 1
         [m] = lk.read("SELECT kmd_version, umd_version FROM lake.measurements")
@@ -194,7 +193,6 @@ def test_the_insert_lands_each_value_in_its_own_column(
     assert declared.index("run_id") < declared.index("box"), (
         "the schema no longer declares these two in the order this relies on")
 
-    store.annotate_all(lake, annotate)
     assert _up(lake, owner, rows, annotate, status="shared").inserted == 1
 
     [m] = lake.read("SELECT run_id, box FROM lake.measurements")
@@ -246,7 +244,9 @@ def test_upload_writes_inputs_batch_and_rows(lake, make_rows, annotate, new_owne
     assert (str(b["owner"]), str(b["upload_id"]), b["piece"], b["run_id"], b["label"],
             b["status"], b["within_peak"], b["nominated_at"], b["decided_at"]) == (
         owner, upload_id, 0, "run-1", "lbl", "private", False, None, None)
-    inputs = lake.read("SELECT * FROM lake.inputs i JOIN annot a USING (input_id) ORDER BY input_id")
+    derive(lake, annotate)
+    inputs = lake.read(f"SELECT * FROM lake.inputs i JOIN {store.ANNOT} a USING (input_id) "
+                       "ORDER BY input_id")
     assert len(inputs) == 3
     for i in inputs:
         ann = annotate(i)
@@ -297,17 +297,6 @@ def test_identity_duplicates(lake, make_rows, annotate, new_owner):
     assert r.inserted == 1
     # inputs are shared across owners, registered once
     assert _count(lake, "SELECT count(*) AS n FROM lake.inputs") == 5
-
-
-def test_inputs_are_annotated_once(lake, make_rows, new_owner):
-    seen = []
-
-    def annotate(inp):
-        seen.append(inp["shape_json"])
-        return make_annotator()(inp)
-    _up(lake, new_owner(), make_rows(2), annotate)
-    _up(lake, new_owner(), make_rows(3), annotate)
-    assert len(seen) == 3 == len(set(seen))
 
 
 def test_reused_upload_id_is_refused(lake, make_rows, annotate, new_owner):
@@ -441,71 +430,6 @@ def test_restamp_rewrites_the_roofline_columns_in_place(lake, make_rows, annotat
     assert store.restamp(lake, owner=owner, rows=[]) == 0
 
 
-# --- the in-memory annotations ------------------------------------------------------
-
-def test_annotate_all_rebuilds_annot_from_every_input(lake, make_rows, annotate, new_owner):
-    _up(lake, new_owner(), make_rows(3), annotate)
-    other = make_annotator(prefix="sig2")
-    assert store.annotate_all(lake, other) == 3
-    got = lake.read("SELECT * FROM lake.inputs i JOIN annot a USING (input_id)")
-    assert len(got) == 3 == _count(lake, "SELECT count(*) AS n FROM annot")
-    for i in got:
-        assert {a: i[a] for a in store.ANNOTATIONS} == other(i)
-        assert i["phys"] == _md5_upper(f"{i['signature']}\x1f{i['physical_shape']}")
-
-
-def test_annotate_all_inserts_in_batches(lake, make_rows, annotate, new_owner,
-                                         monkeypatch):
-    """The records go in `ANNOT_BATCH` at a time — one JSON text holding every
-    input's outgrew the lake's memory limit — and the result is the same."""
-    _up(lake, new_owner(), make_rows(5), annotate)
-    monkeypatch.setattr(store, "ANNOT_BATCH", 2)
-    assert store.annotate_all(lake, annotate) == 5
-    assert _count(lake, "SELECT count(*) AS n FROM annot") == 5
-    assert _count(lake, "SELECT count(DISTINCT input_id) AS n FROM annot") == 5
-
-
-def test_annotate_all_never_holds_every_input(lake, make_rows, annotate,
-                                               new_owner, monkeypatch):
-    """Startup streams one insert batch at a time: even a lake with millions
-    of inputs never materializes them all in Python."""
-    _up(lake, new_owner(), make_rows(5), annotate)
-    monkeypatch.setattr(store, "ANNOT_BATCH", 2)
-    batches: list[int] = []
-    real = store._annotated
-
-    def measured(annotator, inputs):
-        batches.append(len(inputs))
-        return real(annotator, inputs)
-
-    monkeypatch.setattr(store, "_annotated", measured)
-    assert store.annotate_all(lake, annotate) == 5
-    assert batches == [2, 2, 1]
-
-
-def test_an_input_annotate_refuses_has_no_annotations(lake, make_rows, new_owner):
-    def refuse_one(inp):
-        if json.loads(inp["shape_json"])["s_ctx"] == 4096:
-            raise ValueError("no signature")
-        return make_annotator()(inp)
-    rows = make_rows(3)        # s_ctx 2048, 4096, 6144
-    r = _up(lake, new_owner(), rows, refuse_one)
-    assert r.inserted == 3 and _count(lake, "SELECT count(*) AS n FROM lake.inputs") == 3
-    assert _count(lake, "SELECT count(*) AS n FROM annot") == 2
-    assert store.annotate_all(lake, refuse_one) == 2
-
-
-def test_a_catalog_that_cannot_load_refuses_the_upload(lake, make_rows, new_owner):
-    def broken(inp):
-        raise ImportError("no kernel_bench")
-    with pytest.raises(ImportError):
-        _up(lake, new_owner(), make_rows(1), broken)
-    assert _count(lake) == 0
-    _up(lake, new_owner(), make_rows(1), make_annotator())
-    with pytest.raises(ImportError):
-        store.annotate_all(lake, broken)
-
-
 # --- the shared-row rule -------------------------------------------------------------------
 
 _PEAK_CASES = [
@@ -585,14 +509,13 @@ class _SlowLake(Lake):
 def _race_upload(config, owner, n, ready, start, results, lock_owner):
     import contextlib
     lk = _SlowLake.open(config)
-    store.annotate_all(lk, make_annotator())     # each process, as its startup does
     if not lock_owner:
         lk.owner_lock = lambda owner: contextlib.nullcontext()
     try:
         ready.put(True)
         start.wait(30)
         r = store.upload(lk, owner=owner, upload_id=str(uuid.uuid4()), run_id="race",
-                         label=None, rows=_rows(n), annotate=make_annotator())
+                         label=None, rows=_rows(n))
         results.put(r.inserted)
     finally:
         lk.close()
@@ -603,11 +526,10 @@ def _race(config, lock_owner: bool) -> tuple[list[int], int, int]:
     returns (inserted per process, rows stored, distinct identities)."""
     lk = Lake.open(config)
     store.ensure_schema(lk)
-    store.annotate_all(lk, make_annotator())
     # the inputs exist already (another owner's upload), so neither process
     # takes the inputs lock and only the owner lock can serialize them
     store.upload(lk, owner=str(uuid.uuid4()), upload_id=str(uuid.uuid4()), run_id=None,
-                 label=None, rows=_rows(4), annotate=make_annotator())
+                 label=None, rows=_rows(4))
     ctx = multiprocessing.get_context("spawn")
     ready, start, results = ctx.Queue(), ctx.Event(), ctx.Queue()
     owner = str(uuid.uuid4())

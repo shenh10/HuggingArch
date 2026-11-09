@@ -1,19 +1,32 @@
-"""The Kernel Bench page's views over the lake, computed per request.
+"""The Kernel Bench page's views, read from the lake's derived file.
 
-`browse(lake, q)` answers what `GET /api/bench/browse` returns before the
-route's display fields (`_as_row`, `_coverage`): the same JSON shape the
-old Postgres `bench_browse` (migration 0022, dropped by 0026; in git history)
-returned, without `pending`: nothing is ever in flight.
+`browse(lake, q, derived)` answers what `GET /api/bench/browse` returns
+before the route's display fields (`_as_row`, `_coverage`): the same JSON
+shape the old Postgres `bench_browse` (migration 0022, dropped by 0026; in
+git history) returned, without `pending`: nothing is ever in flight.
 
 Views: envelope, rows, workload, curves, coverage; every view but curves
 also returns `facets` (each filter's values under the other filters).
 Scopes (`Query.source`, `run`, `upload`): the shared corpus, the caller's rows ("mine"), shared
 ∪ mine (a row counted once), or one of the caller's sets (run / upload).
-Sorts and filters as in 0022; bounds kept as product limits (workload candidates 50,000; curves 50,000 envelopes per op /
-4,000 points). The bounds 0022 had only because of how it read stored
-aggregates — shared ∪ mine by gain or candidates up to 20,000 of the
-caller's op shapes, rows sorted by text up to 50,000 — are gone: nothing is
-merged from stored parts any more, every view reads the rows.
+Sorts and filters as in 0022; bounds kept as product limits (workload
+candidates 50,000; curves 50,000 envelopes per op / 4,000 points).
+
+What every view reads. Not the lake: the browse table (`ROWS`) of the
+lake's derived file (`derived.Derived`), one row per measurement of the
+snapshot the file holds, every quantity of the browse surface (`_FIELDS`)
+already derived from the measurement, its batch and its input's
+annotations (`rows_select`, the one place they are derived), with the
+batches as of that snapshot (`BATCHES`, whose review state decides the
+scope) and each physical shape's place on a curve (`PLACEMENT`). The file's
+one refresh keeps them at the lake's snapshot by its change feed; a request
+first waits for the file to reach the snapshot it starts at
+(`Derived.reach`), so it answers the lake as it is, and never reads the
+lake's files instead. Computed per request over the lake, the envelope
+view's grouping read every data file and joined two million annotations
+(2.4 s on a 4.28M-row lake), the curves view placed every shape in Python
+(11 s, a 62 MB answer for every op at once); over the derived file the
+envelope view is 0.7 s, the rest 0.03-0.3 s, one op's curves at most 1.2 s.
 
 An envelope is one physical op — (signature, physical shape) at one
 (dtype env, gpu) and phase: one kernel at one shape on one card, whichever
@@ -24,11 +37,13 @@ fastest; its kernels and models every distinct one among its rows. The
 envelope's model, framework and roofline check are its winner's; the kernel
 filter matches an envelope any of whose rows ran that kernel.
 
-Query shape (docs/measured_calibration.md §5.4): project only the columns a
-view reads; envelope groups by (phys, env, phase) with the per-group
-aggregates the sort and the page need, then builds candidate lists, kernels
-and models for the page's groups only; rows find the page's ids over the
-narrow columns, then load those rows.
+Query shape: project only the columns a view reads; envelope groups the
+browse rows by their envelope key (`envelope`, the hash of phys, env and
+phase the derived file stores) with the per-group aggregates the sort and
+the page need, then builds candidate lists, kernels and models for the
+page's groups only; rows find the page's ids over the narrow columns, then
+read those rows; facets and coverage count the groups (`GROUPS`), not the
+rows.
 """
 from __future__ import annotations
 
@@ -38,13 +53,16 @@ import statistics
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from backend.arch.dims import call_token_axes, symbols as dim_symbols
 from backend.inference.benchmarks import OUTCOME_VOCABULARY
 from backend.inference.op_signatures import all_signatures
 from backend.service.bench import store
 from backend.service.bench.lake import Lake
+
+if TYPE_CHECKING:
+    from backend.service.bench.derived import Derived
 
 
 @dataclass(frozen=True)
@@ -56,7 +74,7 @@ class Query:
     run: str = ""                      # one of the caller's runs …
     upload: str = ""                   # … or uploads (the route resolves an admin's reads)
     set_owner: Optional[str] = None    # owner of run/upload (the caller, or anyone for an admin)
-    filters: dict = field(default_factory=dict)   # model, signature, gpu, framework, dtype, phase, kernel, outcome, check, key, batch, context, call_tokens (`call_tokens()`)
+    filters: dict = field(default_factory=dict)   # model, signature, gpu, framework, dtype, phase, kernel, outcome, check, key, batch, context
     sort: str = ""
     desc: Optional[bool] = None        # None: the view's own order (workload descending, others ascending)
     page: int = 0
@@ -67,29 +85,50 @@ class Refused(ValueError):
     """A request beyond a view's bounds; the message names the bound (400)."""
 
 
-def browse(lake: Lake, q: Query) -> dict:
-    return _Browse(lake, q).answer()
+def browse(lake: Lake, q: Query, derived: "Derived") -> dict:
+    """One view (`Query`) over the derived file, once it holds the lake's
+    snapshot now (`Derived.reach`: waits for the refresh; `LakeUnavailable`
+    when it cannot reach it in time)."""
+    b = _Browse(lake, q)
+    b.check_request()
+    derived.reach(lake, lake.snapshot_id())
+    return b.answer()
 
 
-# The joined row: a measurement (m), its batch (b) and its input's
-# annotations (a: the in-memory `annot`, store.py — none for a placeholder).
-_FROM = ("FROM lake.measurements m JOIN lake.batches b ON b.batch_id = m.batch_id "
-         "LEFT JOIN annot a ON a.input_id = m.input_id")
-# Rows of annotated inputs — the members of envelopes (a placeholder has none).
-_PHYSICAL = "a.signature IS NOT NULL AND a.physical_shape IS NOT NULL"
+# The derived file's tables the views read (`derived.Derived` builds them).
+#: One row per measurement: `batch_id`, `input_id`, `env`, `phys` and every
+#: quantity of `_FIELDS` that has SQL, by its name (`rows_select`).
+ROWS = f"{store.DERIVED}.browse_rows"
+#: The lake's batches at the file's snapshot: their review state and owner
+#: decide the scope.
+BATCHES = f"{store.DERIVED}.batches"
+#: The browse rows grouped by everything a scope, a facet or the coverage
+#: view tells rows apart by — batch, within peaks, every filter column —
+#: with how many rows each group has, and how many pass each roofline check
+#: (`n`, `n_<check>`; `groups_select`): what facets and coverage count, a
+#: few thousand groups for millions of rows.
+GROUPS = f"{store.DERIVED}.browse_groups"
+#: Per physical shape (`phys`), its place on a curve (`_Placement.entry`):
+#: axis (NULL: unplaced), x, rest (the shape without its token axes, JSON),
+#: factors (x's factors, a JSON list); integers as text (`_Placement.entry`).
+PLACEMENT = f"{store.DERIVED}.placement"
+
+# The row as a view reads it: the browse row (m) and its batch (b).
+_FROM = f"FROM {ROWS} m JOIN {BATCHES} b ON b.batch_id = m.batch_id"
 
 
 @dataclass(frozen=True)
 class _Field:
     """One quantity of the browse surface, declared once: its SQL over the
-    joined row (aliases m, b, a), and the parts of the page that read it —
-    a row's struct (`shown`), a facet the page filters by (`filter`, the
-    page's name for it), a sort key (`sort`, the page's name; the rows view
-    takes every sort key, `views` the other views that take it), or a
-    roofline check (`check`). The page's names are not always the column's:
-    the `kernel` filter is the catalog kernel, the `kernel` sort the
-    implementation. An envelope aggregate has no row SQL (the envelope
-    view computes it)."""
+    measurement (m), its batch (b) and its input's annotations (a) — what
+    the derived file stores it as, under its name (`rows_select`) — and
+    the parts of the page that read it: a row's struct (`shown`), a facet
+    the page filters by (`filter`, the page's name for it), a sort key
+    (`sort`, the page's name; the rows view takes every sort key, `views`
+    the other views that take it), or a roofline check (`check`). The
+    page's names are not always the column's: the `kernel` filter is the
+    catalog kernel, the `kernel` sort the implementation. An envelope
+    aggregate has no row SQL (the envelope view computes it)."""
     name: str
     sql: Optional[str]
     shown: bool = False
@@ -111,7 +150,9 @@ _WORKLOAD, _ENVELOPE = ("workload",), ("workload", "envelope")
 # The surface. Filters are listed in facet order. A row's rates are shown
 # only when positive; MFU / MBU and the check are the store's
 # (`measured_utilization`'s rule, parity-tested there). The row is 0021b's
-# `_bench_row_json`; `origin` is added per request.
+# `_bench_row_json`; `origin` is added per request. The roofline columns
+# keep the lake's names: the shared-row rule (`store.SHARED_ROW`) reads them
+# from the browse row as it reads them from a measurement.
 _FIELDS = (
     _Field("model", "m.model", shown=True, filter="model", sort="model"),
     _Field("signature", "a.signature", shown=True, filter="signature", sort="op", views=_WORKLOAD),
@@ -156,24 +197,58 @@ _FIELDS = (
     _Field("mbu", _positive(store.MBU), sort="mbu", views=_ENVELOPE),
     _Field("ai", "(CASE WHEN m.achieved_tflops > 0 AND m.achieved_bw_gbps > 0"
                  " THEN 1000 * m.achieved_tflops / m.achieved_bw_gbps END)", sort="ai"),
+    # Whether the row is within its recorded peaks: what the shared-row rule
+    # asks of a row (`store.shared_row`).
+    _Field("within_peak", store.WITHIN_PEAK),
     _Field("over", f"(NOT {store.WITHIN_PEAK})", check=True),
     _Field("ok", f"(({store.MFU} IS NOT NULL OR {store.MBU} IS NOT NULL) AND {store.WITHIN_PEAK})",
            check=True),
 )
 
 
+def rows_select(source: str) -> str:
+    """The browse row of every measurement of `source` (a relation with the
+    lake's measurement columns, aliased m): its keys and every quantity of
+    `_FIELDS` with SQL, under its name — with its batch from `BATCHES` and
+    its input's annotations from `store.ANNOT` (a placeholder's are NULL).
+    The derived file's only definition of the browse table."""
+    return ("SELECT m.batch_id, m.input_id, m.env, a.phys, "
+            # The envelope (module docstring) as one key: an envelope view
+            # groups millions of rows by it.
+            "md5_number_upper(a.phys::VARCHAR || chr(31) || m.env::VARCHAR || chr(31) || m.phase)"
+            " AS envelope, "
+            + ", ".join(f'{f.sql} AS "{f.name}"' for f in _FIELDS if f.sql is not None)
+            + f" FROM {source} m JOIN {BATCHES} b ON b.batch_id = m.batch_id"
+            f" LEFT JOIN {store.ANNOT} a ON a.input_id = m.input_id")
+
+
+def groups_select() -> str:
+    """The derived file's only definition of `GROUPS`, over `ROWS`."""
+    keys = ["batch_id", "within_peak", *(f.name for f in _FIELDS if f.filter)]
+    return (f"SELECT {', '.join(_col(k) for k in keys)}, count(*) AS n, "
+            + ", ".join(f'count(*) FILTER (WHERE {_col(f.name)}) AS "n_{f.name}"'
+                        for f in _FIELDS if f.check)
+            + f" FROM {ROWS} m GROUP BY ALL")
+
+
+def _col(name: str) -> str:
+    """A stored quantity of the browse row, by its `_Field` name."""
+    return f'm."{name}"'
+
+
 class _Surface:
-    """The lookups the views read, each derived from `_FIELDS`."""
+    """The lookups the views read, each derived from `_FIELDS`: every
+    quantity is the browse row's column of its name."""
 
     def __init__(self, fields: tuple) -> None:
-        self.sql = {f.name: f.sql for f in fields if f.sql is not None}
-        self.row = {f.name: f.sql for f in fields if f.shown}
-        self.dims = {f.filter: f.sql for f in fields if f.filter}
-        self.checks = {f.name: f.sql for f in fields if f.check}
+        self.sql = {f.name: _col(f.name) for f in fields if f.sql is not None}
+        self.row = {f.name: _col(f.name) for f in fields if f.shown}
+        self.dims = {f.filter: _col(f.name) for f in fields if f.filter}
+        self.checks = {f.name: _col(f.name) for f in fields if f.check}
         sortable = [f for f in fields if f.sort]
         self.sorts = {
-            "rows": {f.sort: f.sql for f in sortable if f.sql is not None},
-            "workload": {f.sort: f.sql for f in sortable if "workload" in f.views},
+            "rows": {f.sort: _col(f.name) for f in sortable if f.sql is not None},
+            "workload": {f.sort: _col(f.name) for f in sortable if "workload" in f.views},
             # the envelope view sorts its grouped CTE, by column name
             "envelope": {f.sort: f.name for f in sortable if "envelope" in f.views},
         }
@@ -182,6 +257,8 @@ class _Surface:
 
 
 _SURFACE = _Surface(_FIELDS)
+# Rows of annotated inputs — the members of envelopes (a placeholder has none).
+_PHYSICAL = f"{_col('signature')} IS NOT NULL AND {_col('physical_shape')} IS NOT NULL"
 
 _WORKLOAD_CANDIDATES = 50_000
 _CURVE_ENVELOPES = 50_000
@@ -253,10 +330,7 @@ class _Browse:
             self._scope = self._resolve_scope()
         text, params = self._scope
         if outcome and not self.all_outcomes:
-            if self.f["outcome"] == "measured":
-                s.add(f"{store.IS_MEASUREMENT} AND")
-            else:
-                s.add(f"{store.OUTCOME} = ? AND", self.f["outcome"])
+            s.add(f"{_SURFACE.sql['outcome']} = ? AND", self.f["outcome"])
         return s.add("(").add(text, *params).add(")")
 
     def _resolve_scope(self) -> tuple[str, list]:
@@ -268,10 +342,10 @@ class _Browse:
             ref = (store.SetRef(owner, "run", q.run.strip()) if q.run
                    else store.SetRef(owner, "upload", q.upload))
             where, params = ref.where()
-            return f"m.batch_id IN (SELECT batch_id FROM lake.batches WHERE {where})", params
+            return f"m.batch_id IN (SELECT batch_id FROM {BATCHES} WHERE {where})", params
         parts, params = [], []
         if q.source in ("", "shared"):
-            parts.append(f"({store.SHARED_ROW})")
+            parts.append(store.shared_row(_col("within_peak")))
         if q.caller is not None and q.source in ("", "mine"):
             parts.append("b.owner = ?::UUID")
             params.append(q.caller)
@@ -308,8 +382,9 @@ class _Browse:
         returns it (the rows and curves views ask for its members)."""
         key = self.f.get("key")
         if isinstance(key, dict):
-            s.add("AND a.signature = ? AND a.physical_shape = ? AND json(m.dtype_env_json) = json(?)"
-                  " AND m.gpu = ? AND m.phase = ?",
+            s.add(f"AND {_col('signature')} = ? AND {_col('physical_shape')} = ?"
+                  f" AND json({_col('dtype_env_json')}) = json(?)"
+                  f" AND {_col('gpu')} = ? AND {_col('phase')} = ?",
                   key.get("signature"), key.get("physical_shape"),
                   json.dumps(key.get("dtype_env_json")), key.get("gpu"), key.get("phase"))
         return s
@@ -328,9 +403,6 @@ class _Browse:
     def answer(self) -> dict:
         views = {"envelope": self.envelope, "rows": self.rows, "workload": self.workload,
                  "curves": self.curves, "coverage": self.coverage}
-        if self.view not in views:
-            raise Refused(f"unknown view {self.view}")
-        self.check_request()
         out: dict = {}
         if self.view != "curves":
             out["facets"] = self.facets()
@@ -340,6 +412,8 @@ class _Browse:
     def check_request(self) -> None:
         """Refuse what the view cannot answer before reading anything."""
         sorts = _SURFACE.sorts
+        if self.view not in ("envelope", "rows", "workload", "curves", "coverage"):
+            raise Refused(f"unknown view {self.view}")
         if self.all_outcomes:
             if self.view != "rows":
                 raise Refused("outcome=all lists measurements and failures together; "
@@ -363,12 +437,6 @@ class _Browse:
                 raise Refused("pick a model and a phase to see its workloads")
             if self.sort not in sorts["workload"]:
                 raise Refused(f"workload rows do not sort by {self.sort}")
-        if self.view == "curves":
-            tokens = self.f.get("call_tokens")
-            if not isinstance(tokens, dict) or not isinstance(tokens.get("total"), (list, tuple)) \
-                    or not isinstance(tokens.get("factor"), (list, tuple)) \
-                    or not isinstance(tokens.get("runs"), dict):
-                raise Refused("the curves view needs call_tokens {total, factor, runs}")
 
     def read(self, s: _Sql) -> list[dict]:
         return self.lake.read(s.text(), s.params)
@@ -376,23 +444,17 @@ class _Browse:
     # --------------------------------------------------------------- facets
 
     def facets(self) -> dict:
-        """Each filter's values over the scope under every other filter.
-
-        The scope's rows are grouped first, by the filter columns (dtype by
-        its whole env JSON, read once per group) and the roofline check as a
-        flag: a check in the WHERE made DuckDB group 2M filtered rows ~8×
-        slower than grouping them all (2.2M-row scale copy: 1.1 s vs 0.14 s)."""
+        """Each filter's values over the scope under every other filter, read
+        from the groups (`GROUPS`): a group passes the roofline check when
+        any of its rows does."""
         check = self.check()
         dims = _SURFACE.dims
-        s = _Sql().add("WITH g AS (SELECT " + ", ".join(
-            "m.dtype_env_json AS dtype_env_json" if d == "dtype" else f"{e} AS {d}"
-            for d, e in dims.items()))
-        s.add(f", bool_or({_SURFACE.checks[check]}) AS passes" if check else ", true AS passes")
-        s.add(_FROM + " WHERE")
+        s = _Sql().add("WITH d AS (SELECT DISTINCT " + ", ".join(f"{e} AS {d}" for d, e in dims.items()))
+        s.add(f"FROM {GROUPS} m JOIN {BATCHES} b ON b.batch_id = m.batch_id WHERE")
         self.scope(s, outcome=False)
-        s.add("GROUP BY " + ", ".join(str(n + 1) for n in range(len(dims))) + ")")
-        s.add(", d AS (SELECT * EXCLUDE (dtype_env_json),"
-              " json_extract_string(dtype_env_json, '$.activation') AS dtype FROM g WHERE passes)")
+        if check:
+            s.add(f'AND m."n_{check}" > 0')
+        s.add(")")
         cols = []
         for d in dims:
             col = _Sql().add(f"list_sort(list(DISTINCT {d}) FILTER (WHERE {d} IS NOT NULL")
@@ -410,58 +472,48 @@ class _Browse:
 
     # ------------------------------------------------------------- envelope
 
-    def envelopes(self, s: _Sql, winner: tuple[str, ...], extra_where: str = "",
-                  listed: bool = False) -> _Sql:
-        """CTEs `g` (one row per envelope in scope: count, winner struct
-        `win`, two fastest latencies) and `e` (filtered; winner id, latency,
-        gain and the `winner` fields — row columns or display rates — the
-        caller reads). Filters on key columns (op, gpu, phase, dtype — equal
-        on every member) select rows before grouping; a `key` selects the
-        one envelope it names there too. The model, framework
-        and check filters are the winner's, the kernel filter any member's.
-        The winner struct carries only what is read: every field rides
-        through `min_by` for every row in scope.
-
-        With `listed`, `r` (materialized) also keeps the annotated rows
-        without a physical shape and flags `listed`, a row passing every
-        filter — the ops the curves view lists, from the same pass."""
+    def envelopes(self, s: _Sql, winner: tuple[str, ...], extra_where: str = "") -> _Sql:
+        """CTEs `g` (one row per envelope in scope, by its key `envelope`:
+        count, winner id and latency, the runner-up's latency, and the
+        `winner` fields — row columns or display rates — the caller reads)
+        and `e` (`g` filtered, with the gain). Filters on key columns (op,
+        gpu, phase, dtype — equal on every member) select rows before
+        grouping; a `key` selects the one envelope it names there too. The
+        model, framework and check filters are the winner's, the kernel
+        filter any member's. Each winner field is its own `arg_min_null` (the
+        winner's value, NULL included — `arg_min` skips NULLs): a
+        struct carried through the grouping for every row in scope was
+        twice as slow at 4.28M rows."""
         kernel = self.f.get("kernel")
         check = self.check()
-        names = ("id", "latency_us", *(d for d in ("model", "framework") if d in self.f), *winner)
+        fastest = f"({_col('latency_us')}, {_col('id')})"
+        names = (*(d for d in ("model", "framework") if d in self.f), *winner)
         exprs = {c: _SURFACE.sql[c] for c in dict.fromkeys(names)}
         if check:
             exprs["passes_check"] = _SURFACE.checks[check]
-        s.add("WITH r AS MATERIALIZED (" if listed else "WITH r AS (")
-        s.add("SELECT a.phys, m.env, m.phase,")
-        s.add(", ".join(f"{e} AS {c}" for c, e in exprs.items()))
+        s.add(f"WITH g AS (SELECT m.envelope, any_value(m.phys) AS phys, count(*) AS n_candidates,"
+              f" arg_min({_col('id')}, {fastest}) AS winner_id,"
+              f" arg_min_null({_col('latency_us')}, {fastest}) AS latency_us,"
+              # the two smallest latencies: the runner-up's is the second
+              f" min_by({_col('latency_us')}, {_col('latency_us')}, 2)[2] AS second_latency_us")
+        s.add("".join(f", arg_min_null({e}, {fastest}) AS {c}" for c, e in exprs.items()))
         if kernel:
-            s.add(", a.catalog_kernel AS member_kernel")
-        if listed:
-            s.add(f", a.signature AS listed_signature, {_PHYSICAL} AS physical, (TRUE")
-            self.filters(s, dims=("model", "framework", "kernel"))
-            s.add(f") AS listed {_FROM} WHERE a.signature IS NOT NULL AND")
-        else:
-            s.add(f"{_FROM} WHERE {_PHYSICAL} AND")
+            s.add(f", bool_or({_col('catalog_kernel')} = ?) AS has_kernel", kernel)
+        s.add(f"{_FROM} WHERE {_PHYSICAL} AND")
         self.scope(s)
         self.filters(s, dims=("signature", "gpu", "phase", "dtype"), check=False)
         self.one_envelope(s)
-        s.add("), g AS (SELECT phys, env, phase, count(*) AS n_candidates,")
-        s.add("min_by(struct_pack(" + ", ".join(exprs) + "), (latency_us, id)) AS win,")
-        s.add("min_by(latency_us, latency_us, 2) AS fastest")  # the two smallest latencies
-        if kernel:
-            s.add(", bool_or(member_kernel = ?) AS has_kernel", kernel)
-        s.add(("FROM r WHERE physical" if listed else "FROM r") + " GROUP BY phys, env, phase)")
-        s.add(", e AS MATERIALIZED (SELECT phys, env, phase, n_candidates, win, win.id AS winner_id,"
-              " win.latency_us AS latency_us, fastest[2] AS second_latency_us,"
-              " fastest[2] / NULLIF(win.latency_us, 0) - 1 AS gain"
-              + "".join(f", win.{c} AS {c}" for c in winner) + " FROM g WHERE TRUE")
+        s.add("GROUP BY m.envelope)")
+        s.add(", e AS MATERIALIZED (SELECT envelope, phys, n_candidates, winner_id, latency_us,"
+              " second_latency_us, second_latency_us / NULLIF(latency_us, 0) - 1 AS gain"
+              + "".join(f", {c}" for c in winner if c != "latency_us") + " FROM g WHERE TRUE")
         if kernel:
             s.add("AND has_kernel")
         for d in ("model", "framework"):
             if d in self.f:
-                s.add(f"AND win.{d} = ?", self.f[d])
+                s.add(f"AND {d} = ?", self.f[d])
         if check:
-            s.add("AND win.passes_check")
+            s.add("AND passes_check")
         return s.add(extra_where + ")")
 
     def envelope(self) -> dict:
@@ -470,24 +522,21 @@ class _Browse:
         s = self.envelopes(_Sql(), winner=(sort_col,) if sort_col in _SURFACE.derived else ())
         s.add(f", p AS MATERIALIZED (SELECT * FROM e ORDER BY {order} LIMIT ? OFFSET ?)", self.size, self.off)
         # The page's members, read once: the winner's row, candidate lists,
-        # kernels, models — by the page's inputs first (`pa`, materialized:
-        # otherwise DuckDB joins the measurements to the page on env alone,
-        # 40 s at 2.2M rows).
-        s.add(", pa AS MATERIALIZED (SELECT p.winner_id, p.env, p.phase, a.* EXCLUDE (phys)"
-              " FROM p JOIN annot a ON a.phys = p.phys)")
-        s.add(", c AS (SELECT a.winner_id, min_by(")
+        # kernels, models.
+        s.add(", c AS (SELECT p.winner_id, min_by(")
         self.row_struct(s)
-        s.add(", (m.latency_us, m.id)) AS winner,"
-              " min_by(struct_pack(id := m.id, latency_us := m.latency_us, framework := m.framework,"
-              " kernel_impl := m.kernel_impl, catalog_kernel := a.catalog_kernel, model := m.model),"
-              f" (m.latency_us, m.id), {_CANDIDATES}) AS candidates,"
-              " list_sort(list(DISTINCT a.catalog_kernel) FILTER (WHERE a.catalog_kernel IS NOT NULL)) AS kernels,"
-              " list_sort(list(DISTINCT m.model) FILTER (WHERE m.model IS NOT NULL)) AS models"
-              " FROM pa a JOIN lake.measurements m ON m.input_id = a.input_id AND m.env = a.env"
-              " AND m.phase = a.phase"
-              f" JOIN lake.batches b ON b.batch_id = m.batch_id WHERE {_PHYSICAL} AND")
+        s.add(f", ({_col('latency_us')}, {_col('id')})) AS winner,"
+              f" min_by(struct_pack(id := {_col('id')}, latency_us := {_col('latency_us')},"
+              f" framework := {_col('framework')}, kernel_impl := {_col('kernel_impl')},"
+              f" catalog_kernel := {_col('catalog_kernel')}, model := {_col('model')}),"
+              f" ({_col('latency_us')}, {_col('id')}), {_CANDIDATES}) AS candidates,"
+              f" list_sort(list(DISTINCT {_col('catalog_kernel')}) FILTER"
+              f" (WHERE {_col('catalog_kernel')} IS NOT NULL)) AS kernels,"
+              f" list_sort(list(DISTINCT {_col('model')}) FILTER (WHERE {_col('model')} IS NOT NULL)) AS models"
+              f" FROM p JOIN {ROWS} m ON m.envelope = p.envelope"
+              f" JOIN {BATCHES} b ON b.batch_id = m.batch_id WHERE {_PHYSICAL} AND")
         self.scope(s)
-        s.add("GROUP BY a.winner_id)")
+        s.add("GROUP BY p.winner_id)")
         s.add(f"SELECT t.total, x.* FROM (SELECT count(*) AS total FROM e) t LEFT JOIN ("
               f" SELECT p.{sort_col} AS sort_key, p.winner_id, p.n_candidates, p.gain,"
               " c.winner, c.candidates, c.kernels, c.models FROM p JOIN c ON c.winner_id = p.winner_id"
@@ -510,15 +559,14 @@ class _Browse:
     # ----------------------------------------------------------------- rows
 
     def page_of_rows(self, s: _Sql, source: str, totals: str) -> list[dict]:
-        """Finish a statement whose CTE `source` has (id, batch_id,
-        input_id, k): `totals` over it, then the page's rows in order."""
+        """Finish a statement whose CTE `source` has (id, k): `totals` over
+        it, then the page's rows in order."""
         s.add(f", p AS (SELECT * FROM {source} ORDER BY {self.order('k', 'id')} LIMIT ? OFFSET ?)",
               self.size, self.off)
         s.add(f"SELECT t.*, x.* FROM (SELECT {totals} FROM {source}) t LEFT JOIN (SELECT p.k AS sort_key, p.id AS page_id,")
         self.row_struct(s)
-        s.add("AS row FROM p JOIN lake.measurements m ON m.id = p.id AND m.batch_id = p.batch_id"
-              " AND m.input_id = p.input_id"
-              " JOIN lake.batches b ON b.batch_id = m.batch_id LEFT JOIN annot a ON a.input_id = m.input_id"
+        s.add(f"AS row FROM p JOIN {ROWS} m ON {_col('id')} = p.id"
+              f" JOIN {BATCHES} b ON b.batch_id = m.batch_id"
               f") x ON true ORDER BY {self.order('x.sort_key', 'x.page_id')}")
         return self.read(s)
 
@@ -526,7 +574,7 @@ class _Browse:
         """One page of the scope's rows under the filters (the envelope
         view's scope and filters), or of one envelope's (`key` as the
         envelope view returns it — its rows from every deployment)."""
-        s = _Sql().add(f"WITH f AS (SELECT m.id, m.batch_id, m.input_id, {_SURFACE.sorts['rows'][self.sort]} AS k"
+        s = _Sql().add(f"WITH f AS (SELECT {_col('id')} AS id, {_SURFACE.sorts['rows'][self.sort]} AS k"
                        f" {_FROM} WHERE")
         self.scope(s)
         self.one_envelope(s)
@@ -542,13 +590,14 @@ class _Browse:
     def workload(self) -> dict:
         model, phase = self.f["model"], self.f["phase"]
         batch, context = self.f.get("batch"), self.f.get("context")
-        s = _Sql().add("SELECT list_sort(list(DISTINCT a.workload_batch)"
-                       " FILTER (WHERE a.workload_batch IS NOT NULL)) AS batches,"
-                       " count(*) FILTER (WHERE a.workload_batch IS NULL) AS unplaced,"
-                       " list(DISTINCT a.workload_context) FILTER (WHERE a.workload_batch = ?) AS contexts,"
-                       " count(*) FILTER (WHERE a.workload_batch = ? AND a.workload_context IN (?, 0)) AS candidates",
+        wb, wc = _col("workload_batch"), _col("workload_context")
+        s = _Sql().add(f"SELECT list_sort(list(DISTINCT {wb})"
+                       f" FILTER (WHERE {wb} IS NOT NULL)) AS batches,"
+                       f" count(*) FILTER (WHERE {wb} IS NULL) AS unplaced,"
+                       f" list(DISTINCT {wc}) FILTER (WHERE {wb} = ?) AS contexts,"
+                       f" count(*) FILTER (WHERE {wb} = ? AND {wc} IN (?, 0)) AS candidates",
                        batch, batch, context)
-        s.add(f"{_FROM} WHERE m.model = ? AND m.phase = ? AND", model, phase)
+        s.add(f"{_FROM} WHERE {_col('model')} = ? AND {_col('phase')} = ? AND", model, phase)
         self.scope(s)
         st = self.read(s)[0]
         out: dict = {"batches": list(st["batches"] or []), "unplaced": int(st["unplaced"])}
@@ -563,16 +612,16 @@ class _Browse:
             raise Refused(f"this workload has {n} measurements; the view reads up to 50,000 — pick a source")
         # The candidates — context c and context 0 (they belong to every
         # context) — and per (layer, op) the fastest of them.
-        s = _Sql().add("WITH c AS (SELECT m.id, m.batch_id, m.input_id, m.node_spec_id, m.op, m.latency_us,"
+        s = _Sql().add(f"WITH c AS (SELECT {_col('id')} AS id, {_col('node_spec_id')} AS node_spec_id,"
+                       f" {_col('op')} AS op, {_col('latency_us')} AS latency_us,"
                        f" {_SURFACE.sorts['workload'][self.sort]} AS k {_FROM}"
-                       " WHERE m.model = ? AND m.phase = ? AND a.workload_batch = ?"
-                       " AND a.workload_context IN (?, 0) AND", model, phase, batch, context)
+                       f" WHERE {_col('model')} = ? AND {_col('phase')} = ? AND {wb} = ?"
+                       f" AND {wc} IN (?, 0) AND", model, phase, batch, context)
         self.scope(s)
         self.filters(s, dims=[d for d in _SURFACE.dims if d not in ("model", "phase")])
-        s.add("), w AS (SELECT min_by(struct_pack(id, batch_id, input_id, latency_us, k), (latency_us, id)) AS best"
+        s.add("), w AS (SELECT min_by(struct_pack(id, latency_us, k), (latency_us, id)) AS best"
               " FROM c GROUP BY node_spec_id, op),"
-              " pick AS (SELECT best.id AS id, best.batch_id AS batch_id, best.input_id AS input_id,"
-              " best.latency_us AS latency_us, best.k AS k FROM w)")
+              " pick AS (SELECT best.id AS id, best.latency_us AS latency_us, best.k AS k FROM w)")
         got = self.page_of_rows(s, "pick", "count(*) AS total, COALESCE(sum(latency_us), 0) AS total_latency_us")
         return {**out, "total": int(got[0]["total"]),
                 "total_latency_us": _plain(got[0]["total_latency_us"]),
@@ -581,56 +630,51 @@ class _Browse:
     # --------------------------------------------------------------- curves
 
     def curves(self) -> dict:
-        """Per op, its envelopes along the tokens one kernel call runs over,
-        as `call_tokens()` derives them (passed by the route as {total,
-        runs}): a shape with one `total` axis runs along it, the factors it
-        also has moving with it (a grouped expert GEMM's routed `n_tokens`,
-        its per-expert `s_expert_rows`); otherwise along the first run of
-        factors
-        its signature's contract lays out that the shape has whole
-        (`call_tokens()`): batch × context where the contract has a context
-        axis (attention along `B×s_kv`, one curve per `s_query`; not a
-        sparse attention, whose keys are capped by its top-k), the product
-        where the contract folds factors into one axis (`B×s_query`, in
-        decode the batch), else one factor with the others kept in the
-        curve. A signature with no contract is unplaced. An op
-        shape with those axes taken out — a GEMM's (n, k) — at one gpu and
-        dtype is one curve, across phases (each point says its phase). A
-        point needs an MFU or an MBU: a memory-only op records no FLOP rate.
-        The longest curves first, each whole, up to 4,000 points per op (the
-        first curve always); envelopes with no token axis are `unplaced`; an
-        op with more than 50,000 envelopes in view answers `too_many`."""
-        tokens = self.f["call_tokens"]
-        # One pass over the scope's rows (`listed`): the envelopes and the ops
-        # listed come from the same materialized rows, narrow; the winners'
-        # text by one join on their ids. (Measured both ways on the live lake
-        # and the 2.2M-row copy: text carried through the grouping is slower
-        # at scale, a separate pass for the op list costs a scan of every file.)
-        s = self.envelopes(_Sql(), winner=("tflops", "gbps", "mfu", "mbu"),
-                           extra_where=" AND (mfu IS NOT NULL OR mbu IS NOT NULL)", listed=True)
-        s.add(", w AS (SELECT e.phase, e.tflops, e.gbps, e.mfu, e.mbu, "
-              + ", ".join(f"{_SURFACE.row[c]} AS {c}" for c in (
-                  "signature", "physical_shape", "gpu", "dtype_env_json", "framework",
-                  "model", "latency_us"))
-              + ", coalesce(a.catalog_kernel, m.kernel_impl) AS kernel"
-              " FROM e JOIN lake.measurements m ON m.id = e.winner_id"
-              " JOIN annot a ON a.input_id = m.input_id)")
-        s.add(", s AS (SELECT *, count(*) OVER (PARTITION BY signature) AS n_op FROM w)"
-              " SELECT false AS op, * FROM s"
-              f" QUALIFY n_op <= {_CURVE_ENVELOPES} OR row_number() OVER (PARTITION BY signature) = 1"
-              " UNION ALL BY NAME SELECT DISTINCT true AS op, listed_signature AS signature"
-              " FROM r WHERE listed")
-        signatures: list = []
-        per_op: dict = {}
-        for r in self.read(s):
-            if r["op"]:
-                signatures.append(r["signature"])
-            else:
-                per_op.setdefault(r["signature"], []).append(r)
-        signatures.sort()
-        place = _Placement(tokens["runs"], list(tokens["total"]),
-                           list(tokens["factor"]))
-        return {"ops": [place.curves_of(sig, per_op.get(sig, [])) for sig in signatures]}
+        """The ops in view, and — when the request names one op (its
+        `signature` filter) —
+        that op's curves: its envelopes along the tokens one kernel call
+        runs over (`_Placement`, stored per physical shape in `PLACEMENT`).
+
+        Without an op the answer lists the ops (`{signature}` each): every
+        op with an annotated row under the scope and every filter, a shape
+        with no physical identity included. The page draws an op's curves
+        when it asks for them by name: one answer with every op's curves
+        was 187k points, 62 MB on the 4.28M-row lake.
+
+        For the op: a shape with its token axes taken out — a GEMM's (n, k)
+        — at one gpu and dtype is one curve, across phases (each point says
+        its phase). A point needs an MFU or an MBU: a memory-only op records
+        no FLOP rate. The longest curves first, each whole, up to 4,000
+        points (the first curve always); envelopes with no token axis are
+        `unplaced`; more than 50,000 envelopes in view answers `too_many`."""
+        listed = _Sql().add(f"SELECT DISTINCT {_col('signature')} AS signature {_FROM}"
+                            f" WHERE {_col('signature')} IS NOT NULL AND")
+        self.scope(listed)
+        self.filters(listed)
+        self.one_envelope(listed)
+        op = self.f.get("signature")
+        if op is not None:
+            listed.add(f"AND {_col('signature')} = ?", op)
+        signatures = sorted(r["signature"] for r in self.read(listed))
+        if op is None:
+            return {"ops": [{"signature": sig} for sig in signatures]}
+        if op not in signatures:
+            return {"ops": []}
+        # The op's envelopes counted first, on the rates alone: an op over
+        # the bound answers `too_many` without carrying its winners' text
+        # through the grouping.
+        rates = ("tflops", "gbps", "mfu", "mbu")
+        drawn = " AND (mfu IS NOT NULL OR mbu IS NOT NULL)"
+        counted = self.envelopes(_Sql(), winner=rates, extra_where=drawn)
+        n_op = self.read(counted.add("SELECT count(*) AS n FROM e"))[0]["n"]
+        if n_op > _CURVE_ENVELOPES:
+            return {"ops": [{"signature": op, "too_many": True}]}
+        shown = ("phase", "physical_shape", "gpu", "dtype_env_json", "framework", "model",
+                 "catalog_kernel", "kernel_impl", "latency_us")
+        s = self.envelopes(_Sql(), winner=(*rates, *shown), extra_where=drawn)
+        s.add("SELECT e.*, coalesce(e.catalog_kernel, e.kernel_impl) AS kernel,"
+              f" pl.axis, pl.x, pl.rest, pl.factors FROM e JOIN {PLACEMENT} pl ON pl.phys = e.phys")
+        return {"ops": [_curves_of(op, self.read(s))]}
 
     # ------------------------------------------------------------- coverage
 
@@ -641,11 +685,10 @@ class _Browse:
         `outcomes`, the rows of every outcome under the same filters, so the
         page can say how many of a kernel's attempts failed and how."""
         check = self.check()
-        # The check counted per group rather than filtered in the WHERE (see
-        # `facets`: same answer, several times faster at scale).
-        n = f"count(*) FILTER (WHERE {_SURFACE.checks[check]})" if check else "count(*)"
-        s = _Sql().add(f"SELECT a.catalog_kernel AS kernel, m.framework AS framework,"
-                       f" {store.OUTCOME} AS outcome, {n} AS n {_FROM} WHERE")
+        n = f'sum(m."n_{check}")' if check else "sum(m.n)"
+        s = _Sql().add(f"SELECT {_col('catalog_kernel')} AS kernel, {_col('framework')} AS framework,"
+                       f" {_col('outcome')} AS outcome, {n} AS n FROM {GROUPS} m"
+                       f" JOIN {BATCHES} b ON b.batch_id = m.batch_id WHERE")
         self.scope(s, outcome=False)
         self.filters(s, dims=("gpu", "dtype", "phase"), check=False)
         s.add(f"GROUP BY ALL HAVING {n} > 0")
@@ -665,90 +708,98 @@ class _Browse:
 
 
 class _Placement:
-    """Envelopes onto curves. A shape's token axes, x and the rest of it
-    are read once per distinct shape text, and points are built only for
-    the curves the answer keeps."""
+    """Where a physical shape sits on a curve, from the declarations
+    (`call_tokens()`): its token axes, x and the rest of it. Applied once
+    per physical shape by the derived file's refresh (`entry`, stored in
+    `PLACEMENT`); a view reads the stored answer."""
 
     def __init__(self, runs: dict, totals: list[str], factors: list[str]) -> None:
         self.runs = runs
         self.totals = totals
         self.factors = factors
-        self.shapes: dict = {}
-        self.dtypes: dict = {}
 
     def place(self, signature: str, physical_shape: str):
         """(axis, x, rest, rest's key, x's factors) of a shape, or None:
         unplaced — no token axis, more than one total, or no contract for
         the signature."""
-        key = (signature, physical_shape)
-        if key not in self.shapes:
-            shape = json.loads(physical_shape)
+        shape = json.loads(physical_shape)
 
-            def has(a: str) -> bool:
-                v = shape.get(a)
-                return isinstance(v, int) and not isinstance(v, bool) and v > 0
-            runs = [list(r) for r in self.runs.get(signature, ())]
-            totals = [a for a in self.totals if has(a)]
-            if signature not in self.runs:
-                # No contract: no declaration says what its axes are.
-                x_axes = taken = []
-            elif totals:
-                # A total is the count itself; every factor present moves with
-                # it — the declared factors (dims.yaml `call_tokens: factor`),
-                # not only the ones the contract's operands lay out: a
-                # combine writes its token side, so its B and s_query are on
-                # no operand and still grow with the routed rows.
-                x_axes = totals if len(totals) == 1 else []
-                taken = totals + [a for a in self.factors if has(a)] + [
-                    a for r in runs for a in r if has(a)]
-            else:
-                x_axes = next((r for r in runs if all(has(a) for a in r)), [])
-                taken = x_axes
-            if not x_axes:
-                self.shapes[key] = None
-            else:
-                rest = {k: v for k, v in shape.items() if k not in taken}
-                self.shapes[key] = ("×".join(x_axes), math.prod(shape[a] for a in x_axes),
-                                    rest, json.dumps(rest, sort_keys=True),
-                                    tuple(shape[a] for a in x_axes))
-        return self.shapes[key]
+        def has(a: str) -> bool:
+            v = shape.get(a)
+            return isinstance(v, int) and not isinstance(v, bool) and v > 0
+        runs = self.runs.get(signature)
+        if runs is None:
+            # No contract: no declaration says what its axes are.
+            return None
+        totals = [a for a in self.totals if has(a)]
+        if totals:
+            # A total is the count itself; every factor present moves with
+            # it — the declared factors (dims.yaml `call_tokens: factor`),
+            # not only the ones the contract's operands lay out: a
+            # combine writes its token side, so its B and s_query are on
+            # no operand and still grow with the routed rows.
+            if len(totals) != 1:
+                return None
+            x_axes = totals
+            taken = set(totals) | {a for a in self.factors if has(a)} | {
+                a for r in runs for a in r if has(a)}
+        else:
+            x_axes = next((list(r) for r in runs if all(has(a) for a in r)), [])
+            taken = set(x_axes)
+        if not x_axes:
+            return None
+        rest = {k: v for k, v in shape.items() if k not in taken}
+        return ("×".join(x_axes), math.prod(shape[a] for a in x_axes),
+                rest, json.dumps(rest, sort_keys=True), tuple(shape[a] for a in x_axes))
 
-    def dtype(self, text: str) -> Any:
-        if text not in self.dtypes:
-            self.dtypes[text] = json.loads(text)
-        return self.dtypes[text]
+    def entry(self, phys: int, signature: str, physical_shape: str) -> dict:
+        """A `PLACEMENT` row: the placement of one physical shape (axis NULL:
+        unplaced)."""
+        at = self.place(signature, physical_shape)
+        if at is None:
+            return {"phys": phys, "axis": None, "x": None, "rest": None, "factors": None}
+        axis, x, _rest, key, factors = at
+        # Integers as text: exact past 2^53, and read back several times
+        # faster than DuckDB's 128-bit integers.
+        return {"phys": phys, "axis": axis, "x": str(x), "rest": key,
+                "factors": json.dumps(list(factors))}
 
-    def curves_of(self, signature: str, envelopes: list[dict]) -> dict:
-        if envelopes and envelopes[0]["n_op"] > _CURVE_ENVELOPES:
-            return {"signature": signature, "too_many": True}
-        members: dict = {}
-        unplaced = 0
-        for e in envelopes:
-            at = self.place(signature, e["physical_shape"])
-            if at is None:
-                unplaced += 1
-                continue
-            key = (e["gpu"], e["dtype_env_json"], at[0], at[3])
-            members.setdefault(key, []).append((at[1], at[4], e))
-        kept, upto = [], 0
-        for key in sorted(members, key=lambda k: (-len(members[k]), k)):
-            upto += len(members[key])
-            if upto > _CURVE_POINTS and kept:
-                break
-            gpu, dtype, axis, _ = key
-            placed = sorted(members[key], key=lambda m: (m[0], m[2]["physical_shape"], m[2]["phase"],
-                                                         m[2]["latency_us"]))
-            pts = [{"x": x, "shape": e["physical_shape"], "phase": e["phase"], "framework": e["framework"],
-                    "kernel": e["kernel"], "model": e["model"], "latency_us": e["latency_us"],
-                    "tflops": e["tflops"], "gbps": e["gbps"], "mfu": e["mfu"], "mbu": e["mbu"]}
-                   for x, _, e in placed]
-            kept.append({"gpu": gpu,
-                         "dtype_env_json": dict(self.dtype(dtype)), "axis": axis,
-                         "shape": dict(self.place(signature, members[key][0][2]["physical_shape"])[2]),
-                         "saturation": _saturation(pts), "points": pts,
-                         "lines": _lines([(p["phase"], f) for p, (_, f, _) in zip(pts, placed, strict=True)])})
-        return {"signature": signature, "points": sum(len(m) for m in members.values()),
-                "curves_total": len(members), "unplaced": unplaced, "curves": kept}
+
+#: A `PLACEMENT` row's types (`_Placement.entry`).
+PLACEMENT_TYPES = {"phys": "UBIGINT", "axis": "VARCHAR", "x": "VARCHAR", "rest": "VARCHAR",
+                   "factors": "VARCHAR"}
+
+
+def _curves_of(signature: str, envelopes: list[dict]) -> dict:
+    """One op's envelopes (each with its stored placement) onto curves;
+    points are built only for the curves the answer keeps."""
+    members: dict = {}
+    unplaced = 0
+    for e in envelopes:
+        if e["axis"] is None:
+            unplaced += 1
+            continue
+        key = (e["gpu"], e["dtype_env_json"], e["axis"], e["rest"])
+        members.setdefault(key, []).append((int(e["x"]), tuple(json.loads(e["factors"])), e))
+    kept, upto = [], 0
+    for key in sorted(members, key=lambda k: (-len(members[k]), k)):
+        upto += len(members[key])
+        if upto > _CURVE_POINTS and kept:
+            break
+        gpu, dtype, axis, rest = key
+        placed = sorted(members[key], key=lambda m: (m[0], m[2]["physical_shape"], m[2]["phase"],
+                                                     m[2]["latency_us"]))
+        pts = [{"x": x, "shape": e["physical_shape"], "phase": e["phase"], "framework": e["framework"],
+                "kernel": e["kernel"], "model": e["model"], "latency_us": e["latency_us"],
+                "tflops": e["tflops"], "gbps": e["gbps"], "mfu": e["mfu"], "mbu": e["mbu"]}
+               for x, _, e in placed]
+        kept.append({"gpu": gpu,
+                     "dtype_env_json": json.loads(dtype), "axis": axis,
+                     "shape": json.loads(rest),
+                     "saturation": _saturation(pts), "points": pts,
+                     "lines": _lines([(p["phase"], f) for p, (_, f, _) in zip(pts, placed, strict=True)])})
+    return {"signature": signature, "points": sum(len(m) for m in members.values()),
+            "curves_total": len(members), "unplaced": unplaced, "curves": kept}
 
 
 def _lines(points: list[tuple]) -> list[list[int]]:

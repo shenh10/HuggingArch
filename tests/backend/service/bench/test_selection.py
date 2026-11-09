@@ -18,7 +18,7 @@ from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable
 
 def _upload(lake, annotate, owner, rows, *, status="private"):
     store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                 rows=rows, annotate=annotate, status=status,
+                 rows=rows, status=status,
                  decided_by=owner if status == "shared" else None)
     return lake.snapshot_id()
 
@@ -61,7 +61,6 @@ def test_the_held_tables_budget_is_the_lakes_configured_limit(tmp_path, annotate
     for limit, held in (("64MiB", True), ("32MiB", False)):
         lk = _open(tmp_path / limit, selection_limit=limit)
         try:
-            store.annotate_all(lk, annotate)
             snap = _upload(lk, annotate, new_owner(), rows, status="shared")
             with LK.Selection().use(lk, snap) as table:
                 assert (table is not None) is held, limit
@@ -76,7 +75,7 @@ def test_a_selection_limit_not_below_the_memory_limit_is_refused(tmp_path):
                              memory_limit="256MB", selection_limit="256MB"))
 
 
-def test_the_held_table_answers_as_the_pinned_query(lake, cells, annotate, make_rows,
+def test_the_held_table_answers_as_the_pinned_query(lake, derived, annotate, make_rows,
                                                     new_owner):
     alice, admin = new_owner(), new_owner()
     rows = make_rows(3)
@@ -85,13 +84,13 @@ def test_the_held_table_answers_as_the_pinned_query(lake, cells, annotate, make_
     keys = [_key(annotate, r) for r in rows]
     held, pinned = LK.Selection(), LK.Selection()
     unheld = _limited(lake, 0)
-    cells.refresh(unheld)
+    derived.refresh(unheld)
     for owner in (None, alice):
         for snap in (s2, s1):
             a = LK.lookup(lake, keys, owner=owner, snapshot=snap, selection=held,
-                          cells=cells)
+                          derived=derived)
             b = LK.lookup(unheld, keys, owner=owner, snapshot=snap, selection=pinned,
-                          cells=cells)
+                          derived=derived)
             assert a == b and a["rows"] != [[], [], []]
     assert len(_tables(lake)) == 1 and pinned._current[unheld][1] is None
 
@@ -152,7 +151,7 @@ def test_an_older_pin_takes_the_pinned_query(lake, annotate, make_rows, new_owne
 
 
 @pytest.mark.parametrize("held", [False, True])
-def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, cells, annotate, make_rows,
+def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, derived, annotate, make_rows,
                                                            new_owner, held):
     owner = new_owner()
     rows = make_rows(6)
@@ -161,14 +160,14 @@ def test_concurrent_lookups_at_moving_snapshots_never_fail(lake, cells, annotate
     sel = LK.Selection()
     if not held:
         lake = _limited(lake, 0)
-    cells.refresh(lake)
+    derived.refresh(lake)
     errors: list = []
 
     def run(snap):
         try:
             for _ in range(5):
                 out = LK.lookup(lake, keys, owner=None, snapshot=snap,
-                                selection=sel, cells=cells)
+                                selection=sel, derived=derived)
                 assert sum(map(len, out["rows"])) == snaps.index(snap) + 1
         except Exception as e:
             errors.append(e)

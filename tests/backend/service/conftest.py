@@ -92,6 +92,7 @@ def bench_gate(monkeypatch):
     """A fresh `serving.Gate` for the Kernel Bench service's routes (the
     module's one keeps its state across tests otherwise), a fresh shared
     revision and verdict memo; the maintainer not started."""
+    from backend.service.bench import derived as derived_mod
     from backend.service.bench import lake as lake_mod
     from backend.service.bench import lookup
     from backend.service.bench import serving
@@ -102,9 +103,9 @@ def bench_gate(monkeypatch):
     monkeypatch.setattr(R, "shared_revision", lookup.SharedRevision())
     monkeypatch.setattr(R, "verdicts", lookup.Verdicts())
     monkeypatch.setattr(R, "lookup_stats", lookup.LookupStats())
-    cells = lookup.Cells()
-    monkeypatch.setattr(R, "cells", cells)
-    gate = serving.Gate(annotate=R.row_annotations, ready=cells.refresh,
+    derived = derived_mod.Derived(annotate=R.row_annotations, rules=R.rules_rev)
+    monkeypatch.setattr(R, "derived", derived)
+    gate = serving.Gate(ready=derived.refresh,
                         on_serving=R._serving_started)
     monkeypatch.setattr(R, "gate", gate)
     yield gate

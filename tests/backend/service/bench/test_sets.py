@@ -9,8 +9,15 @@ import pytest
 
 from backend.inference import benchmarks as _benchmarks
 from backend.inference.op_calibration import measured_utilization
+from backend.inference.benchmark_identity import canonical_identity_json
 from backend.service.bench import sets, store
 from backend.service.bench.store import SetRef
+from tests.backend.service.bench.conftest import derive, make_annotator
+
+
+def _overlap(lake, ref, **kw):
+    """`sets.overlap` over the lake's derived file (the fixture's rules)."""
+    return sets.overlap(lake, ref, derive(lake, make_annotator(), rules="test"), **kw)
 
 
 def _shape(i):
@@ -28,7 +35,7 @@ def rows_of(make_rows):
 def _upload(lake, annotate, owner, rows, *, run_id=None, label=None):
     upload_id = str(uuid.uuid4())
     res = store.upload(lake, owner=owner, upload_id=upload_id, run_id=run_id,
-                       label=label, rows=rows, annotate=annotate)
+                       label=label, rows=rows)
     assert res.inserted == len(rows)
     return upload_id
 
@@ -251,7 +258,7 @@ def _envelopes(rows, annotate):
     for r in rows:
         ann = annotate(r)
         key = (ann["signature"], ann["physical_shape"],
-               store.canonical_json(r["dtype_env_json"]), r["gpu"], r["phase"])
+               canonical_identity_json(r["dtype_env_json"]), r["gpu"], r["phase"])
         out.setdefault(key, []).append(r)
     return {k: (min(float(r["latency_us"]) for r in v), len(v)) for k, v in out.items()}
 
@@ -266,7 +273,7 @@ def test_overlap_against_shared(lake, corpus, annotate):
         mine = _envelopes(rows, annotate)
         both = [k for k in mine if k in shared]
         faster = [k for k in both if mine[k][0] < shared[k][0]]
-        out = sets.overlap(lake, ref)
+        out = _overlap(lake, ref)
         assert out["op_shapes"] == len(mine)
         assert out["in_shared"] == len(both)
         assert out["new"] == len(mine) - len(both)
@@ -284,12 +291,12 @@ def test_overlap_against_shared(lake, corpus, annotate):
                           for k in both}
         ratios = [r["latency_us"] / r["shared_latency_us"] for r in out["in_shared_list"]]
         assert ratios == sorted(ratios)
-    run = sets.overlap(lake, SetRef(a, "run", "r1"))
+    run = _overlap(lake, SetRef(a, "run", "r1"))
     # Shapes seq 2048 (B's), 4096 (both), 6144 (A's own shared row); the
     # run's H200 batch is new. B's 100 µs beats the run at seq 2048.
     assert (run["op_shapes"], run["in_shared"], run["new"], run["faster_than_shared"]) == (5, 3, 2, 0)
-    assert len(sets.overlap(lake, SetRef(a, "run", "r1"), limit=1)["in_shared_list"]) == 1
-    assert sets.overlap(lake, SetRef(a, "run", "nope"))["op_shapes"] == 0
+    assert len(_overlap(lake, SetRef(a, "run", "r1"), limit=1)["in_shared_list"]) == 1
+    assert _overlap(lake, SetRef(a, "run", "nope"))["op_shapes"] == 0
 
 
 def test_overlap_winner_framework(lake, rows_of, annotate, new_owner):
@@ -302,7 +309,7 @@ def test_overlap_winner_framework(lake, rows_of, annotate, new_owner):
                                                  latency_us="45.0"))
     _move(lake, other, u, "private", "nominated")
     _move(lake, other, u, "nominated", "shared")
-    (row,) = sets.overlap(lake, SetRef(owner, "run", "w"))["in_shared_list"]
+    (row,) = _overlap(lake, SetRef(owner, "run", "w"))["in_shared_list"]
     assert (row["latency_us"], row["framework"], row["shared_framework"],
             row["shared_kernel_impl"], row["shared_candidates"]) == (40.0, "sglang", "trtllm",
                                                                      "flash_attention_v3", 1)
@@ -318,7 +325,7 @@ def test_overlap_matches_shared_across_deployments(lake, rows_of, annotate, new_
                                                  latency_us="45.0"))
     _move(lake, other, u, "private", "nominated")
     _move(lake, other, u, "nominated", "shared")
-    out = sets.overlap(lake, SetRef(owner, "run", "d"))
+    out = _overlap(lake, SetRef(owner, "run", "d"))
     assert (out["op_shapes"], out["in_shared"], out["faster_than_shared"]) == (1, 1, 1)
 
 

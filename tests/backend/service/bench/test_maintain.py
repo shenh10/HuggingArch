@@ -15,7 +15,7 @@ _TABLES = {"batches": "batch_id", "inputs": "input_id", "measurements": "id"}
 
 def _up(lake, owner, rows, annotate, **kw):
     return store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()), run_id="r",
-                        label="l", rows=rows, annotate=annotate, **kw)
+                        label="l", rows=rows, **kw)
 
 
 def _dump(lake, at=None):

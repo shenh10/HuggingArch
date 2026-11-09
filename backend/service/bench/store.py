@@ -42,21 +42,24 @@ is per owner, and DuckLake lets two appends commit side by side), so a
 same in every process and needs no coordination; 63 bits leave a collision
 probability near n²/2⁶⁴, and a writer refuses one it sees. Registering a new
 input additionally takes `lake.inputs_lock()`, so `inputs` never holds one
-key twice (nor `annot` one input).
+key twice.
 
 Annotations — the grouping labels of an input (signature, physical_shape,
 workload_batch, workload_context, catalog_kernel) and `phys =
-md5_number_upper(signature ‖ 0x1F ‖ physical_shape)` — are not stored: they
-are pure functions of the input under this process's catalogs (`annotate`,
-composed by the routes). `annotate_all` computes them for every input into
-the in-memory table `annot` (the DuckDB instance's own in-memory database,
-which every cursor sees) before the lake serves, and `upload` adds those of
-its new inputs before it commits them. An input `annotate` refuses has no
-`annot` row — a placeholder: its rows are in scope but in no envelope.
+md5_number_upper(signature ‖ 0x1F ‖ physical_shape)` — are not lake data:
+they are pure functions of the input under the annotation rules
+(`annotate`, composed by the routes; their revision is `rules_rev`). They
+live in the lake's derived file (`derived.Derived`, `ANNOT`), which its one
+refresh keeps at one entry per input of the snapshot it holds: an input
+`annotate` refuses has its entry with every annotation NULL — a
+placeholder: its rows are in scope but in no envelope. Nothing here writes
+them; an upload's new inputs are annotated by the refresh that brings the
+derived file to the upload's snapshot, before any reader reads that
+snapshot.
 
   annot(input_id BIGINT, signature, physical_shape VARCHAR, workload_batch,
         workload_context INTEGER, catalog_kernel VARCHAR, phys UBIGINT)
-      in memory, one row per annotated input
+      in the derived file, one row per input
 
 A row is shared iff its batch is 'shared' and (not within_peak or the row is
 within both recorded peaks — `SHARED_ROW` below, the one SQL statement of the
@@ -65,17 +68,15 @@ rule, parity-tested against `measured_utilization`).
 from __future__ import annotations
 
 import json
-import logging
-import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 import numpy as np
 
 from backend.inference import benchmarks as _benchmarks
+from backend.inference.benchmark_identity import canonical_identity_json
 from backend.service.bench.lake import Lake
 
-_LOG = logging.getLogger(__name__)
 
 # A batch's review status, in the order a set takes the first its batches
 # have (`sets.list_sets`).
@@ -91,7 +92,7 @@ JSON_COLUMNS = ("shape_json", "dtype_env_json")
 
 # An input's columns besides its id: the input key (what `annotate` reads;
 # `lake.inputs` holds exactly it and is unique on it), then the annotations
-# `annotate` gives (held in memory, `annot`). Both tables' DDL, INPUT_KEY,
+# `annotate` gives (the derived file's `annot`). Both tables' DDL, INPUT_KEY,
 # ANNOTATIONS and an `annot` entry's types are read from here.
 _INPUT_COLUMNS = (
     ("op", "VARCHAR", "key"), ("phase", "VARCHAR", "key"),
@@ -150,8 +151,15 @@ OUTCOME: str = outcome_of("m")
 IS_MEASUREMENT: str = f"({OUTCOME} = 'measured')"
 
 
+def shared_row(within: str) -> str:
+    """The shared-row rule over the batch alias b, given the SQL of whether
+    the row is within its recorded peaks (`within`: `WITHIN_PEAK` over a
+    measurement, or a column a derived table stored it in)."""
+    return f"(b.status = 'shared' AND (NOT b.within_peak OR {within}))"
+
+
 # SQL predicate over aliases m (measurements) and b (batches).
-SHARED_ROW: str = f"(b.status = 'shared' AND (NOT b.within_peak OR {WITHIN_PEAK}))"
+SHARED_ROW: str = shared_row(WITHIN_PEAK)
 
 # The lake's data tables, by name, with their DDL (what a backup counts and
 # a restore checks); its metadata table (identity, import state) follows.
@@ -174,17 +182,23 @@ TABLES = tuple(name for name, _ddl in SCHEMA)
 META_DDL = "CREATE TABLE IF NOT EXISTS lake.lake_meta (key VARCHAR NOT NULL, value VARCHAR)"
 
 _SEP = "chr(31)"
-_PHYS = f"md5_number_upper(signature || {_SEP} || physical_shape)"
+#: The physical hash of an annotation entry (its signature and shape).
+PHYS = f"md5_number_upper(signature || {_SEP} || physical_shape)"
 _INPUT_ID = (f"(md5_number_upper(op || {_SEP} || phase || {_SEP} || kernel_impl || {_SEP} "
              "|| shape_json) >> 1)::BIGINT")
 
-# An `annot` entry: the input's id and its annotations, typed; the table
-# adds the physical hash.
-_ANNOT_ENTRY = {"input_id": "BIGINT"} | {
+#: The alias the lake's derived file is attached under (`derived.Derived`),
+#: and the annotations' table in it — what every reader joins as `annot`.
+DERIVED = "derived"
+ANNOT = f"{DERIVED}.annot"
+#: An `annot` entry: the input's id and its annotations, typed; the table
+#: adds the physical hash.
+ANNOT_ENTRY = {"input_id": "BIGINT"} | {
     name: type_ for name, type_, role in _INPUT_COLUMNS if role == "annotation"}
-_ANNOT = ("CREATE OR REPLACE TABLE annot (input_id BIGINT NOT NULL, "
-          + ", ".join(f"{name} {type_}" for name, type_ in _ANNOT_ENTRY.items()
-                      if name != "input_id") + ", phys UBIGINT)")
+#: The annotations table's columns, as DDL.
+ANNOT_COLUMNS = ("input_id BIGINT NOT NULL, "
+                 + ", ".join(f"{name} {type_}" for name, type_ in ANNOT_ENTRY.items()
+                             if name != "input_id") + ", phys UBIGINT")
 
 
 def env_key(t: str) -> str:
@@ -214,14 +228,6 @@ class UploadResult:
     upload_id: str
     inserted: int
     duplicates: int     # rows whose 12-column identity the owner already has
-
-
-def canonical_json(value: Any) -> str:
-    """A JSON cell as the canonical text the lake stores and the identity
-    functions read (sorted keys, no spaces) — the producers' own form
-    (`benchmark_identity.compute_per_row_*`)."""
-    v = json.loads(value) if isinstance(value, str) else value
-    return json.dumps(v, sort_keys=True, separators=(",", ":"))
 
 
 def has_tables(lake: Lake) -> bool:
@@ -291,11 +297,12 @@ def set_meta(lake: Lake, **entries: str) -> None:
 
 
 def _rows_frame(rows: Sequence[Mapping[str, Any]]) -> dict[str, np.ndarray]:
-    """The rows as one string column per corpus column, JSON cells canonical;
-    a column a CSV may omit (`moe_block_member`) reads as empty."""
+    """The rows as one string column per corpus column, JSON cells canonical
+    (`canonical_identity_json`: `validate_row` has made each an object); a
+    column a CSV may omit (`moe_block_member`) reads as empty."""
     frame = {c: [r.get(c) or "" for r in rows] for c in _benchmarks.ALL_COLUMNS}
     for c in JSON_COLUMNS:
-        frame[c] = [canonical_json(v) for v in frame[c]]
+        frame[c] = [canonical_identity_json(v) for v in frame[c]]
     return {c: np.array(v, dtype=str) for c, v in frame.items()}
 
 
@@ -318,98 +325,23 @@ _IDENTITY_MATCH = " AND ".join((
     f"{outcome_of('m')} = {outcome_of('src')}"))
 
 
-def _annotated(annotate: Annotate, inputs: Sequence[Mapping[str, Any]]) -> list[dict]:
-    """`annotate` over inputs (input_id and the key), as `annot` entries. An
-    input `annotate` refuses gets none — a placeholder — and is logged; a
-    catalog that cannot load (`ImportError`) refuses them all, so it is
-    raised."""
-    out, refused = [], []
-    for inp in inputs:
-        key = {k: inp[k] for k in INPUT_KEY}
-        try:
-            ann = annotate(key)
-        except ImportError:
-            raise
-        except Exception as e:
-            refused.append((key, e))
-            continue
-        out.append({"input_id": inp["input_id"], **{a: ann[a] for a in ANNOTATIONS}})
-    if refused:
-        key, e = refused[0]
-        _LOG.warning("bench: %d inputs cannot be annotated (placeholders), e.g. %s: %s: %s",
-                     len(refused), key, type(e).__name__, e)
-    return out
-
-
-def _records(types: Mapping[str, str]) -> str:
+def records(types: Mapping[str, Any]) -> str:
     """A relation of the records in one JSON text parameter, with the
     columns `types` names — one parameter parsed by DuckDB: binding a list of
     Python dicts converts value by value (~20 s for 27k entries; this 0.2 s)."""
-    # The column names and types are this module's constants (no quotes).
+    # The column names and types are the callers' constants (no quotes).
     return f"(SELECT unnest(from_json(?::JSON, '{json.dumps([types])}'), recursive := true))"
-
-
-#: Entries per `annot` insert. The records travel as one JSON text that
-#: DuckDB parses whole, so one statement's memory grows with the lake: at
-#: ~300k inputs the startup rebuild asked for 256 MiB beyond the lake's
-#: `memory_limit` and the service could no longer start.
-ANNOT_BATCH = 50_000
-
-
-def _add_annotations(cur, entries: Sequence[Mapping[str, Any]]) -> None:
-    """Insert `annot` entries for inputs it does not hold yet,
-    `ANNOT_BATCH` at a time."""
-    entries = list(entries)
-    for i in range(0, len(entries), ANNOT_BATCH):
-        cur.execute(
-            f"INSERT INTO annot SELECT {', '.join(_ANNOT_ENTRY)}, {_PHYS} FROM "
-            f"{_records(_ANNOT_ENTRY)} WHERE input_id NOT IN (SELECT input_id FROM annot)",
-            [json.dumps(entries[i:i + ANNOT_BATCH])])
-
-
-def annotate_all(lake: Lake, annotate: Annotate) -> int:
-    """(Re)build `annot` from every input of the lake — at startup, before
-    the lake serves. Returns how many inputs are annotated.
-
-    Inputs stream in annotation order (`op`, `shape_json`, then the rest of
-    the key), one `ANNOT_BATCH` at a time: Python holds one input batch and
-    one annotation batch, never the lake. The routes' annotator memoizes the
-    physical half by the same op/shape while their duplicates are adjacent.
-    """
-    t0 = time.monotonic()
-    with lake.inputs_lock():
-        total = 0
-        annotated = 0
-
-        def build(cur) -> None:
-            nonlocal total, annotated
-            cur.execute(_ANNOT)
-            batches = lake.read_batches(
-                "SELECT input_id, " + ", ".join(INPUT_KEY)
-                + " FROM lake.inputs ORDER BY "
-                + ", ".join(("op", "shape_json", "phase", "kernel_impl")),
-                batch_rows=ANNOT_BATCH)
-            for inputs in batches:
-                total += len(inputs)
-                entries = _annotated(annotate, inputs)
-                annotated += len(entries)
-                _add_annotations(cur, entries)
-
-        lake.transact(build)
-    _LOG.info("bench: %d of %d inputs annotated in %.1f s", annotated, total,
-              time.monotonic() - t0)
-    return annotated
 
 
 def upload(lake: Lake, *, owner: str, upload_id: str, run_id: Optional[str],
            label: Optional[str], rows: Sequence[Mapping[str, Any]],
-           annotate: Annotate, status: Status = "private",
+           status: Status = "private",
            decided_by: Optional[str] = None) -> UploadResult:
     """One batch from validated CSV rows (strings as `validate_text` yields
     them). Under `lake.owner_lock(owner)`: register the inputs the lake
-    lacks under `lake.inputs_lock()`, their annotations added to `annot`
-    first (so no committed row is ever without them); then, in one
-    transaction, the new inputs, the batch, and the rows whose identity the
+    lacks under `lake.inputs_lock()` (their annotations are the derived
+    file's: the refresh that reaches this upload's snapshot adds them before
+    any reader reads it); then, in one transaction, the new inputs, the batch, and the rows whose identity the
     owner does not already have. No batch is written when every row is such
     a duplicate. Raises `ValueError` when the owner already has a batch with
     this `upload_id`."""
@@ -434,7 +366,7 @@ def upload(lake: Lake, *, owner: str, upload_id: str, run_id: Optional[str],
         new = missing_inputs(cur)
         if new:
             key = {"input_id": "BIGINT", **dict.fromkeys(INPUT_KEY, "VARCHAR")}
-            cur.execute(f"INSERT INTO lake.inputs SELECT {', '.join(key)} FROM {_records(key)}",
+            cur.execute(f"INSERT INTO lake.inputs SELECT {', '.join(key)} FROM {records(key)}",
                         [json.dumps(new)])
             clash = cur.execute(
                 "SELECT input_id FROM lake.inputs GROUP BY input_id HAVING count(*) > 1 LIMIT 1"
@@ -484,13 +416,7 @@ def upload(lake: Lake, *, owner: str, upload_id: str, run_id: Optional[str],
         if not new:
             # Inputs are never deleted: every key stays registered.
             return lake.transact(write)
-        entries = _annotated(annotate, new)
         with lake.inputs_lock():
-            # `annot` is the process's own memory, outside the lake's
-            # transaction (DuckDB writes one database per transaction), so
-            # it is written first: entries of inputs the write then does not
-            # commit join nothing.
-            lake.transact(lambda cur: _add_annotations(cur, entries))
             return lake.transact(write)
 
 
@@ -627,7 +553,7 @@ def restamp(lake: Lake, *, owner: str,
         return cur.execute(
             "UPDATE lake.measurements AS m SET "
             + ", ".join(f"{c} = coalesce(r.{c}, m.{c})" for c in ROOFLINE_COLUMNS)
-            + f" FROM {_records(types)} AS r WHERE m.id = r.id AND m.batch_id IN ("
+            + f" FROM {records(types)} AS r WHERE m.id = r.id AND m.batch_id IN ("
             "SELECT batch_id FROM lake.batches WHERE owner = ?::UUID)",
             [json.dumps(patch), owner]).fetchone()[0]
 

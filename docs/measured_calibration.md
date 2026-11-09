@@ -382,14 +382,17 @@ state: `signature`, `physical_shape`, `workload_batch`, `workload_context`,
 `catalog_kernel` and `phys`. They are pure functions of the input under the
 current code (`annotations.row_annotations`, composing `physical_identity`,
 `workload_coordinates` and the provider catalog's `catalog_kernel`) and are
-**not stored**. At startup the service computes them for every input into an
-in-memory table `annot` (`store.annotate_all`); an upload adds its new
-inputs' annotations before it commits them, so a committed row always has
-them. An input the rules refuse has no `annot` entry: its rows are visible
-in row views but belong to no envelope.
+**not lake data**. They live in the lake's derived file (§7.2,
+`derived.Derived`) as the table `annot`, one entry per input of the snapshot
+the file holds: built once, kept by the lake's change feed (an upload's new
+inputs are annotated by the refresh the next read waits for), and reused by
+the next start when the file is this lake's under the same rules — a start
+no longer annotates two million inputs (85 s locally, minutes in
+production) before it serves. An input the rules refuse has an entry with no
+annotations: its rows are visible in row views but belong to no envelope.
 
-A change to the annotation rules or catalogs takes effect at the next service
-start. `rules_revision.rules_rev` names the data format's revision from the
+A change to the annotation rules or catalogs (`rules_rev`, recorded in the
+derived file) rebuilds the file at the next service start. `rules_revision.rules_rev` names the data format's revision from the
 semantic owners declared by `rules_revision.rule_inputs`:
 
 | Input | Why it can change a row or its key |
@@ -397,7 +400,7 @@ semantic owners declared by `rules_revision.rule_inputs`:
 | `annotations.row_annotations`, `registered_kernels`, provider `catalog_kernel` | input annotations and the implementation catalog |
 | `benchmark_identity.current_shape`, `measured_row_migration`, `workload_coordinates` | retired/derived shape axes and workload coordinates |
 | `op_calibration.physical_identity` | signature and physical-shape projection |
-| `store.canonical_json` and the storage schema in that module | canonical identity JSON and row storage format |
+| `benchmark_identity.canonical_identity_json` | canonical identity JSON (the one spelling the lake stores and keys read) |
 | `benchmarks.validate_row`, `row_identity` | row validity and duplicate identity |
 | dtype, activation-format, eval-format, and measured-row migration modules | vocabulary and migrations the validator/key derivation reads |
 | loaded `all_signatures()` and `registered_kernels()` | signature and kernel catalogs as data |
@@ -698,8 +701,19 @@ A lake that does not serve, a lost commit race, or a refused write answers
 
 ### 5.4 Kernel Bench page views
 
-`GET /api/bench/browse` (`browse.py`) computes one view per request from the
-stored tables joined with `annot`; nothing is aggregated in advance. Views:
+`GET /api/bench/browse` (`browse.py`) reads one view per request from the
+lake's derived file (§7.2): `browse_rows`, every measurement with every
+quantity the page shows, sorts or filters by already derived from it, its
+batch and its input's annotations; `browse_groups`, those rows counted by
+batch and filter columns (what facets and coverage read); and `placement`,
+each physical shape's place on a curve. A request first waits for the file
+to reach the lake's snapshot, and never reads the lake's files. Computed per
+request over the lake, the envelope view took 2.4 s and the curves view 11 s
+(a 62 MB answer) on a 4.28M-row lake, and the page's concurrent requests ran
+past the API's 30 s limit; over the derived file every view answers in under
+1.2 s at that scale. The curves view lists the ops in view, and answers one
+op's curves when the request names it (`signature`); the page asks per op as
+it scrolls into view. Views:
 `envelope`, `rows`, `workload`, `curves`, `coverage`; every view but
 `curves` also returns facets (each filter's values under the other
 filters). Scopes: the shared corpus, the caller's rows, both (a row counted
@@ -863,14 +877,15 @@ estimate never reads stays in the lake.
 | Candidate rows per answer (`lookup.MAX_ROWS`) | 50,000 | 503 before any wide column is read; never truncated, since a partial candidate set would change what an estimate picks. |
 | In-memory selection table (`BENCH_LAKE_SELECTION_LIMIT`, a share of `BENCH_LAKE_MEMORY_LIMIT`) | default 32 MiB (~460k rows at ~72 B a row) | Above it, or at an older pin, the service runs the exact pinned query over the lake's files instead. |
 | Validator verdicts held by the service (`Verdicts`) | 120,000 row-content keys | Owner calibration only; lookup does not put cells or unvalidated “valid” marks here. |
-| Lookup cells file (`lookup.Cells`, `<cache dir>/lookup_cells.duckdb`) | every row's `ROW_COLUMNS`, each version with the snapshots it is live at (4.28M rows: ~230 MB on disk, built in ~5–10 s) | The one place a lookup reads a row's cells; built for the current snapshot before the service serves. A pin past the file waits up to `TIMEOUT_S` (5 s) for it to catch up by DuckLake's change feed, else 503; a pin before its first snapshot is 503. |
+| The lake's derived file (`derived.Derived`, `<cache dir>/derived.duckdb`) | every row's `ROW_COLUMNS`, each version with the snapshots it is live at; the annotations, the browse tables and the curves' placement at the newest (4.28M rows, 2M inputs: ~1 GB on disk, a full build ~130 s, reused across starts) | The one place a lookup reads a row's cells; built for the current snapshot before the service serves. A pin past the file waits up to `TIMEOUT_S` (5 s) for it to catch up by DuckLake's change feed, else 503; a pin before its first snapshot is 503. |
 | Rows held per client process (`measure.lookup.ROWS_KEPT`) | 50,000 rows | Evicted keys are asked again. |
 | Client timeout (`lookup_timeout`) | 5 s + 2 ms per key sent | A slower answer is a failure (§7.3). |
 
 **Cold reads.** A cold lookup's rows are a random point set over the lake
 (row and input ids are hashes), so reading their wide cells from parquet
 scans every data file; reordering files cannot help. The service therefore
-reads a row's cells from one place, a native DuckDB table (`lookup.Cells`)
+reads a row's cells from one place, a native DuckDB table (the derived
+file's `rows`, `derived.Derived`)
 that keeps each row's versions with the snapshots they are live at, the way
 DuckLake keeps the rows. The lake's wide columns are read only to build it
 (at startup, before the service serves) and to catch it up by the lake's

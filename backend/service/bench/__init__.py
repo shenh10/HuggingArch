@@ -1,14 +1,16 @@
 """Kernel Bench measurements in a DuckLake (docs/measured_calibration.md §4).
 
-Three stored tables — `batches`, `inputs`, `measurements` — and nothing
-derived: every view is computed per request. An input's annotations (its
-grouping labels) are computed in memory at startup and for each new input
-(`store.annotate_all`, the `annot` table), never stored. Modules:
+Three stored tables — `batches`, `inputs`, `measurements` — and, beside
+the lake, one derived file holding what is derived from a snapshot: the
+inputs' annotations (their grouping labels), the cells lookups send, and the
+tables the browse views read, kept at the lake's snapshot by one refresh
+(`derived`). Modules:
 
   lake      the DuckDB instance attached to the lake (one process,
             root-only directories); reads, write transactions with retry,
             the owner / inputs / maintainer / backup locks, the free-space check
-  store     writes: upload, review state, deletion; the in-memory annotations
+  store     writes: upload, review state, deletion
+  derived   the lake's derived file: its one builder and the wait a read takes
   annotations the input rules and their revision (`rules_rev`) that decide
             which rows a lookup key selects
   browse    the Kernel Bench page's views (envelope, rows, workload, curves,

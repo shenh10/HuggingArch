@@ -395,7 +395,10 @@ def _fake_browse(q: dict) -> dict:
             c["saturation"] = _saturation(c["points"])
             c["lines"] = _lines([(pt["phase"], tuple(json.loads(pt["shape"])[a] for a in c["axis"].split("×")))
                                  for pt in c["points"]])
-    return {"ops": [ops[k] for k in sorted(ops)]}
+    # The list names the ops; an op's curves are asked by its signature.
+    if not q.get("signature"):
+        return {"ops": [{"signature": k} for k in sorted(ops)]}
+    return {"ops": [ops[k] for k in sorted(ops) if k == q["signature"]]}
 
 
 class Refusal:

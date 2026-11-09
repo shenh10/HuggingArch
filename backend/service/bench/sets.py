@@ -24,12 +24,15 @@ JSONB columns did.
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, Optional, get_args
+from typing import TYPE_CHECKING, Any, Iterable, Optional, get_args
 
 from backend.inference import benchmarks as _benchmarks
 from backend.service.bench.lake import Lake
-from backend.service.bench.store import (IS_MEASUREMENT,
+from backend.service.bench.store import (ANNOT, IS_MEASUREMENT,
     JSON_COLUMNS, MBU, MFU, OUTCOME, SHARED_ROW, WITHIN_PEAK, SetRef, Status)
+
+if TYPE_CHECKING:
+    from backend.service.bench.derived import Derived
 
 # A row its batch offers to the shared corpus once nominated.
 _OFFERED = f"(NOT b.within_peak OR {WITHIN_PEAK})"
@@ -240,7 +243,7 @@ def rows(lake: Lake, ref: SetRef, *, limit: int, offset: int = 0,
 # The set against the shared corpus.
 # --------------------------------------------------------------------------
 
-# One op shape of a scope: its envelope key (phys from the in-memory `annot`,
+# One op shape of a scope: its envelope key (phys from the derived file's `annot`,
 # env, phase — placeholders, with no annotations, are in no envelope), the
 # fastest row by (latency, id).
 _OP_SHAPES = (
@@ -250,7 +253,7 @@ _OP_SHAPES = (
     "arg_min(m.framework, (m.latency_us, m.id)) AS framework, "
     "arg_min(m.kernel_impl, (m.latency_us, m.id)) AS kernel_impl, count(*) AS n "
     "FROM lake.measurements m JOIN lake.batches b ON b.batch_id = m.batch_id "
-    "JOIN annot a ON a.input_id = m.input_id {keys} "
+    f"JOIN {ANNOT} a ON a.input_id = m.input_id {{keys}} "
     # Only a measurement can be the fastest row: a recorded refusal has no
     # latency, and left in it both inflated `n` and — for an op shape whose
     # every row is a refusal — produced a winner with no latency at all,
@@ -259,13 +262,14 @@ _OP_SHAPES = (
     "GROUP BY m.phase, a.phys, m.env")
 
 
-def overlap(lake: Lake, ref: SetRef, *, limit: int = 200) -> dict:
+def overlap(lake: Lake, ref: SetRef, derived: "Derived", *, limit: int = 200) -> dict:
     """`/api/bench/overlap`: the set against the shared corpus per op shape
     (the fields of the Postgres bench_set_overlap, 0016). An op shape is an
     envelope key (`signature`, `physical_shape`, dtypes, gpu, phase — not
     the deployment that cut the shape); per op shape the set's fastest row against shared's.
     `pending` (op shapes not yet indexed) is gone: nothing is indexed, the
     counts are always complete. `limit` bounds `in_shared_list` (1..500)."""
+    derived.reach(lake, lake.snapshot_id())      # its annotations hold every input
     where, params = _in_set(ref)
     mine = _OP_SHAPES.format(keys="", where=where)
     shared = _OP_SHAPES.format(

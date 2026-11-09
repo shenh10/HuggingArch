@@ -11,11 +11,11 @@ from functools import lru_cache
 from typing import Any, Dict, Mapping
 
 from backend.inference.benchmark_identity import (
+    canonical_identity_json,
     current_shape,
     workload_coordinates,
 )
 from backend.inference.op_calibration import physical_identity
-from backend.service.bench import store as _store
 
 
 def _catalog():
@@ -35,7 +35,7 @@ def _shape_identity(op: str, shape_json: Any) -> tuple[dict, str, str]:
     vocabulary tests hand it parsed); the memo is keyed by the canonical
     spelling either way, so an unhashable dict never reaches the cache.
     """
-    return _shape_identity_of(op, _store.canonical_json(shape_json))
+    return _shape_identity_of(op, canonical_identity_json(shape_json))
 
 
 @lru_cache(maxsize=1)

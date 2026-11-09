@@ -71,6 +71,7 @@ from backend.service.bench.annotations import (
     row_annotations,
 )
 from backend.service.bench import browse as _browse
+from backend.service.bench import derived as _derived
 from backend.service.bench import identity as _identity
 from backend.service.bench import lake as _lake_mod
 from backend.service.bench import lookup as _lookup
@@ -102,24 +103,25 @@ shared_revision = _lookup.SharedRevision()
 verdicts = _lookup.Verdicts()
 #: What a lookup selects from, per pinned snapshot (`lookup.Selection`).
 selection = _lookup.Selection()
-#: The cells lookups send, the one place they read them (`lookup.Cells`):
-#: built before the lake serves (`ready`), then following it.
-cells = _lookup.Cells()
+#: The lake's derived file (`derived.Derived`): the annotations, the cells
+#: lookups send and the tables the browse views read, built before the lake
+#: serves (`ready`), then following it.
+derived = _derived.Derived(annotate=row_annotations, rules=rules_rev)
 #: What lookups have answered, for /health (`lookup.LookupStats`).
 lookup_stats = _lookup.LookupStats()
 
 
 def _serving_started(lake: _lake_mod.Lake, backup, *, read_only: bool = False) -> None:
     """Once the lake serves: the shared rows' revision starts at the
-    snapshot now; the lookup's cells file follows the lake; the maintainer
+    snapshot now; the derived file follows the lake; the maintainer
     (lake maintenance; a backup every cycle) starts."""
     shared_revision.current(lake)
-    cells.follow(lake)
+    derived.follow(lake)
     if not read_only:
         _maintain.start(lake, backup)
 
 
-gate = _serving.Gate(annotate=row_annotations, ready=cells.refresh,
+gate = _serving.Gate(ready=derived.refresh,
                      on_serving=_serving_started)
 
 
@@ -151,14 +153,16 @@ def _lake() -> _lake_mod.Lake:
 @contextmanager
 def _writing() -> Iterator[_lake_mod.Lake]:
     """The lake for a write (`LakeUnavailable` — 503 — when writes are
-    refused); after the block the backup follows. A write that changes the
-    shared rows says so inside the block (`shared_revision.changed`)."""
+    refused); after the block the backup and the derived file follow. A
+    write that changes the shared rows says so inside the block
+    (`shared_revision.changed`)."""
     lake = gate.writer()
     try:
         with shared_revision.writing():
             yield lake
     finally:
         gate.wrote()
+        derived.poke(lake)
 
 
 def lake_unavailable(_request, exc: Exception):
@@ -305,19 +309,14 @@ def bench_upload(body: BenchUploadBody, user: dict = Depends(_identity.require_u
         raise HTTPException(
             status_code=403, detail="publishing to the shared corpus requires admin")
     label = (body.label or "").strip() or None
-    try:
-        with _writing() as lake:
-            res = _store.upload(
-                lake, owner=user_id, upload_id=str(uuid.uuid4()), run_id=run_id,
-                label=label, rows=rows, annotate=row_annotations,
-                status="shared" if body.make_public else "private",
-                decided_by=user_id if body.make_public else None)
-            if body.make_public and res.inserted:
-                shared_revision.changed(lake)
-    except ImportError as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"provider catalog unavailable, rows cannot be annotated: {e}") from e
+    with _writing() as lake:
+        res = _store.upload(
+            lake, owner=user_id, upload_id=str(uuid.uuid4()), run_id=run_id,
+            label=label, rows=rows,
+            status="shared" if body.make_public else "private",
+            decided_by=user_id if body.make_public else None)
+        if body.make_public and res.inserted:
+            shared_revision.changed(lake)
     return {
         "upload_id": res.upload_id,
         "row_count": res.inserted,
@@ -430,7 +429,7 @@ def bench_overlap(
     ref = _read_ref(user, owner, run_id, upload_id)
     if limit < 1 or limit > 500:
         raise HTTPException(status_code=400, detail="limit must be 1..500")
-    return _sets.overlap(_lake(), ref, limit=limit)
+    return _sets.overlap(_lake(), ref, derived, limit=limit)
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +779,6 @@ def bench_browse(
             filters["key"] = json.loads(key)
         except ValueError:
             raise HTTPException(status_code=400, detail="key is not JSON") from None
-    if view == "curves":
-        filters["call_tokens"] = _browse.call_tokens()
     q = _browse.Query(
         view=view, caller=user_id, source=source, run=run,
         upload=_upload_id(upload) if upload else "",
@@ -789,7 +786,7 @@ def bench_browse(
         filters=filters, sort=sort, desc={"": None, "asc": False, "desc": True}[dir],
         page=page, page_size=page_size)
     try:
-        out = _browse.browse(_lake(), q)
+        out = _browse.browse(_lake(), q, derived)
     except _browse.Refused as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     if view in ("rows", "workload"):
@@ -847,7 +844,7 @@ def bench_lookup(body: LookupBody):
     started = time.perf_counter()
     try:
         out = _lookup.lookup(lake, keys, owner=owner, snapshot=snapshot,
-                             selection=selection, cells=cells, stats=lookup_stats)
+                             selection=selection, derived=derived, stats=lookup_stats)
     except _lookup.TooManyRows as e:
         raise HTTPException(status_code=503, detail=str(e)) from None
     except duckdb.Error as e:

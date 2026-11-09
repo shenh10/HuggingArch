@@ -16,6 +16,7 @@ import pytest
 
 from backend.service.bench import serving, store
 from backend.service.bench import lake as lake_mod
+from backend.service.bench.derived import Derived
 from backend.service.bench.backup import BackupConfig
 from backend.service.bench.lake import Lake, LakeConfig, LakeUnavailable
 
@@ -67,7 +68,7 @@ class FakeClock:
 
 
 def _gate(opened, **kw):
-    return serving.Gate(annotate=make_annotator(), open_lake=opened, **kw)
+    return serving.Gate(open_lake=opened, **kw)
 
 
 def _dev_schema(lake, **meta):
@@ -206,10 +207,9 @@ def test_an_unleased_copy_of_an_identified_lake_is_read_only(env, opened, make_r
     _dev_schema(lake, lake_id="11111111-1111-4111-8111-111111111111")
     store.set_meta(lake, lake_role="authority")
     serving.data_rules.initialize(lake)
-    store.annotate_all(lake, annotate)
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111",
                  upload_id="22222222-2222-4222-8222-222222222222", run_id=None,
-                 label=None, rows=make_rows(1), annotate=annotate)
+                 label=None, rows=make_rows(1))
     gate = _gate(opened)
     assert gate.reader().read(
         "SELECT count(*) AS n FROM lake.measurements")[0]["n"] == 1
@@ -291,9 +291,8 @@ def test_an_old_lake_migrates_its_data_rules_before_it_serves(
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
     _dev_schema(lake, lake_id="x", import_state="none")
-    store.annotate_all(lake, annotate)
     store.upload(lake, owner=new_owner(), upload_id=str(uuid.uuid4()), run_id=None,
-                 label=None, rows=make_rows(1), annotate=annotate)
+                 label=None, rows=make_rows(1))
     assert "data_rules" not in store.meta(lake)
     gate = _gate(opened)
     gate.reader()
@@ -362,25 +361,24 @@ def test_an_unregistered_lake_version_is_refused_before_any_schema_write(
     }
 
 
-# --- annotations --------------------------------------------------------------------------
+# --- the derived file ----------------------------------------------------------------------
 
-def test_every_input_is_annotated_in_memory_before_the_lake_serves(env, opened, make_rows):
-    """The gate builds `annot` from every input with the `annotate` it was
-    given before it serves; nothing of it is stored."""
+def test_every_input_is_annotated_before_the_lake_serves(env, opened, make_rows):
+    """The gate's `ready` brings the derived file to the lake before it
+    serves: every input annotated with the rules the routes give it."""
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
     _dev_schema(lake, lake_id="x", import_state="none")
-    store.annotate_all(lake, make_annotator())
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
-                 rows=make_rows(3), annotate=make_annotator())
-    lake.transact(lambda cur: cur.execute("DROP TABLE annot"))     # a new process
+                 rows=make_rows(3))
     other = make_annotator(prefix="sig2")
     seen = []
 
     def on_serving(lk, backup, read_only=False):
-        seen.append(lk.read("SELECT * FROM lake.inputs i JOIN annot a USING (input_id)"))
-    gate = serving.Gate(annotate=other, open_lake=opened, on_serving=on_serving)
+        seen.append(lk.read(f"SELECT * FROM lake.inputs i JOIN {store.ANNOT} a USING (input_id)"))
+    derived = Derived(annotate=other, rules=lambda: "sig2")
+    gate = serving.Gate(open_lake=opened, ready=derived.refresh, on_serving=on_serving)
     gate.reader()
     [got] = seen
     assert len(got) == 3
@@ -392,14 +390,14 @@ def test_a_catalog_that_cannot_load_holds_the_startup(env, opened, make_rows):
     env.setenv("BENCH_LAKE_LEASE", "off")
     lake = opened()
     _dev_schema(lake, lake_id="x", import_state="none")
-    store.annotate_all(lake, make_annotator())
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
-                 rows=make_rows(1), annotate=make_annotator())
+                 rows=make_rows(1))
 
     def broken(inp):
         raise ImportError("no kernel_bench")
-    gate = serving.Gate(annotate=broken, open_lake=opened)
+    derived = Derived(annotate=broken, rules=lambda: "broken")
+    gate = serving.Gate(open_lake=opened, ready=derived.refresh)
     with pytest.raises(LakeUnavailable, match="no kernel_bench"):
         gate.reader()
 
@@ -411,10 +409,9 @@ def test_startup_backs_up_before_writes(env, opened, tmp_path, make_rows, annota
     env.delenv("BENCH_LAKE_BACKUP")
     lake = opened()
     _dev_schema(lake, lake_id="x", import_state="none")
-    store.annotate_all(lake, annotate)
     store.upload(lake, owner="11111111-1111-4111-8111-111111111111", upload_id=
                  "22222222-2222-4222-8222-222222222222", run_id=None, label=None,
-                 rows=make_rows(2), annotate=annotate)
+                 rows=make_rows(2))
     config = BackupConfig(root=str(tmp_path / "bucket"))
     gate = _gate(opened, backup=lambda: config)
     gate.writer()
@@ -470,7 +467,7 @@ def test_low_disk_refuses_writes(env, opened, monkeypatch):
 def test_an_unopenable_lake_is_503_with_the_reason(env, monkeypatch):
     def open_lake():
         raise LakeUnavailable("BENCH_LAKE_CATALOG and BENCH_LAKE_DATA must be set")
-    gate = serving.Gate(annotate=make_annotator(), open_lake=open_lake)
+    gate = serving.Gate(open_lake=open_lake)
     with pytest.raises(LakeUnavailable, match="BENCH_LAKE_CATALOG"):
         gate.reader()
     assert gate.health()["state"] == "unavailable"
@@ -482,10 +479,9 @@ def _backed_up_lake(tmp_path, make_rows, annotate) -> int:
     src = Lake.open(LakeConfig(catalog=str(tmp_path / "src" / "catalog.ducklake"),
                                data=str(tmp_path / "src" / "data")))
     store.ensure_schema(src, lake_id="built-elsewhere", import_state="verified")
-    store.annotate_all(src, annotate)
     store.upload(src, owner="11111111-1111-4111-8111-111111111111",
                  upload_id="22222222-2222-4222-8222-222222222222", run_id=None, label=None,
-                 rows=make_rows(2), annotate=annotate)
+                 rows=make_rows(2))
     Backup(LocalBucket(str(tmp_path / "bucket"))).run(src)
     n = src.read("SELECT count(*) AS n FROM lake.measurements")[0]["n"]
     src.close()
@@ -581,12 +577,12 @@ def test_the_gate_drops_stored_annotation_columns_of_an_old_lake(env, opened, ma
     _dev_schema(lake, lake_id="x", import_state="none")
     lake.transact(lambda cur: cur.execute(
         "ALTER TABLE lake.inputs ADD COLUMN signature VARCHAR"))
-    gate = serving.Gate(annotate=make_annotator(), open_lake=opened)
+    gate = serving.Gate(open_lake=opened)
     lk = gate.reader()
     assert [r["column_name"] for r in lk.read(
         "SELECT column_name FROM information_schema.columns WHERE table_catalog = 'lake' "
         "AND table_name = 'inputs' ORDER BY ordinal_position")] == ["input_id", *store.INPUT_KEY]
     res = store.upload(lk, owner="11111111-1111-4111-8111-111111111111",
                        upload_id="22222222-2222-4222-8222-222222222222", run_id=None,
-                       label=None, rows=make_rows(1), annotate=make_annotator())
+                       label=None, rows=make_rows(1))
     assert res.inserted == 1

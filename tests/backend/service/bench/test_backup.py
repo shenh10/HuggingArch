@@ -34,7 +34,7 @@ class RecordingBucket(LocalBucket):
 
 def _up(lake, owner, rows, annotate):
     return store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()), run_id="r",
-                        label="l", rows=rows, annotate=annotate)
+                        label="l", rows=rows)
 
 
 def _dump(lake):

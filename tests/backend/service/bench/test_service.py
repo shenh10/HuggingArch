@@ -158,15 +158,15 @@ class TestLookup:
 
     def test_cells_that_cannot_catch_up_are_503_not_a_lake_read(self, bench_client,
                                                                 bench_lake, monkeypatch):
-        """The lookup's cells file is its one read of a row's cells: behind
+        """The lake's derived file is a lookup's one read of a row's cells: behind
         the pin and unable to catch up, the lookup is 503 (the client's
         "measurements unavailable"), never answered from the lake's files."""
-        from backend.service.bench import lookup as LK
+        from backend.service.bench import derived as D
         from backend.service.bench import routes as R
         _upload(bench_client, ALICE, [_row(0)])
         assert _lookup(bench_client, [_key(_row(0))], owner=ALICE)["rows"][0]
-        monkeypatch.setattr(R.cells, "refresh", lambda lake: None)
-        monkeypatch.setattr(LK.Cells, "CATCH_UP_S", 0.3)
+        monkeypatch.setattr(R.derived, "refresh", lambda lake: None)
+        monkeypatch.setattr(D.Derived, "CATCH_UP_S", 0.3)
         _upload(bench_client, ALICE, [_row(1)])
         r = bench_client.post("/internal/bench/lookup",
                               json={"keys": [_key(_row(1))], "owner": ALICE})
@@ -230,7 +230,7 @@ class TestLookup:
         bench_client.get("/api/bench/list", headers=as_user(ALICE))
         lake = lake_mod.get_lake()
         store.upload(lake, owner=ALICE, upload_id=str(uuid.uuid4()), run_id=None,
-                     label=None, rows=[old], annotate=A.row_annotations)
+                     label=None, rows=[old])
         got = _lookup(bench_client, [_key(old)], owner=ALICE)
         assert len(got["rows"][0]) == 1
         report = bench_client.get("/api/bench/calibration", headers=as_user(ALICE)).json()
@@ -400,11 +400,10 @@ def test_divergent_copies_of_a_lake_have_divergent_scopes(tmp_path, annotate, ma
     a_dir.mkdir(mode=0o700)
     a = opened(a_dir)
     store.ensure_schema(a, lake_id="one-lineage", import_state="none")
-    store.annotate_all(a, annotate)
     rows = make_rows(1 + 2 * rows_each)
     owner = new_owner()
     store.upload(a, owner=owner, upload_id=str(uuid.uuid4()), run_id=None, label=None,
-                 rows=rows[:1], annotate=annotate, status="shared", decided_by=owner)
+                 rows=rows[:1], status="shared", decided_by=owner)
     common = scope(a)
     a.close()
     shutil.copytree(a_dir, b_dir)
@@ -415,9 +414,8 @@ def test_divergent_copies_of_a_lake_have_divergent_scopes(tmp_path, annotate, ma
     a, b = opened(a_dir), opened(b_dir)
     assert scope(a).key == scope(b).key == common.key        # one history
     for lake, mine in ((a, rows[1:1 + rows_each]), (b, rows[1 + rows_each:])):
-        store.annotate_all(lake, annotate)                   # the copies diverge
         store.upload(lake, owner=owner, upload_id=str(uuid.uuid4()), run_id=None,
-                     label=None, rows=mine, annotate=annotate, status="shared",
+                     label=None, rows=mine, status="shared",
                      decided_by=owner)
     first = a.snapshot_id()
     assert first == b.snapshot_id()

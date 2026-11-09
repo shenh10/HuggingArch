@@ -387,7 +387,7 @@ class TestBrowse:
 
 def test_startup_annotates_and_starts_the_maintainer(bench_lake, bench_gate, monkeypatch):
     """The background start (`serving.Gate.start`): the lake opened, every
-    input annotated in memory by `row_annotations` (the composition only
+    input annotated into the derived file by `row_annotations` (the composition only
     this module may make), then serving: the shared rows' revision starts
     at the snapshot then and the maintainer starts."""
     from backend.service.bench import lake as lake_mod
@@ -397,14 +397,11 @@ def test_startup_annotates_and_starts_the_maintainer(bench_lake, bench_gate, mon
     monkeypatch.setattr(B._maintain, "start", lambda *a: calls.append(a))
     lake = lake_mod.get_lake()
     store.ensure_schema(lake)
-    store.annotate_all(lake, B.row_annotations)
     store.upload(lake, owner=ALICE, upload_id="44444444-4444-4444-8444-444444444444", run_id=None,
-                 label=None, rows=_corpus_rows(2),
-                 annotate=B.row_annotations, status="shared", decided_by=ADMIN)
-    lake.transact(lambda cur: cur.execute("DROP TABLE annot"))     # a new process
+                 label=None, rows=_corpus_rows(2), status="shared", decided_by=ADMIN)
     bench_gate.start()
     assert bench_gate.phase == "serving"
-    got = lake.read("SELECT * FROM lake.inputs i LEFT JOIN annot a USING (input_id)")
+    got = lake.read(f"SELECT * FROM lake.inputs i LEFT JOIN {store.ANNOT} a USING (input_id)")
     assert len(got) == 2
     for i in got:
         assert {a: i[a] for a in store.ANNOTATIONS} == B.row_annotations(i)
