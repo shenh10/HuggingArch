@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import threading
 
+import pytest
+
 from backend.measure.cache import (
     DiskBackend,
     KeyedCache,
@@ -19,6 +21,7 @@ from backend.measure.cache import (
     WriteBehindBackend,
     WriteBehindQueue,
     deep_size_of,
+    env_bytes,
 )
 from backend.measure.scope import make_key
 
@@ -151,6 +154,49 @@ def test_disk_backend_survives_bad_dir(tmp_path):
     assert be.get("k") is None
     be.put("k", {"v": 1})            # creates the dir
     assert be.get("k") == {"v": 1}
+
+
+def _aged(disk, key, value, age_s):
+    """Put an entry and give its file an explicit mtime, so a prune's
+    oldest-first order is the test's, not the filesystem clock's."""
+    disk.put(key, value)
+    import os as _os
+    p = disk._dir / f"{key}.json"
+    st = p.stat()
+    _os.utime(p, (st.st_atime - age_s, st.st_mtime - age_s))
+
+
+def test_disk_backend_byte_budget_evicts_oldest_until_the_rest_fits(tmp_path):
+    be = DiskBackend(tmp_path, max_files=100, max_bytes=350)
+    for i, k in enumerate(("a", "b", "c")):
+        _aged(be, k, _blob(100), age_s=100 - i)   # "a" is the oldest
+    be.put("d", _blob(100))                       # 400 bytes → evict "a"
+    assert be.get("a") is None
+    assert be.nbytes("b") == be.nbytes("c") == be.nbytes("d") == 100
+
+
+def test_disk_backend_keeps_an_oversized_entry_alone(tmp_path):
+    be = DiskBackend(tmp_path, max_files=100, max_bytes=100)
+    _aged(be, "small", _blob(50), age_s=10)
+    be.put("huge", _blob(1000))
+    # The bound caps growth at one oversized entry; it never deletes the
+    # entry it just wrote.
+    assert be.get("small") is None
+    assert be.nbytes("huge") == 1000
+
+
+def test_env_bytes_parses_operator_sizes_and_refuses_a_mistyped_budget(monkeypatch):
+    monkeypatch.delenv("HA_TEST_BYTES", raising=False)
+    assert env_bytes("HA_TEST_BYTES", 5) == 5
+    for raw, want in (("300", 300), ("512KB", 512 << 10), ("1.5MiB", int(1.5 * (1 << 20))),
+                      ("2G", 2 << 30)):
+        monkeypatch.setenv("HA_TEST_BYTES", raw)
+        assert env_bytes("HA_TEST_BYTES", 5) == want, raw
+    monkeypatch.setenv("HA_TEST_BYTES", "512 MB")
+    assert env_bytes("HA_TEST_BYTES", 5) == 512 << 20   # a space is fine
+    monkeypatch.setenv("HA_TEST_BYTES", "five")
+    with pytest.raises(ValueError, match="HA_TEST_BYTES"):
+        env_bytes("HA_TEST_BYTES", 5)
 
 
 def test_tiered_memory_miss_reads_disk_written_by_another_process(tmp_path):

@@ -24,7 +24,9 @@ from backend.measure import pool
 from backend.inference.capacity import sweep_points
 from backend.inference.parallel_config import ParallelConfig
 from backend.fingerprint import result_version
-from backend.measure.cache import DiskBackend, KeyedCache, MemoryBackend, TieredBackend
+from backend.measure.cache import (
+    DiskBackend, KeyedCache, MemoryBackend, TieredBackend, env_bytes,
+)
 from backend.measure.scope import make_key
 from backend.api.offload import (
     ensure_spec_generation,
@@ -74,6 +76,17 @@ _GALLERY_CACHE_DIR = pathlib.Path(
         pathlib.Path.home() / ".cache" / "huggingarch" / "gallery",
     )
 )
+# The gallery's disk tiers all live under that one directory, so they share
+# one operator budget — the directory is the disk the operator sizes — and
+# the split among the tiers is a code fact, not three more knobs: the
+# frontier entries are the mass (16–150 MB each) and get the largest share,
+# the model facts one entry a model, the views kilobytes beside either.
+# The shares sum to the whole; the remote tier, not this disk, is the
+# durable one, so a bigger box raises the one knob.
+_GALLERY_DISK_BYTES = env_bytes("HA_GALLERY_CACHE_BYTES", 1 << 30)
+_FACTS_DISK_BYTES = _GALLERY_DISK_BYTES // 4          # 25%
+_FRONTIER_DISK_BYTES = _GALLERY_DISK_BYTES * 13 // 20  # 65%
+_VIEWS_DISK_BYTES = _GALLERY_DISK_BYTES // 10          # 10%
 # Gallery render cache — disk-backed (persists across restarts) with
 # single-flight so two concurrent cold hits for one model render once. Shares
 # the cache machinery (`backend.measure.cache`) with the sweep +
@@ -88,7 +101,8 @@ _GALLERY = KeyedCache(
     "gallery",
     TieredBackend(
         MemoryBackend(max_entries=256),
-        DiskBackend(_GALLERY_CACHE_DIR, max_files=10000),
+        DiskBackend(_GALLERY_CACHE_DIR, max_files=10000,
+                    max_bytes=_FACTS_DISK_BYTES),
     ),
     single_flight=True,
 )
@@ -120,14 +134,16 @@ _GALLERY = KeyedCache(
 FRONTIER_VIEW_MEMORY_BYTES = 8 << 20
 _FRONTIER = KeyedCache(
     "gallery-frontier",
-    DiskBackend(_GALLERY_CACHE_DIR / "frontier", max_files=4000),
+    DiskBackend(_GALLERY_CACHE_DIR / "frontier", max_files=4000,
+                max_bytes=_FRONTIER_DISK_BYTES),
     single_flight=True,
 )
 _FRONTIER_VIEWS = KeyedCache(
     "gallery-frontier-views",
     TieredBackend(
         MemoryBackend(max_entries=4096, max_bytes=FRONTIER_VIEW_MEMORY_BYTES),
-        DiskBackend(_GALLERY_CACHE_DIR / "frontier-views", max_files=20000),
+        DiskBackend(_GALLERY_CACHE_DIR / "frontier-views", max_files=20000,
+                    max_bytes=_VIEWS_DISK_BYTES),
     ),
     single_flight=True,
 )

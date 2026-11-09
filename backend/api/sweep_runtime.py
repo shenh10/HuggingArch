@@ -25,7 +25,7 @@ from backend.code_trace.provider import recording
 from backend.fingerprint import engine_version, result_version
 from backend.hf.metadata import fetch_config
 from backend.measure.cache import (DiskBackend, KeyedCache, MemoryBackend,
-                                   TieredBackend, private_copy)
+                                   TieredBackend, env_bytes, private_copy)
 from backend.api._models import (
     CompareFrontierRequest,
     InferenceEstimateSweepRequest,
@@ -99,13 +99,18 @@ _SWEEP_CACHE_DIR = pathlib.Path(
         pathlib.Path.home() / ".cache" / "huggingarch" / "sweep",
     )
 )
+# Both sweep tiers share the directory's one budget (the directory is the
+# disk the operator sizes); finished answers keep the larger share, the
+# unfinished steps of one running sweep the smaller.
+_SWEEP_DISK_BYTES = env_bytes("HA_SWEEP_CACHE_BYTES", 512 << 20)
 _SWEEP = KeyedCache(
     "sweep",
     TieredBackend(
         MemoryBackend(max_entries=256),
         # Featured models × DEFAULT_SWEEP_GPUS × 4 modes × 8 degrees is ~800
         # files; --all-gpus × the same grid is a few thousand.
-        DiskBackend(_SWEEP_CACHE_DIR, max_files=8000),
+        DiskBackend(_SWEEP_CACHE_DIR, max_files=8000,
+                    max_bytes=_SWEEP_DISK_BYTES * 3 // 4),
     ),
     single_flight=True,
 )
@@ -121,7 +126,8 @@ _SWEEP_STEP = KeyedCache(
     "sweep-step",
     TieredBackend(
         MemoryBackend(max_entries=512),
-        DiskBackend(_SWEEP_CACHE_DIR / "steps", max_files=16000),
+        DiskBackend(_SWEEP_CACHE_DIR / "steps", max_files=16000,
+                    max_bytes=_SWEEP_DISK_BYTES // 4),
     ),
 )
 

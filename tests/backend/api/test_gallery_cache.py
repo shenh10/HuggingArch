@@ -13,6 +13,7 @@ route wires it together.
 from __future__ import annotations
 
 import asyncio
+import importlib
 
 import backend.api.gallery_overview as g
 from backend.measure.cache import DiskBackend, KeyedCache
@@ -29,6 +30,23 @@ def test_the_entry_is_keyed_on_the_models_result_version(monkeypatch):
     monkeypatch.setattr(g, "result_version",
                         lambda r: "rv" if r is resolved else None)
     assert g._resolve_one(_MID)[2] == "rv"
+
+
+def test_the_gallery_disk_budget_is_one_knob_split_by_declared_shares(monkeypatch):
+    """The operator sizes the directory, not each tier: the knob lands on
+    the tiers as the declared shares and they sum to the whole."""
+    monkeypatch.setenv("HA_GALLERY_CACHE_BYTES", "2000")
+    reloaded = importlib.reload(g)
+    try:
+        facts, frontier, views = (reloaded._FACTS_DISK_BYTES,
+                                  reloaded._FRONTIER_DISK_BYTES,
+                                  reloaded._VIEWS_DISK_BYTES)
+        assert facts + frontier + views == 2000
+        assert (facts, frontier, views) == (2000 // 4, 2000 * 13 // 20, 2000 // 10)
+        assert reloaded._GALLERY._backend._cold._max_bytes == facts
+    finally:
+        monkeypatch.delenv("HA_GALLERY_CACHE_BYTES")
+        importlib.reload(g)
 
 
 def _stub_facts(monkeypatch, tmp_path, ids):

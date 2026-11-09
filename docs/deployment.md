@@ -58,6 +58,11 @@ at deploy so the service can report which code it runs (the image has no
 `HA_GALLERY_CACHE_DIR` / `HA_SWEEP_CACHE_DIR`
 under `/app/var` — outside the
 volume, so the mount does not hide the caches baked into the image.
+Each cache directory is also byte-bounded by one knob
+(`HA_GALLERY_CACHE_BYTES` for the gallery's, `HA_SWEEP_CACHE_BYTES` for the
+sweeps'; the tiers under a directory split it, oldest entries evicted
+first), so a full warm — or the orphaned keys a code edit leaves behind —
+cannot fill the volume the lake and the sol pool also live on.
 
 ### Continuous integration
 

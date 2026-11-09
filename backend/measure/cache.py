@@ -6,7 +6,8 @@ supported-models list — is held here; no caller hand-rolls a dict, a lock
 and an eviction rule:
 
   * backends: `MemoryBackend` (LRU), `DiskBackend` (content-addressed JSON
-    files), `TieredBackend` (memory in front of disk), `WriteBehindBackend`
+    files, oldest-by-mtime evicted by a file-count and a byte budget),
+    `TieredBackend` (memory in front of disk), `WriteBehindBackend`
     (a slow store's writes queued on `WRITE_BEHIND`);
   * `KeyedCache` — a keyed cache over a backend, with optional single-flight
     (concurrent misses for one key compute once) and an optional remote tier
@@ -41,6 +42,7 @@ import os
 import pathlib
 import pickle
 import queue
+import re
 import sys
 import threading
 import types
@@ -209,19 +211,52 @@ def deep_size_of(value: Any) -> int:
     return total
 
 
+_SIZE_UNITS = {"": 1, "b": 1, "k": 1 << 10, "kib": 1 << 10, "kb": 1 << 10,
+               "m": 1 << 20, "mib": 1 << 20, "mb": 1 << 20,
+               "g": 1 << 30, "gib": 1 << 30, "gb": 1 << 30}
+
+
+def env_bytes(name: str, default: int) -> int:
+    """A deployment's byte budget from the environment: a plain byte count
+    or a size (`512MB`, `1.5GiB`, `2G`; the decimal spellings read 1024-based,
+    the way an operator means them beside a disk size), `default` when unset.
+    A malformed value is refused, not guessed: a mistyped budget stops the
+    process at startup rather than silently becoming the default.
+
+    A disk tier's budget is a fact about the volume it fills — production's
+    cache volume is shared with the lake and the sol pool, a dev box's is not
+    — so it is the operator's knob, with a default sized for production.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)", raw)
+    if m is None or m.group(2).lower() not in _SIZE_UNITS:
+        raise ValueError(f"{name}={raw!r}: expected bytes or a size like 512MB")
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).lower()])
+
+
 class DiskBackend:
     """Content-addressed JSON files under a directory, capped by file count
-    (oldest-by-mtime evicted). Persists across restarts. Best-effort: a read or
-    write failure never raises — the endpoint just recomputes.
+    and by total bytes (oldest-by-mtime evicted, the count as `max_files`
+    and the bytes as `max_bytes`, `None` for no byte bound). Persists across
+    restarts. Best-effort: a read or write failure never raises — the
+    endpoint just recomputes.
 
     Values must be JSON-serializable. A changed key lands on a fresh file and
     the old one is orphaned, so the cap bounds orphan growth (e.g. one set per
     data edit); an entry whose trace went stale is replaced under its own key,
-    atomically."""
+    atomically. The byte bound is what the count alone could not give: an
+    entry is 21 KB or 150 MB by the value it holds, so a count of files says
+    nothing about the disk it fills. One entry larger than the byte bound is
+    kept alone (the newest file is never the one pruned): the bound caps
+    growth at one oversized entry rather than a write-then-delete cycle."""
 
-    def __init__(self, directory: os.PathLike | str, max_files: int = 2000):
+    def __init__(self, directory: os.PathLike | str, max_files: int = 2000,
+                 max_bytes: Optional[int] = None):
         self._dir = pathlib.Path(directory)
         self._max = max_files
+        self._max_bytes = max_bytes
 
     def get(self, key: str) -> Optional[Any]:
         try:
@@ -256,12 +291,23 @@ class DiskBackend:
 
     def _prune(self) -> None:
         try:
-            files = list(self._dir.glob("*.json"))
-            if len(files) <= self._max:
-                return
-            files.sort(key=lambda p: p.stat().st_mtime)
-            for p in files[: len(files) - self._max]:
+            # One stat pass serves both bounds; the prune runs after every
+            # write, so it is already O(files) and the sizes are free.
+            files = []
+            for p in self._dir.glob("*.json"):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                files.append((st.st_mtime, st.st_size, p))
+            files.sort()
+            total = sum(s for _, s, _ in files)
+            while len(files) > 1 and (
+                    len(files) > self._max
+                    or (self._max_bytes is not None and total > self._max_bytes)):
+                _, size, p = files.pop(0)
                 p.unlink(missing_ok=True)
+                total -= size
         except OSError:
             pass
 
