@@ -1039,11 +1039,17 @@ function ParetoSection({
   const held = holds.filter((h) => fix[h.d]?.length)
     .map((h) => (fix[h.d] as CloudValue[]).map((v) => cloudLabel(h.d, v)).join(", ")).join(" · ");
   const options = (d: CloudDim) => (view || answer?.view)?.values[d] || [];
+  const specK = Number(sweepBody.speculative_draft_tokens) || 0;
+  const specNote = specK > 0
+    ? ` Speculative decoding, K = ${specK} at α = ${sweepBody.acceptance_rate}: ${sweepBody.speculative_draft
+      ? "each step runs the K MTP draft forwards and the verify over K + 1 positions"
+      : "each step is the verify over K + 1 positions alone (no draft forward on the GPU)"}, keeping 1 + α·K tokens per request.`
+    : "";
   return (
     <FrontierChart<ParFrontierPt>
       bare
       title={`Decode Pareto frontier — ctx ${fmtSeqLabel(ctx)}${held ? ` · ${held}` : ""}`}
-      subtitle={`Every layout of the Parallelism sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better. Throughput is per GPU. SOL only.${onApply ? " Click a point to apply it." : ""}`}
+      subtitle={`Every layout of the Parallelism sweep at every per-GPU decode batch, kept to the held values; each line keeps the points no other point of it beats on both axes, up and to the right is better. Throughput is per GPU.${specNote} SOL only.${onApply ? " Click a point to apply it." : ""}`}
       controls={
         <div className="flex items-center gap-3 flex-wrap">
           {applied ? <span className="text-11 text-green-600">{applied}</span> : null}
@@ -1302,10 +1308,16 @@ export function ScalingPanel(props: {
   const [ovDegree, setOvDegree] = useState(BATCH_PAR_DEGREE);
   const [ctx, setCtx] = useState(4096);
   const [showBatchMeas, setShowBatchMeas] = useState(false);
-  // Speculative decoding for the Context × Batch decode curves: a preset's
-  // K drafts verified per step at acceptance α. "none" sends neither field,
-  // so the default body (and its warm cache key) is plain decode.
+  // Speculative decoding for every sweep of the panel (Parallelism, its
+  // Pareto frontier, Context × Batch): a preset's K drafts verified per step
+  // at acceptance α. "none" sends neither field, so the default bodies (and
+  // their warm cache keys) are plain decode. `countDraft` adds the draft's
+  // own forwards, priced off the model's MTP stack (`speculative_draft`);
+  // off, the step is the verify alone — a drafter that runs no forward on the
+  // GPU (n-gram / prompt lookup), the one form a model with no MTP stack has.
   const [specMode, setSpecMode] = useState("none");
+  const [countDraft, setCountDraft] = useState(false);
+  const [draftAvail, setDraftAvail] = useState<{ key: string; available: boolean; reason: string | null } | null>(null);
   const [showParMeas, setShowParMeas] = useState(false);
   const [status, setStatus] = useState<SweepStatus | null>({ text: "Pick a model and GPU." });
   // The (batch × context) sweep as the backend returned it. Measured only
@@ -1355,7 +1367,39 @@ export function ScalingPanel(props: {
   // holds theory sweeps only (`sweepCache`): a measured sweep is always asked
   // of the server, so an upload elsewhere is never served from old curves.
   const calibrateMine = props.calibration?.state === "on";
-  const sweepHold = rhoHold || (props.calibration?.state === "loading" ? "Reading your calibration rows…" : "");
+  const spec = SPEC_PRESETS[specMode] ?? SPEC_PRESETS.none;
+  // Whether this model can count a draft at the preset's K: the refusal the
+  // estimate would raise (`/inference/speculative-draft`), asked per model and K.
+  useEffect(() => {
+    const id = props.modelId.trim();
+    if (!id || spec.K <= 0) return;
+    const ctrl = new AbortController();
+    const key = `${id}|${spec.K}`;
+    fetchJson<{ available?: boolean; unavailable_reason?: string | null }>(
+      `/inference/speculative-draft?model_id=${encodeURIComponent(id)}`
+        + `&speculative_draft_tokens=${encodeURIComponent(String(spec.K))}`,
+      { signal: ctrl.signal },
+    )
+      .then((j) => setDraftAvail({ key, available: !!j.available, reason: j.unavailable_reason || null }))
+      .catch((e) => {
+        if (isAbort(e)) return;
+        setDraftAvail({ key, available: false, reason: e instanceof Error ? e.message : String(e) });
+      });
+    return () => ctrl.abort();
+  }, [props.modelId, spec.K]);
+  // The answer for this model and K; null while it is asked (an answer for
+  // another model or K is no answer here).
+  const draft = draftAvail?.key === `${props.modelId.trim()}|${spec.K}` ? draftAvail : null;
+  // The speculative fields every sweep body carries; none under plain decode.
+  const specBody = useMemo(() => (spec.K > 0 ? {
+    speculative_draft_tokens: spec.K,
+    acceptance_rate: spec.alpha,
+    ...(countDraft && draft?.available ? { speculative_draft: "recursive" } : {}),
+  } : {}), [spec.K, spec.alpha, countDraft, draft]);
+  // Asked to count the draft before this model's answer is known: the sweeps
+  // wait, rather than post a verify-only sweep first and the drafted one after.
+  const draftHold = spec.K > 0 && countDraft && !draft ? "Checking whether this model has a draft graph…" : "";
+  const sweepHold = rhoHold || draftHold || (props.calibration?.state === "loading" ? "Reading your calibration rows…" : "");
   const lapsed = (e: unknown) => {
     if (calibrateMine && e instanceof ApiError && e.status === 401) props.onSessionLapsed?.();
   };
@@ -1372,7 +1416,6 @@ export function ScalingPanel(props: {
   const degreesPending = degreeModes === null && !!props.modelId.trim() && !!props.gpuSku
     && !parStatus?.failed;
   const batchDegree = snapDegree(ovDegree, batchDegrees);
-  const spec = SPEC_PRESETS[specMode] ?? SPEC_PRESETS.none;
 
   useEffect(() => {
     fetchJson<{ scaling_contexts?: number[]; scaling_degrees?: number[] }>("/inference/defaults")
@@ -1448,7 +1491,7 @@ export function ScalingPanel(props: {
       selection_mode: props.selectionMode || "envelope",
       ...(props.framework?.trim() ? { framework: props.framework.trim() } : {}),
       ...(props.kvBlock ? { kv_block_size: Number(props.kvBlock) } : {}),
-      ...(spec.K > 0 ? { speculative_draft_tokens: spec.K, acceptance_rate: spec.alpha } : {}),
+      ...specBody,
       ...(calibrateMine ? { calibrate_with_mine: true } : {}),
     };
     // The measured answer is read only while it is drawn: unticked, the
@@ -1519,7 +1562,7 @@ export function ScalingPanel(props: {
         setStatus({ text: e instanceof Error ? e.message : String(e), failed: true });
       });
     return () => ctrl.abort();
-  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, spec, calibrateMine, showBatchMeas]);
+  }, [props.modelId, ovGpu, ovPar, batchDegree, noDegreeFits, degreesPending, grid, gridError, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine, showBatchMeas]);
 
   useEffect(() => {
     setParMeasNote(null);
@@ -1548,6 +1591,7 @@ export function ScalingPanel(props: {
       ...(props.framework?.trim() ? { framework: props.framework.trim() } : {}),
       ...(props.kvBlock ? { kv_block_size: Number(props.kvBlock) } : {}),
       ...(rho ? { ep_load_factor: rho } : {}),
+      ...specBody,
       ...(calibrateMine ? { calibrate_with_mine: true } : {}),
     };
     const wantMeasured = showParMeas && !isTheory(body);
@@ -1620,7 +1664,7 @@ export function ScalingPanel(props: {
         setParStatus({ text: `sweep load failed: ${e instanceof Error ? e.message : String(e)}`, failed: true });
       });
     return () => ctrl.abort();
-  }, [props.modelId, props.gpuSku, ctx, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, calibrateMine, showParMeas]);
+  }, [props.modelId, props.gpuSku, ctx, props.precision, props.frac, props.commLatencyUs, props.launchFloorUs, props.outTok, props.selectionMode, props.framework, props.kvBlock, rho, sweepHold, specBody, calibrateMine, showParMeas]);
 
   // The deployment the curves were drawn for, as the backend resolved it.
   const batchEst = batchResults ? Object.values(batchResults).flat().find((r) => r?.parallel) : undefined;
@@ -1635,7 +1679,43 @@ export function ScalingPanel(props: {
     <section id="infer-scaling" className="card p-4 sm:p-6 mb-6">
       <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
         <h2 className="text-lg font-semibold text-gray-900">Scaling</h2>
-        {appliedNote ? <div className="text-xs text-green-600">{appliedNote}</div> : null}
+        <div className="flex items-center gap-3 flex-wrap">
+          <label
+            className="inline-flex items-center gap-1.5 text-xs text-gray-500"
+            title="Decode, every sweep below: the target verifies K draft tokens in one forward over K + 1 positions and keeps 1 + α·K tokens per step."
+          >
+            Spec decode
+            <select
+              id="infer-scaling-spec"
+              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
+              value={specMode}
+              onChange={(e) => setSpecMode(e.target.value)}
+            >
+              {Object.entries(SPEC_PRESETS).filter(([v]) => v !== "custom").map(([v, p]) => (
+                <option key={v} value={v}>{p.label}</option>
+              ))}
+            </select>
+          </label>
+          {spec.K > 0 ? (
+            <label
+              className={`inline-flex items-center gap-1.5 text-xs ${draft?.available ? "text-gray-500" : "text-gray-400"}`}
+              title={draft?.available
+                ? "On: each step also runs the K draft forwards of the model's MTP stack (one token each). Off: the verify alone — a drafter that runs no forward on the GPU (n-gram / prompt lookup)."
+                : `Only the verify is counted: ${draft?.reason ?? "checking whether this model has a draft graph…"}`}
+            >
+              <input
+                id="infer-scaling-spec-draft"
+                type="checkbox"
+                className="accent-amber-500"
+                disabled={!draft?.available}
+                checked={!!draft?.available && countDraft}
+                onChange={(e) => setCountDraft(e.target.checked)}
+              />
+              Count draft cost (MTP stack)
+            </label>
+          ) : null}
+          {appliedNote ? <div className="text-xs text-green-600">{appliedNote}</div> : null}
+        </div>
       </div>
       <ParallelSection
         ctx={ctx}
@@ -1692,22 +1772,6 @@ export function ScalingPanel(props: {
               onChange={(e) => setOvDegree(Number(e.target.value))}
             >
               {batchDegrees.map((n) => <option key={n} value={n}>{n}</option>)}
-            </select>
-          </label>
-          <label
-            className="inline-flex items-center gap-1.5 text-xs text-gray-500"
-            title="Decode only: the target verifies K draft tokens in one forward over K + 1 positions and keeps 1 + α·K tokens per step. The draft model's own forwards are not counted."
-          >
-            Spec decode
-            <select
-              id="infer-scaling-spec"
-              className="text-sm border border-gray-200 rounded-lg px-2 py-1.5 bg-white text-gray-800"
-              value={specMode}
-              onChange={(e) => setSpecMode(e.target.value)}
-            >
-              {Object.entries(SPEC_PRESETS).filter(([v]) => v !== "custom").map(([v, p]) => (
-                <option key={v} value={v}>{p.label}</option>
-              ))}
             </select>
           </label>
           <MeasuredCheck id="infer-scaling-measured" checked={showBatchMeas} onChange={setShowBatchMeas}
