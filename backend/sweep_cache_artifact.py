@@ -15,7 +15,7 @@ The mechanism is `backend.release_artifacts.JsonCacheArtifact`.
 """
 from __future__ import annotations
 
-from backend.release_artifacts import JsonCacheArtifact
+from backend.release_artifacts import CacheTier, JsonCacheArtifact
 
 
 SWEEP_CACHE = JsonCacheArtifact(
@@ -24,7 +24,7 @@ SWEEP_CACHE = JsonCacheArtifact(
     dir_env="HA_SWEEP_CACHE_DIR",
     default_dir="sweep",
     pin_env="HA_SWEEP_CACHE_ARTIFACT",
-    entries=("*.json",),
+    entries=(CacheTier(),),
 )
 
 pull = SWEEP_CACHE.pull

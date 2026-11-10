@@ -647,7 +647,8 @@ timestamped pool by hand.
 
 The Gallery response cache is a different, mergeable layer. It lives under
 `HA_GALLERY_CACHE_DIR` on the same persistent volume, and
-`backend.gallery_cache_artifact` reads `gallery-cache-v1/<engine>/index.json`.
+`backend.gallery_cache_artifact` reads `gallery-cache-v2/<engine>/index.json`
+(v2: frontier entries are stored gzip-compressed, `frontier/*.json.gz`).
 Its archive contains deterministic model facts and frontier entries only:
 measured views are folded live and are deliberately excluded.
 `scripts.publish_gallery_cache.publish` is that layer's publisher. A new

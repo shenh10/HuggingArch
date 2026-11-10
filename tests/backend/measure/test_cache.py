@@ -185,6 +185,84 @@ def test_disk_backend_keeps_an_oversized_entry_alone(tmp_path):
     assert be.nbytes("huge") == 1000
 
 
+def _noise(n: int, seed: int) -> dict:
+    """A value whose JSON is `n` bytes of hex — gzip halves it, no more."""
+    import random
+    rng = random.Random(seed)
+    value = {"x": ""}
+    value["x"] = "".join(rng.choice("0123456789abcdef")
+                         for _ in range(n - len(json.dumps(value))))
+    return value
+
+
+def test_compressed_disk_backend_roundtrip_is_gzip_of_the_json(tmp_path):
+    import gzip
+    be = DiskBackend(tmp_path, compress=True)
+    value = {"points": [[i, i * 0.5, "x"] for i in range(500)]}
+    be.put("k", value)
+    assert be.get("k") == value
+    assert be.get("missing") is None
+    (path,) = be.files()
+    assert path.name == "k.json.gz" and be.suffix == ".json.gz"
+    # The file is the value's JSON, gzip'd — any gzip reader opens it — and
+    # holds no name or time: one value, one file.
+    assert json.loads(gzip.decompress(path.read_bytes())) == value
+    again = DiskBackend(tmp_path / "again", compress=True)
+    again.put("k", value)
+    assert (tmp_path / "again" / "k.json.gz").read_bytes() == path.read_bytes()
+    # A plain backend over the same directory sees none of it.
+    assert DiskBackend(tmp_path).get("k") is None
+    assert DiskBackend(tmp_path).files() == []
+
+
+def test_compressed_nbytes_is_the_json_length_not_the_file_length(tmp_path):
+    be = DiskBackend(tmp_path, compress=True)
+    be.put("big", _blob(100_000))
+    assert be.nbytes("big") == 100_000
+    assert (tmp_path / "big.json.gz").stat().st_size < 1_000
+    assert be.nbytes("missing") is None
+
+
+def test_compressed_byte_budget_counts_the_bytes_on_disk(tmp_path):
+    be = DiskBackend(tmp_path, max_files=100, max_bytes=40_000, compress=True)
+    for i in range(12):
+        be.put(f"k{i:02d}", _noise(10_000, i))
+    on_disk = [p.stat().st_size for p in be.files()]
+    # 12 × 10 KB of JSON is three times the budget; at about half that each
+    # on disk, more than the 4 entries a JSON count would allow are kept,
+    # and the files fit the budget.
+    assert sum(on_disk) <= 40_000
+    assert 4 < len(on_disk) < 12
+    assert be.get("k11") == _noise(10_000, 11)   # newest kept
+    assert be.get("k00") is None                 # oldest evicted
+
+
+def test_a_corrupt_compressed_entry_reads_as_a_miss(tmp_path):
+    be = DiskBackend(tmp_path, compress=True)
+    be.put("k", {"v": 1})
+    path = tmp_path / "k.json.gz"
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) // 2])     # truncated
+    assert be.get("k") is None
+    path.write_bytes(b"not gzip at all")
+    assert be.get("k") is None
+
+
+def test_a_file_of_the_other_format_is_never_read_and_is_pruned(tmp_path):
+    """No backend reads both formats: an entry written before its tier
+    changed format is a miss, and the next write's prune removes it."""
+    DiskBackend(tmp_path).put("old", {"v": 1})
+    be = DiskBackend(tmp_path, compress=True)
+    assert be.get("old") is None
+    be.put("new", {"v": 2})
+    assert not (tmp_path / "old.json").exists()
+    assert [p.name for p in be.files()] == ["new.json.gz"]
+    # And the other way round.
+    plain = DiskBackend(tmp_path)
+    plain.put("plain", {"v": 3})
+    assert not (tmp_path / "new.json.gz").exists()
+
+
 def test_env_bytes_parses_operator_sizes_and_refuses_a_mistyped_budget(monkeypatch):
     monkeypatch.delenv("HA_TEST_BYTES", raising=False)
     assert env_bytes("HA_TEST_BYTES", 5) == 5

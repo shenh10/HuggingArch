@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import collections
 import gc
+import gzip
+import io
 import json
 import logging
 import os
@@ -46,6 +48,7 @@ import re
 import sys
 import threading
 import types
+import zlib
 from typing import Any, Callable, Optional
 
 from backend.code_trace.provider import TRACES, Trace, provider, recording
@@ -250,40 +253,95 @@ class DiskBackend:
     entry is 21 KB or 150 MB by the value it holds, so a count of files says
     nothing about the disk it fills. One entry larger than the byte bound is
     kept alone (the newest file is never the one pruned): the bound caps
-    growth at one oversized entry rather than a write-then-delete cycle."""
+    growth at one oversized entry rather than a write-then-delete cycle.
+
+    The file format is this class's, and only its: `<key>.json`, or with
+    ``compress=True`` `<key>.json.gz` — the same JSON, gzip level 1 (a
+    multi-megabyte entry stored at about a sixth of its size, for ~15% more
+    read time and a compress at write). Whoever needs an entry's file or
+    value — the release artifact that ships a cache directory — asks the
+    backend (`suffix`, `files`, `decode`) rather than restating it. The byte
+    bound counts the bytes on disk, compressed or not. A directory is one
+    backend's: a file there in the other format is not an entry this backend
+    reads (no backend reads both — an entry written before its tier changed
+    format is a miss, recomputed), only a dead file its prune removes."""
+
+    _PLAIN, _GZIP = ".json", ".json.gz"
 
     def __init__(self, directory: os.PathLike | str, max_files: int = 2000,
-                 max_bytes: Optional[int] = None):
+                 max_bytes: Optional[int] = None, *, compress: bool = False):
         self._dir = pathlib.Path(directory)
         self._max = max_files
         self._max_bytes = max_bytes
+        self._compress = compress
+
+    @property
+    def suffix(self) -> str:
+        """The suffix of this backend's entry files."""
+        return self._GZIP if self._compress else self._PLAIN
+
+    def _path(self, key: str) -> pathlib.Path:
+        return self._dir / f"{key}{self.suffix}"
+
+    def files(self) -> list[pathlib.Path]:
+        """This backend's entry files: its suffix, no dotfile (a writer's
+        temporary, a bootstrap marker)."""
+        try:
+            return [p for p in self._dir.glob(f"*{self.suffix}")
+                    if p.is_file() and not p.name.startswith(".")]
+        except OSError:
+            return []
+
+    def decode(self, data: bytes) -> Optional[Any]:
+        """The value an entry file of this backend holds, None when it holds
+        none (truncated, corrupt, or not this backend's format)."""
+        try:
+            return json.loads(gzip.decompress(data) if self._compress
+                              else data)
+        except (OSError, ValueError, EOFError, zlib.error):
+            return None
 
     def get(self, key: str) -> Optional[Any]:
         try:
-            with open(self._dir / f"{key}.json") as f:
-                return json.load(f)
-        except (OSError, ValueError):
+            data = self._path(key).read_bytes()
+        except OSError:
             return None
+        return self.decode(data)
 
     def nbytes(self, key: str) -> Optional[int]:
-        """The stored value's JSON byte length — its file's — without
-        reading it; None when there is no such file."""
+        """The stored value's JSON byte length without parsing it; None
+        when there is no such file. Plain: the file's length. Compressed:
+        the gzip trailer's ISIZE (the uncompressed length mod 2**32 — exact
+        below 4 GiB, which a cache entry is)."""
+        path = self._path(key)
         try:
-            return (self._dir / f"{key}.json").stat().st_size
+            if not self._compress:
+                return path.stat().st_size
+            with open(path, "rb") as f:
+                f.seek(-4, os.SEEK_END)
+                return int.from_bytes(f.read(4), "little")
         except OSError:
             return None
 
     def put(self, key: str, value: Any) -> None:
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
-            path = self._dir / f"{key}.json"
+            path = self._path(key)
             # Atomic write-tmp+rename: a reader in another process (the server
             # while `backend.api.warm` fills the same directory) sees either
             # no file or the whole file. The tmp name is unique per writer
             # thread so two writers of one key never share a half-written tmp.
-            tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-            with open(tmp, "w") as f:
-                json.dump(value, f)
+            tmp = self._dir / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as raw:
+                if self._compress:
+                    # No name and no time in the header: one value, one file.
+                    with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                       compresslevel=1, mtime=0) as zipped, \
+                            io.TextIOWrapper(zipped, encoding="utf-8") as f:
+                        json.dump(value, f)
+                else:
+                    with io.TextIOWrapper(raw, encoding="utf-8") as f:
+                        json.dump(value, f)
             os.replace(tmp, path)
             self._prune()
         except (OSError, TypeError, ValueError):
@@ -291,10 +349,16 @@ class DiskBackend:
 
     def _prune(self) -> None:
         try:
+            # The other format's files are dead here (see the class): an
+            # entry this backend cannot read, kept by no bound but this one.
+            other = self._PLAIN if self._compress else self._GZIP
+            for p in self._dir.glob(f"*{other}"):
+                if not p.name.startswith("."):
+                    p.unlink(missing_ok=True)
             # One stat pass serves both bounds; the prune runs after every
             # write, so it is already O(files) and the sizes are free.
             files = []
-            for p in self._dir.glob("*.json"):
+            for p in self.files():
                 try:
                     st = p.stat()
                 except OSError:
@@ -312,11 +376,8 @@ class DiskBackend:
             pass
 
     def clear(self) -> None:
-        try:
-            for p in self._dir.glob("*.json"):
-                p.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for p in self.files():
+            p.unlink(missing_ok=True)
 
 
 class TieredBackend:

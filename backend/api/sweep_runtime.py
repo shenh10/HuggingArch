@@ -105,8 +105,8 @@ _SWEEP = KeyedCache(
         MemoryBackend(max_entries=256),
         # Featured models × DEFAULT_SWEEP_GPUS × 4 modes × 8 degrees is ~800
         # files; --all-gpus × the same grid is a few thousand.
-        DiskBackend(_SWEEP_CACHE_DIR, max_files=8000,
-                    max_bytes=_SWEEP_DISK_BYTES * 3 // 4),
+        SWEEP_CACHE.disk(max_files=8000,
+                         max_bytes=_SWEEP_DISK_BYTES * 3 // 4),
     ),
     single_flight=True,
 )

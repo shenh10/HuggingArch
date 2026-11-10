@@ -48,7 +48,7 @@ import urllib.error
 import urllib.request
 
 from backend.code_trace.provider import TRACE_DIR_ENV, TRACES, Trace
-from backend.measure.cache import TRACE_FIELD
+from backend.measure.cache import TRACE_FIELD, DiskBackend
 
 
 INDEX_SCHEMA = 1
@@ -354,16 +354,32 @@ def publish(prefix: str, build: Callable[[Path, Path], int], root: Path,
 
 
 @dataclass(frozen=True)
+class CacheTier:
+    """One `DiskBackend` directory of a result cache: where it sits under
+    the cache directory (``""`` for the directory itself) and whether its
+    files are compressed. The file format is the backend's; this names the
+    backend, so the runtime cache and the artifact build the same one."""
+
+    path: str = ""
+    compress: bool = False
+
+    def disk(self, root: Path, **bounds: Any) -> DiskBackend:
+        return DiskBackend(root / self.path, compress=self.compress, **bounds)
+
+
+@dataclass(frozen=True)
 class JsonCacheArtifact:
     """A result-cache directory (`backend.measure.cache.DiskBackend` files)
     published and pulled as one artifact.
 
-    ``entries`` are the globs (relative to the directory) of the shareable
-    entries; anything else under it is machine-local and never ships.
-    ``machine_local`` names subdirectories whose entries a newly installed
-    artifact clears (they were derived from what it replaces). The
-    directory itself is declared here once: the runtime cache reads
-    `directory()` too.
+    ``entries`` are the tiers (`CacheTier`, relative to the directory) of
+    the shareable entries; anything else under it is machine-local and
+    never ships. ``machine_local`` names tiers whose entries a newly
+    installed artifact clears (they were derived from what it replaces).
+    The directory and its tiers are declared here once: the runtime cache
+    builds its disk backends with `disk()`, and the artifact reads each
+    tier's files and values through the same backend — an archive member
+    is a tier's file, byte for byte.
     """
 
     name: str
@@ -371,8 +387,8 @@ class JsonCacheArtifact:
     dir_env: str
     default_dir: str
     pin_env: str
-    entries: tuple[str, ...] = ("*.json",)
-    machine_local: tuple[str, ...] = ()
+    entries: tuple[CacheTier, ...] = (CacheTier(),)
+    machine_local: tuple[CacheTier, ...] = ()
 
     @property
     def volume_dirs(self) -> tuple[str, ...]:
@@ -386,31 +402,43 @@ class JsonCacheArtifact:
             self.dir_env,
             str(Path.home() / ".cache" / "huggingarch" / self.default_dir)))
 
-    def files(self, root: Path) -> list[Path]:
-        """The shareable entries under ``root``: no dotfile (the bootstrap
-        marker, a writer's temporary)."""
+    def disk(self, path: str = "", **bounds: Any) -> DiskBackend:
+        """The runtime disk backend of the tier at ``path``, under
+        `directory()`, with its bounds (``max_files``, ``max_bytes``)."""
+        for tier in (*self.entries, *self.machine_local):
+            if tier.path == path:
+                return tier.disk(self.directory(), **bounds)
+        raise KeyError(f"{self.name} cache declares no tier {path!r}")
+
+    def _tier_files(self, root: Path) -> list[tuple[CacheTier, Path]]:
+        """Each shareable entry under ``root`` with its tier, in archive
+        order."""
         return sorted(
-            (path for pattern in self.entries for path in root.glob(pattern)
-             if path.is_file() and not path.name.startswith(".")),
-            key=lambda path: path.relative_to(root).as_posix())
+            ((tier, path) for tier in self.entries
+             for path in tier.disk(root).files()),
+            key=lambda item: item[1].relative_to(root).as_posix())
+
+    def files(self, root: Path) -> list[Path]:
+        """The shareable entries under ``root``: each tier's entry files
+        (`DiskBackend.files`)."""
+        return [path for _, path in self._tier_files(root)]
 
     # -- publishing -------------------------------------------------------
 
     def build(self, root: Path, destination: Path) -> int:
         """The archive of ``root``'s entries and, under ``code-traces/``,
         each trace they name, once; the entry count."""
-        files = self.files(root)
+        files = self._tier_files(root)
         if not files:
             raise ValueError(f"no shareable {self.name} entries under {root}")
         traces: set[str] = set()
 
         def members():
-            for path in files:
+            for tier, path in files:
                 data = path.read_bytes()
-                try:
-                    tid = json.loads(data).get(TRACE_FIELD)
-                except (ValueError, AttributeError):
-                    tid = None
+                value = tier.disk(root).decode(data)
+                tid = (value.get(TRACE_FIELD) if isinstance(value, dict)
+                       else None)
                 if tid:
                     traces.add(tid)
                 yield path.relative_to(root).as_posix(), data
@@ -433,8 +461,12 @@ class JsonCacheArtifact:
     # -- pulling ----------------------------------------------------------
 
     def check(self, archive: Path) -> int:
-        """Accept only regular JSON files below ``<name>/``; their count."""
+        """Accept only regular files below ``<name>/``: a declared tier's
+        entry files (its directory, its backend's suffix) and the trace
+        bodies under ``code-traces/``; the entry count."""
         files = 0
+        suffixes = {tier.path: tier.disk(Path()).suffix
+                    for tier in self.entries}
         with tarfile.open(archive, "r:gz") as tar:
             members = tar.getmembers()
             for member in members:
@@ -447,16 +479,25 @@ class JsonCacheArtifact:
                 if not member.isfile():
                     raise ValueError(f"{self.name} cache archive member is "
                                      f"not a file: {name}")
-                if not name.endswith(".json"):
+                relative = name[len(self.name) + 1:]
+                parent, _, leaf = relative.rpartition("/")
+                if parent == "code-traces":
+                    if not leaf.endswith(".json"):
+                        raise ValueError(f"{self.name} cache archive trace "
+                                         f"is not JSON: {name}")
+                    continue
+                suffix = suffixes.get(parent)
+                if suffix is None or not leaf.endswith(suffix):
                     raise ValueError(f"{self.name} cache archive member is "
-                                     f"not JSON: {name}")
+                                     f"not an entry of a declared tier: "
+                                     f"{name}")
                 files += 1
             if not any(m.name.rstrip("/") == self.name for m in members):
                 raise ValueError(
                     f"{self.name} cache archive has no {self.name}/ root")
             if not files:
                 raise ValueError(
-                    f"{self.name} cache archive has no JSON entries")
+                    f"{self.name} cache archive has no entries")
         return files
 
     def installed(self, root: Path, artifact: str, sha: str) -> bool:
@@ -487,15 +528,12 @@ class JsonCacheArtifact:
             with tarfile.open(archive, "r:gz") as tar:
                 tar.extractall(staging, filter="data")
             unpacked = staging / self.name
-            files = [path for path in unpacked.rglob("*.json")
-                     if path.is_file()
-                     and path.parent != unpacked / "code-traces"]
+            files = self.files(unpacked)
             if not files:
                 raise ValueError(
-                    f"{self.name} cache archive has no JSON entries")
-            for directory in self.machine_local:
-                for stale in (root / directory).glob("*.json"):
-                    stale.unlink(missing_ok=True)
+                    f"{self.name} cache archive has no entries")
+            for tier in self.machine_local:
+                tier.disk(root).clear()
             for source in files:
                 destination = root / source.relative_to(unpacked)
                 destination.parent.mkdir(parents=True, exist_ok=True)

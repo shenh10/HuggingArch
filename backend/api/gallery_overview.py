@@ -24,7 +24,7 @@ from backend.inference.parallel_config import ParallelConfig
 from backend.fingerprint import result_version
 from backend.gallery_cache_artifact import GALLERY_CACHE
 from backend.measure.cache import (
-    DiskBackend, KeyedCache, MemoryBackend, TieredBackend, env_bytes,
+    KeyedCache, MemoryBackend, TieredBackend, env_bytes,
 )
 from backend.measure.scope import make_key
 from backend.api.offload import (
@@ -74,8 +74,9 @@ _GALLERY_CACHE_DIR = GALLERY_CACHE.directory()
 # The gallery's disk tiers all live under that one directory, so they share
 # one operator budget — the directory is the disk the operator sizes — and
 # the split among the tiers is a code fact, not three more knobs: the
-# frontier entries are the mass (16–150 MB each) and get the largest share,
-# the model facts one entry a model, the views kilobytes beside either.
+# frontier entries are the mass (up to ~5 MB each, compressed) and get the
+# largest share, the model facts one entry a model, the views kilobytes
+# beside either.
 # The shares sum to the whole; the remote tier, not this disk, is the
 # durable one, so a bigger box raises the one knob.
 _GALLERY_DISK_BYTES = env_bytes("HA_GALLERY_CACHE_BYTES", 1 << 30)
@@ -96,8 +97,7 @@ _GALLERY = KeyedCache(
     "gallery",
     TieredBackend(
         MemoryBackend(max_entries=256),
-        DiskBackend(_GALLERY_CACHE_DIR, max_files=10000,
-                    max_bytes=_FACTS_DISK_BYTES),
+        GALLERY_CACHE.disk(max_files=10000, max_bytes=_FACTS_DISK_BYTES),
     ),
     single_flight=True,
 )
@@ -105,13 +105,19 @@ _GALLERY = KeyedCache(
 # A model's decode-frontier entry (`gallery_frontier`) is megabytes of JSON,
 # most of it each point's step as a function of the floors at every K
 # (`FloorForm`) — DeepSeek-V3 on H100 with every layout: 9.0 MB, Kimi-K3:
-# 0.85 MB; all 63 models on H100: 357 MB (measured 2026-11-10) — one per
-# model per GPU view (6 GPUs × every model). It
-# is kept in two parts on disk and in the remote tier only (`_FRONTIER`):
-# no process holds an entry in memory. What a page reads is a view's
-# drawing — the frontier points under its floors, K and acceptance, and the
-# Kernel Bench coverage of those points, ~21 KB for DeepSeek-V3 — and, per
-# Kernel Bench snapshot, the entry's measured rates with each point's
+# 0.85 MB, DeepSeek-V4-Flash: 30.7 MB; all 63 models on H100: 357 MB
+# (measured 2026-11-10) — one per model per GPU view (6 GPUs × every
+# model, ~2.3 GB of JSON). It is kept in two parts on disk and in the
+# remote tier only (`_FRONTIER`): no process holds an entry in memory. On
+# disk an entry is gzip level 1 (`DiskBackend(compress=True)`, declared on
+# the artifact's tier): DeepSeek-V3 1.6 MB, V4-Flash 5.3 MB, the six GPUs'
+# set ~0.4 GB inside this tier's share; reading V4-Flash's costs 0.69 s
+# against 0.61 s plain, writing it 0.19 s more. The remote tier keeps the
+# JSON (jsonb), so an entry above its 8 MiB limit stays local.
+# What a page reads is a view's drawing — the frontier points under its
+# floors, K and acceptance, and the Kernel Bench coverage of those points,
+# ~21 KB for DeepSeek-V3 — and, per Kernel Bench snapshot, the entry's
+# measured rates with each point's
 # coverage, ~300 KB for DeepSeek-V3 on H100 (2,545 distinct unmeasured keys)
 # (`_FRONTIER_VIEWS`): small next to an entry, so they get a memory tier,
 # which holds a few dozen of the larger ones; the rest read from disk.
@@ -130,16 +136,16 @@ _GALLERY = KeyedCache(
 FRONTIER_VIEW_MEMORY_BYTES = 8 << 20
 _FRONTIER = KeyedCache(
     "gallery-frontier",
-    DiskBackend(_GALLERY_CACHE_DIR / "frontier", max_files=4000,
-                max_bytes=_FRONTIER_DISK_BYTES),
+    GALLERY_CACHE.disk("frontier", max_files=4000,
+                       max_bytes=_FRONTIER_DISK_BYTES),
     single_flight=True,
 )
 _FRONTIER_VIEWS = KeyedCache(
     "gallery-frontier-views",
     TieredBackend(
         MemoryBackend(max_entries=4096, max_bytes=FRONTIER_VIEW_MEMORY_BYTES),
-        DiskBackend(_GALLERY_CACHE_DIR / "frontier-views", max_files=20000,
-                    max_bytes=_VIEWS_DISK_BYTES),
+        GALLERY_CACHE.disk("frontier-views", max_files=20000,
+                           max_bytes=_VIEWS_DISK_BYTES),
     ),
     single_flight=True,
 )

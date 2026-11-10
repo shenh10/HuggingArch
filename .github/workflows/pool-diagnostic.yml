@@ -33,7 +33,7 @@ jobs:
             echo SOL_BOOTSTRAP
             cat /app/.cache/huggingarch/sol-pool/.bootstrap.json 2>/dev/null || true
             echo GALLERY_FACTS=\$(find /app/.cache/huggingarch/gallery-cache -maxdepth 1 -name \"*.json\" 2>/dev/null | wc -l)
-            echo GALLERY_FRONTIER=\$(find /app/.cache/huggingarch/gallery-cache/frontier -name \"*.json\" 2>/dev/null | wc -l)
+            echo GALLERY_FRONTIER=\$(find /app/.cache/huggingarch/gallery-cache/frontier -name \"*.json.gz\" 2>/dev/null | wc -l)
             echo GALLERY_VIEWS=\$(find /app/.cache/huggingarch/gallery-cache/frontier-views -name \"*.json\" 2>/dev/null | wc -l)
             echo GALLERY_BOOTSTRAP
             cat /app/.cache/huggingarch/gallery-cache/.bootstrap.json 2>/dev/null || true

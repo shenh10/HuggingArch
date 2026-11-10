@@ -6,8 +6,9 @@ deterministic for one engine/spec snapshot, and can be expensive to draw, so
 a release may publish a partial cache (for example completed Gallery GPUs)
 and let runtime warm extend it on the persistent volume.
 
-Shareable: model facts (``*.json``) and frontier entries
-(``frontier/*.json``). Measured views (``frontier-views/``) belong to one
+Shareable: model facts (the directory's own tier) and frontier entries
+(``frontier/``, gzip-compressed: megabytes of JSON each, a sixth of that on
+disk). Measured views (``frontier-views/``) belong to one
 Kernel Bench snapshot and are folded live: they never ship, and a newly
 installed artifact clears the machine's (they were drawn off the entries it
 replaces). The mechanism is `backend.release_artifacts.JsonCacheArtifact`.
@@ -17,17 +18,19 @@ replaces). The mechanism is `backend.release_artifacts.JsonCacheArtifact`.
 """
 from __future__ import annotations
 
-from backend.release_artifacts import JsonCacheArtifact
+from backend.release_artifacts import CacheTier, JsonCacheArtifact
 
 
 GALLERY_CACHE = JsonCacheArtifact(
     name="gallery",
-    prefix="gallery-cache-v1",
+    # v2: frontier entries are gzip files (`.json.gz`); a v1 reader would
+    # refuse them, so the two never share an index.
+    prefix="gallery-cache-v2",
     dir_env="HA_GALLERY_CACHE_DIR",
     default_dir="gallery",
     pin_env="HA_GALLERY_CACHE_ARTIFACT",
-    entries=("*.json", "frontier/*.json"),
-    machine_local=("frontier-views",),
+    entries=(CacheTier(), CacheTier("frontier", compress=True)),
+    machine_local=(CacheTier("frontier-views"),),
 )
 
 pull = GALLERY_CACHE.pull

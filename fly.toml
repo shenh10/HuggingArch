@@ -45,8 +45,9 @@ primary_region = 'nrt'
   HA_GALLERY_CACHE_DIR = '/app/.cache/huggingarch/gallery-cache'
   # The gallery cache shares the 10 GB volume with the bench lake, the sol
   # pool and the sweep cache; this is its whole share (the tiers under the
-  # directory split it, oldest entries evicted first) — sized to hold one
-  # GPU's full frontier entry set locally.
+  # directory split it, oldest entries evicted first) — its frontier share
+  # (65%, ~1.3 GiB) holds every gallery GPU's frontier entry set locally
+  # (~0.4 GB gzip-compressed; ~2.3 GB as JSON).
   HA_GALLERY_CACHE_BYTES = '2GiB'
   # The immutable canonical law pool is machine state, not image state.  It
   # lives on the persistent volume and is bootstrapped from the versioned
