@@ -389,6 +389,22 @@ class MeasuredFormula:
         return evaluate(self.text, {**launches, **times})
 
 
+def blend(t_sol: float, sol_measured: float, measured_s: float
+          ) -> Dict[str, float]:
+    """The partial track — its one definition: the step's SOL total
+    `t_sol` with the measured terms' SOL (`sol_measured`, the same terms
+    the SOL total weights) swapped for their measured share `measured_s`.
+    The SOL total and the measured formula are one aggregation
+    (`StepSum.total` over `t_op` and over `n·T`), so a term's two shares
+    are interchangeable. `t_s` is the blend, `measured_share` the part of
+    it that is measured. Whoever holds the SOL states `sol_measured`: a
+    walk's priced rows (`Folded.partial`), or a pool point's floor form at
+    the reader's floors (`row_roofline.FloorForm.terms_at`)."""
+    t_s = float(t_sol) - float(sol_measured) + float(measured_s)
+    return {"t_s": t_s, "measured_s": float(measured_s),
+            "measured_share": float(measured_s) / t_s if t_s > 0 else 0.0}
+
+
 def key_label(key: Key) -> str:
     """A key as the coverage lists it."""
     return f"{key.signature} {key.shape_json}"
@@ -420,6 +436,13 @@ class PointMeasure:
     #: The per-op row's aggregation id, kept parallel to every other row field.
     #: Empty means an older serialized measure; it has no structured details.
     aggregation_ids: Tuple[str, ...] = ()
+    #: Each term's SOL time at the point — one occurrence, before the
+    #: formula's weight, the leaf the SOL total adds (`StepSum.total` over
+    #: `t_op`) — or None where the producer has none (a pipeline stage not
+    #: walked here). Empty when the producer states none: a pool point,
+    #: whose SOL is a function of the floors its reader picks
+    #: (`row_roofline.FloorForm.terms_at`).
+    sol: Tuple[Optional[float], ...] = ()
 
     def __post_init__(self) -> None:
         n = len(self.keys)
@@ -431,6 +454,8 @@ class PointMeasure:
                 == len(self.reasons) == len(self.formula.zero_cost) == n):
             raise ValueError("a point measure states every field once per row")
         if self.aggregation_ids and len(self.aggregation_ids) != n:
+            raise ValueError("a point measure states every field once per row")
+        if self.sol and len(self.sol) != n:
             raise ValueError("a point measure states every field once per row")
         for k, u, z in zip(self.keys, self.unkeyed, self.formula.zero_cost, strict=True):
             if z and u != MEASURED:
@@ -487,7 +512,8 @@ class PointMeasure:
                 "formula": self.formula.text, "context": self.context,
                 "inputs": list(self.inputs),
                 **({"contexts": list(self.contexts)}
-                   if self.contexts else {})} | {"strings": list(table)}
+                   if self.contexts else {}),
+                **({"sol": list(self.sol)} if self.sol else {})} | {"strings": list(table)}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> "PointMeasure":
@@ -499,7 +525,9 @@ class PointMeasure:
                    MeasuredFormula(d["formula"], tuple(d["zero_cost"])),
                    d.get("context"), tuple(d.get("inputs") or ()),
                    tuple(d.get("contexts") or ()),
-                   tuple(d.get("aggregation_ids") or ()))
+                   tuple(d.get("aggregation_ids") or ()),
+                   tuple(None if v is None else float(v)
+                         for v in d.get("sol") or ()))
 
 
 @dataclass(frozen=True)
@@ -535,39 +563,37 @@ class Folded:
             return track
         return track.with_total(self.measure.formula.at(self.measure.launches, self.times))
 
-    def partial(self, rows: Iterable[Tuple[Sequence[int], float]],
-                t_sol: Optional[float]) -> Optional[Dict[str, float]]:
-        """The partial track: the step's SOL total `t_sol` with every fully
-        measured row's SOL share replaced by its measured share — the one
-        formula over each row's terms (`subtotal`) in place of the term's
-        weight × the row's SOL time. `rows` are `(term indices, SOL time of
-        one weighted occurrence)` per row. A row with any term not measured
-        keeps its SOL time whole. `t_s` is the blend, `measured_s` the part
-        of it that is measured, `measured_share` their ratio; at full
-        coverage `t_s` is the measured total. None when the step has no SOL
-        total (nothing to blend into).
+    @property
+    def measured_terms(self) -> Tuple[int, ...]:
+        """The terms with a measured time (a zero-cost term among them)."""
+        return tuple(k for k, row in enumerate(self.rows) if row[0] == MEASURED)
 
-        The SOL total and the measured formula are one aggregation
-        (`StepSum.total` over `t_op` and over `n·T`), so each row's SOL
-        share is its term's weight times its SOL time."""
-        if t_sol is None:
+    @property
+    def measured_s(self) -> float:
+        """The formula's share of the measured terms: what the partial
+        track puts in place of their SOL."""
+        return self.measure.formula.at(self.measure.launches, self.times,
+                                       self.measured_terms)
+
+    def partial(self, t_sol: Optional[float]) -> Optional[Dict[str, float]]:
+        """The partial track (`blend`) off the measure's own SOL leaves
+        (`PointMeasure.sol`), weighted by the formula as the SOL total
+        weights them. None when the step has no SOL total, or the measure
+        states no SOL — a pool point, whose SOL is a function of the floors
+        its reader picks (`FloorForm.terms_at`)."""
+        sol = self.measure.sol
+        if t_sol is None or not sol:
             return None
-        formula, n = self.measure.formula, len(self.rows)
-        ones = [1.0] * n
-        measured = sol = 0.0
-        for terms, t_op in rows:
-            terms = list(terms)
-            share = self.subtotal(terms)
-            if share is None:
-                continue
-            live = [k for k in terms if not formula.zero_cost[k]]
-            measured += share
-            if live:
-                sol += formula.at(ones, ones, live[:1]) * float(t_op or 0.0)
-        track = self.track
-        t_s = track.t_s if track.complete else float(t_sol) - sol + measured
-        return {"t_s": t_s, "measured_s": measured,
-                "measured_share": measured / t_s if t_s > 0 else 0.0}
+        formula = self.measure.formula
+        live = [k for k in self.measured_terms if not formula.zero_cost[k]]
+        unpriced = [k for k in live if sol[k] is None]
+        if unpriced:
+            raise ValueError(
+                f"measured terms {unpriced[:5]} have no SOL leaf: a measured "
+                "term is a priced row of this walk")
+        ones = [1.0] * len(self.rows)
+        leaves = [0.0 if v is None else float(v) for v in sol]
+        return blend(t_sol, formula.at(ones, leaves, live), self.measured_s)
 
     def subtotal(self, terms: Iterable[int]) -> Optional[float]:
         """The formula's share of `terms` — a draft's forwards, a module's

@@ -28,7 +28,7 @@ from backend.inference.defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_
 from backend.inference.comm_cost import Fabric
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.row_roofline import (
-    LawBook, StepSum, build_row_exprs, card_binding, comm_factor,
+    FloorForm, LawBook, StepSum, build_row_exprs, card_binding, comm_factor,
     evaluate_law, law_columns, read_row_law, RowCard)
 from tests.sweep_parity import REL, Deployment
 
@@ -529,3 +529,22 @@ def test_a_floor_form_collapses_proportional_terms_exactly():
         assert form.at(*floors) == pytest.approx(raw.at(*floors), rel=1e-15)
     assert FloorForm.from_json(json.loads(json.dumps(form.to_json()))) == form
     assert set(form.to_json()) == {"constant", "a", "b", "c", "n"}
+
+
+def test_a_termwise_form_prices_only_the_step_terms_it_is_asked():
+    """`FloorForm.terms_at`: the SOL of the named step terms alone at the
+    floors given; an index past the step's width, or a collapsed form
+    (whose terms are rays, not step terms), refuses."""
+    form = FloorForm.termwise([(0, (3.0, 0.0, 0.0, 0.0)),
+                               (2, (0.0, 1.0, 2.0, 0.0)),
+                               (5, (0.0, 0.0, 0.0, 0.0))], 6)
+    assert form.index == (0, 2)  # an all-zero term is left out
+    assert form.at(1.0, 1.0) == pytest.approx(3.0 + 3.0)
+    assert form.terms_at(1.0, 1.0, [0]) == pytest.approx(3.0)
+    assert form.terms_at(4.0, 1.0, [2, 5]) == pytest.approx(9.0)
+    assert form.terms_at(1.0, 1.0, []) == 0
+    assert FloorForm.from_json(form.to_json()) == form
+    with pytest.raises(ValueError):
+        form.terms_at(1.0, 1.0, [6])
+    with pytest.raises(ValueError):
+        FloorForm.collapsed(0.0, [(1.0, 0.0, 0.0, 0.0)]).terms_at(0, 0, [0])

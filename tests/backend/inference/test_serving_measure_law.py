@@ -7,6 +7,8 @@ import math
 import time
 import zlib
 from typing import Any
+
+import pytest
 from dataclasses import replace
 
 from backend.api._models import InferenceEstimateRequest
@@ -27,9 +29,16 @@ from backend.inference.sweep_grid import (
 )
 from backend.inference.serving_view import servingLawPointView
 from backend.measure.auto_sweep import (
+    blend,
     Folded, MEASURED, MISSING, PointMeasure, key_label,
 )
+from backend.inference.defaults import (COMM_LATENCY_US_DEFAULT,
+                                       LAUNCH_FLOOR_US_DEFAULT)
 from backend.inference.sol_law import (
+    FloorCard,
+    LawGraph,
+    cardBinding,
+    draftForwardsLaw,
     servingMeasureMatrix,
     servingMeasurePoint,
     servingLawPoint,
@@ -74,7 +83,7 @@ def without_anomaly_numbers(measure: dict[str, Any]) -> dict[str, Any]:
         None if value is None else {
             "anchor": value.get("anchor"),
             "dispatch": value.get("dispatch"),
-        } for value in point.inputs), aggregation_ids=())
+        } for value in point.inputs), aggregation_ids=(), sol=())
     return {**measure, "measure": point.to_json(),
             **({"terms": []} if "terms" in measure else {})}
 
@@ -159,6 +168,14 @@ def oracle(gpu: str):
         measure_points(
             [poolItem, directItem], selection_mode="latest",
             measurement_scope=bench.scope)
+    # The partial track is the one fact the two read differently: the
+    # direct walk blends its rows' SOL, the pool point leaves it to a
+    # reader's floors (`test_pool_partial_is_a_direct_walk_s_at_every_k`).
+    for item in (poolItem, directItem):
+        decode = item["sol"]["phases"]["decode"]
+        decode.pop("t_partial_s")
+        decode.pop("partial_measured_share")
+        decode["throughput"].pop("partial")
     same(poolItem["sol"], directItem["sol"])
     return record
 
@@ -166,7 +183,7 @@ def oracle(gpu: str):
 def test_pool_measured_points_match_a_direct_walk_on_two_card_classes():
     for gpu in ("H100-SXM", "B200"):
         record = oracle(gpu)
-        assert record["schema"] == "serving-law-v6"
+        assert record["schema"] == "serving-law-v7"
         assert "measurePoints" in record["phases"]["decode"]
 
 
@@ -230,7 +247,7 @@ def test_stored_measure_points_are_point_keys_after_json():
         record = _layout_law(
             (model, cards, 0.9, _GALLERY_PRECISION.canonical(),
              parallel.to_dict()))
-        assert record.get("schema") == "serving-law-v6", (model, record)
+        assert record.get("schema") == "serving-law-v7", (model, record)
         throughJson = json.loads(json.dumps(record))
         table = throughJson["phases"]["decode"]["measurePoints"]
         assert table["cardless"]
@@ -345,7 +362,7 @@ def test_offline_serving_projection_never_asks_point_keys(monkeypatch):
     record = _layout_law((MODEL, ["H100-SXM"], 0.9,
                           _GALLERY_PRECISION.canonical(),
                           PARALLEL.to_dict()))
-    assert record.get("schema") == "serving-law-v6", record
+    assert record.get("schema") == "serving-law-v7", record
     for module, name in ((law, "point_keys"), (overlay, "point_keys")):
         monkeypatch.setattr(
             module, name,
@@ -354,3 +371,89 @@ def test_offline_serving_projection_never_asks_point_keys(monkeypatch):
     out = gallery._restamp_layout(
         json.loads(json.dumps(record)), "H100-SXM", PARALLEL)
     assert out["theory"]
+
+
+MTP_MODEL = "XiaomiMiMo/MiMo-7B-RL"
+MTP_PARALLEL = ParallelConfig(tp_attention=2, tp_dense_ffn=2)
+
+
+def _gemmMissing(key):
+    return "missing" if key.signature == "gemm" else "measured"
+
+
+@pytest.mark.parametrize("draftTokens,speculative",
+                         [(3, True), (0, True), (0, False)])
+def test_pool_partial_is_a_direct_walk_s_at_every_k(draftTokens, speculative):
+    """The partial track by two roads at one point: the pool's (the record's
+    stored lookups at K, folded, then the measured terms priced off the
+    step's per-term floor form, `FloorForm.terms_at`, and blended,
+    `auto_sweep.blend`) and a direct estimate's (its own walk at K, the
+    measure's per-term SOL, `MatrixFold.partial`). Only gemm is missing, so
+    the blend is genuinely mixed. At K = 0 the record either carries a draft
+    (the Gallery's plain view of an MTP model: the law's terms run past the
+    plain step's, weighted 0) or does not."""
+    gpu, context, batch = "H100-SXM", 1024, 8
+    snapshot_config(MTP_MODEL)
+    spec = {} if not speculative else {
+        "speculative_draft_tokens": 1, "speculative_draft": "recursive",
+        "acceptance_rate": 0.7}
+    base = InferenceEstimateRequest(
+        model_id=MTP_MODEL, gpu_sku=gpu, avg_input_tokens=context,
+        avg_output_tokens=256, parallel=MTP_PARALLEL.to_dict(),
+        framework="vllm", selection_mode="theoretical_only")
+    record = servingLawRecord(
+        resolve_estimate_environment(base.model_copy(update=spec)),
+        gpu_sku=gpu, anchorContext=context, outputTokens=256,
+        parallel=MTP_PARALLEL, capacityCards=(gpu,),
+        capacityContexts=(context,), measureContexts=(context,),
+        measureBatchGrid=[{"decode_batch_size": batch}],
+        **({"draft_forwards": draftForwardsLaw} if speculative else {}))
+    pool = servingLawPointView(servingLawPoint(
+        record, card=Card.of(gpu), context=context, outputTokens=256,
+        decodeBatch=batch, prefillBatch=1, verifyWidth=draftTokens + 1,
+        draftTokens=draftTokens, acceptanceRate=0.7,
+        comm_latency_us=COMM_LATENCY_US_DEFAULT,
+        launch_floor_us=LAUNCH_FLOOR_US_DEFAULT))
+    poolMeasure = servingMeasurePoint(
+        record, card=Card.of(gpu), context=context, batch=batch,
+        draft_tokens=draftTokens)
+    pending = estimate_pending(**resolve_estimate_environment(
+        base.model_copy(update={
+            "decode_batch_size": batch,
+            **({"speculative_draft_tokens": draftTokens,
+                "speculative_draft": "recursive",
+                "acceptance_rate": 0.7} if draftTokens else {})})))
+    direct = pending.finish()
+    poolItem = {"sol": copy.deepcopy(pool), "measures": {"decode": poolMeasure}}
+    directItem = {"sol": servingLawPointView(direct),
+                  "measures": {"decode": pending.measures(direct)["decode"]}}
+    with FixtureBench(_gemmMissing) as bench:
+        measure_points([poolItem, directItem], selection_mode="envelope",
+                       measurement_scope=bench.scope, blend_terms=True)
+    poolDecode = poolItem["sol"]["phases"]["decode"]
+    directDecode = directItem["sol"]["phases"]["decode"]
+    assert poolDecode["t_partial_s"] is None  # the pool blends at the reader
+    assert poolDecode["measured_terms"] == directDecode["measured_terms"]
+    assert poolDecode["measured_part_s"] == pytest.approx(
+        directDecode["measured_part_s"], rel=1e-12)
+
+    graph = LawGraph.from_json(record["phases"]["decode"]["law"])
+    floorCard = FloorCard.of(record, Card.of(gpu),
+                             comm_latency_us=COMM_LATENCY_US_DEFAULT,
+                             launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+    point = {**cardBinding(record, Card.of(gpu),
+                           comm_latency_us=COMM_LATENCY_US_DEFAULT,
+                           launch_floor_us=LAUNCH_FLOOR_US_DEFAULT),
+             "B": batch, "s_input": context, "s_output": 256, "s_prefix": 0,
+             "s_verify": draftTokens + 1, "rho": 1}
+    form = graph.floorForm(point, floorCard)
+    assert form.at(*floorCard.floors_s) == pytest.approx(
+        directDecode["t_sol_s"], rel=1e-9)
+    blended = blend(
+        form.at(*floorCard.floors_s),
+        form.terms_at(*floorCard.floors_s, poolDecode["measured_terms"]),
+        poolDecode["measured_part_s"])
+    assert 0 < directDecode["partial_measured_share"] < 1
+    assert blended["t_s"] == pytest.approx(directDecode["t_partial_s"], rel=1e-9)
+    assert blended["measured_share"] == pytest.approx(
+        directDecode["partial_measured_share"], rel=1e-9)

@@ -71,7 +71,8 @@ import statistics
 import functools
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
+from typing import (Any, Callable, Dict, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 from backend.api._models import BatchPoint, InferenceEstimateSweepRequest
 from backend.api.estimate_env import resolve_estimate_environment
@@ -99,7 +100,7 @@ from backend.inference.batch_sweep import measure_points
 from backend.inference.capacity import point_served
 from backend.inference.card import Card
 from backend.measure import lookup as _measure_lookup
-from backend.measure.auto_sweep import DECLINED, STATES
+from backend.measure.auto_sweep import DECLINED, STATES, blend
 from backend.measure.lookup import MeasurementsUnavailable
 from backend.inference.defaults import (COMM_LATENCY_US_DEFAULT,
                                         GPU_MEMORY_FRACTION_DEFAULT,
@@ -168,8 +169,8 @@ pareto_front = _pareto_front
 # version): the entry, and what views read off it (the measured rates and a
 # drawn view). A drawing's fields change without the entry's, and an entry is
 # priced again only when its own do.
-_FRONTIER_SCHEMA = "gallery-frontier-v13"
-_DRAWING_SCHEMA = "gallery-frontier-drawing-v5"
+_FRONTIER_SCHEMA = "gallery-frontier-v14"
+_DRAWING_SCHEMA = "gallery-frontier-drawing-v6"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
 _GALLERY_PRECISION = AS_SHIPPED
@@ -570,7 +571,7 @@ def _public_entry(entry: dict) -> dict:
 
 
 def _at_view(item: dict, view: FrontierView,
-             ) -> Optional[dict]:
+             fold: Optional[Mapping[str, Any]] = None) -> Optional[dict]:
     """A theory point with its decode step under the view: the step as a
     function of the two floors (`FloorForm`) — the plain step's, or with
     K drafted tokens the speculative step's at that K — at the view's
@@ -582,7 +583,12 @@ def _at_view(item: dict, view: FrontierView,
     at the view's K (its projection failed, `draft_errors`), or under
     plain decode for a point stored from a K-step — a batch the draft's
     smaller capacity ceiling admits but plain decode does not. A plain
-    point stored without its form is not an entry of this schema."""
+    point stored without its form is not an entry of this schema.
+
+    `fold` is what the measured fold said of the point's step at the view's
+    K (`_measured_rates`): its measured total, which no floor moves, and the
+    partial track (`auto_sweep.blend`) — the measured terms' SOL read off the
+    form at the view's floors (`FloorForm.terms_at`)."""
     k = int(view.draft_tokens)
     sol = item["sol"]
     dec = dict(sol["phases"]["decode"])
@@ -599,7 +605,16 @@ def _at_view(item: dict, view: FrontierView,
                 f"frontier point {item.get('label')} at {item.get('seq')} "
                 "carries no step form: not a "
                 f"{_FRONTIER_SCHEMA} entry")
-    dec["t_sol_s"] = FloorForm.from_json(form).at(*view.floors_s())
+    stepForm = FloorForm.from_json(form)
+    dec["t_sol_s"] = stepForm.at(*view.floors_s())
+    if fold is not None:
+        dec["t_measured_s"] = fold["t_measured_s"]
+        partial = blend(dec["t_sol_s"],
+                        stepForm.terms_at(*view.floors_s(),
+                                          _terms(fold["measured_terms"])),
+                        fold["measured_part_s"])
+        dec["t_partial_s"] = partial["t_s"]
+        dec["partial_measured_share"] = partial["measured_share"]
     if k:
         binding = dict(dec["binding"])
         tokens, formula = step_tokens(
@@ -616,6 +631,21 @@ def _at_view(item: dict, view: FrontierView,
         dec, unique_tokens_multiplier=dec["throughput"]["groups"],
         num_gpus=dec["throughput"]["num_gpus"])
     return {**item, "sol": {**sol, "phases": {**sol["phases"], "decode": dec}}}
+
+
+def _termMask(terms: Sequence[int]) -> str:
+    """Step-term indices as a hex bit mask (bit k set: term k), the compact
+    form a fold keeps per point."""
+    mask = 0
+    for k in terms:
+        mask |= 1 << int(k)
+    return format(mask, "x")
+
+
+def _terms(mask: str) -> List[int]:
+    """`_termMask` read back."""
+    value = int(mask, 16)
+    return [k for k in range(value.bit_length()) if value >> k & 1]
 
 
 def _stepDraftTokens(dec: Mapping[str, Any]) -> int:
@@ -731,11 +761,14 @@ def _measured_rates(core: dict,
                     view: FrontierView,
                     scope: Any) -> dict:
     """What the measured fold (`batch_sweep.measure_points`) says of each
-    point of this view under `scope`, by the point's index in the entry: its
-    measured throughput (`rates`; absent for a point the fold publishes no
-    measured time for), and its decode coverage (`coverage`,
-    `_PointCoverage`). K selects this view's measure table; acceptance changes
-    the folded point's published throughput."""
+    point's step at the view's K under `scope`, by the point's index in the
+    entry (`rates`): its measured total (`t_measured_s`, None unless every
+    term is measured), which step terms are measured (`measured_terms`, a
+    `_termMask`) and the formula's share of them (`measured_part_s`) — and
+    its decode coverage (`coverage`, `_PointCoverage`). K selects this
+    view's measure table; no floor and no acceptance moves any of these, so
+    every view at that K reads them, and the view's floors and acceptance
+    enter where it draws (`_at_view`)."""
     index: List[int] = []
     items: List[dict] = []
     timings: Dict[str, Any] = {}
@@ -754,26 +787,20 @@ def _measured_rates(core: dict,
     total = time.monotonic()
     if items:
         measure_points(items, selection_mode=_GALLERY_SELECTION,
-                       measurement_scope=scope, timings=timings)
+                       measurement_scope=scope, timings=timings,
+                       blend_terms=True)
     timings["total_s"] = time.monotonic() - total
     rates: Dict[str, dict] = {}
     coverage = _PointCoverage()
     for i, item in zip(index, items, strict=True):
         dec = item["sol"]["phases"]["decode"]
-        meas = (dec.get("throughput") or {}).get("measured")
-        part = (dec.get("throughput") or {}).get("partial")
-        rate: Dict[str, Any] = {}
-        if meas and meas.get("time_per_output_token_s"):
-            rate["measured"] = {"time_per_output_token_s": meas["time_per_output_token_s"],
-                                "per_gpu": meas["per_gpu"]}
-        if part and part.get("time_per_output_token_s"):
-            rate["partial"] = {"time_per_output_token_s": part["time_per_output_token_s"],
-                               "per_gpu": part["per_gpu"]}
-            rate["partial_measured_share"] = dec.get("partial_measured_share")
-        if rate:
-            rates[str(i)] = rate
-        if "decode" in item["measures"]:
-            coverage.add(i, dec["coverage"])
+        if "measured_terms" not in dec:
+            raise MeasurementFoldMismatch(
+                f"the fold stated no measured terms for point {i}")
+        rates[str(i)] = {"t_measured_s": dec.get("t_measured_s"),
+                         "measured_terms": _termMask(dec["measured_terms"]),
+                         "measured_part_s": dec["measured_part_s"]}
+        coverage.add(i, dec["coverage"])
     timings.update(getattr(measureAt, "timings", {}))
     return {"rates": rates, "coverage": coverage.to_json(),
             "timings": timings}
@@ -870,7 +897,8 @@ def _draw(core: dict, view: FrontierView, state: str,
             batch_key=point.get("batch_key", "max"),
             draft_tokens=int(view.draft_tokens),
             acceptance=float(view.acceptance_rate), ep_load_factor=1.0)
-        item = _at_view(point, view)
+        item = _at_view(point, view,
+                        (rates or {}).get("rates", {}).get(str(i)))
         if item is None:
             records.append(CloudRecord.unanswered(
                 coordinates, "layout",
@@ -878,13 +906,6 @@ def _draw(core: dict, view: FrontierView, state: str,
                 token=i))
             continue
         dec = item["sol"]["phases"]["decode"]
-        rate = (rates or {}).get("rates", {}).get(str(i))
-        if rate is not None:
-            dec = {**dec,
-                   "throughput": {**dec["throughput"],
-                                  "measured": rate.get("measured"),
-                                  "partial": rate.get("partial")},
-                   "partial_measured_share": rate.get("partial_measured_share")}
         records.append(CloudRecord(
             coordinates=coordinates,
             estimate={"phases": {"decode": dec}},
@@ -1060,11 +1081,11 @@ class _Stored(NamedTuple):
     def rates_key(self, view: FrontierView, scope: Any) -> str:
         """The measured rates': the selection that picks each key's row
         (`_GALLERY_SELECTION`) is the fold's, and K selects a different
-        `PointMeasure` formula. Floors do not move a measured launch time;
-        acceptance is kept because the published rate changes with it."""
+        `PointMeasure` formula. Neither floors nor acceptance move what the
+        rates keep (step times and measured terms); a view's enter where it
+        draws (`_at_view`)."""
         return self._key("gallery-frontier-measured",
                          [*view.walk_parts(), int(view.draft_tokens),
-                          float(view.acceptance_rate) if view.draft_tokens else None,
                           _GALLERY_SELECTION], scope,
                          _DRAWING_SCHEMA)
 

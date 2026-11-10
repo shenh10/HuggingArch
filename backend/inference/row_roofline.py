@@ -1252,6 +1252,13 @@ class FloorForm:
     A pipelined step is the caller's to refuse."""
     constant: float
     terms: Tuple[Tuple[float, float, float, float], ...]
+    #: Each term's index among the step's terms (`StepSum.terms`, the
+    #: measured formula's), when the form keeps them apart (`termwise`);
+    #: empty for a `collapsed` form, whose terms are rays, not step terms.
+    index: Tuple[int, ...] = ()
+    #: How many step terms a `termwise` form is over (its all-zero ones
+    #: left out of `terms`); 0 for a `collapsed` form.
+    width: int = 0
 
     @classmethod
     def of(cls, rows: Iterable[Mapping[str, Any]], *, book: "LawBook",
@@ -1286,6 +1293,37 @@ class FloorForm:
             max(a, b + c * link_latency_s, n * launch_floor_s)
             for a, b, c, n in self.terms)
 
+    def terms_at(self, link_latency_s: float, launch_floor_s: float,
+                 steps: Iterable[int]) -> float:
+        """The SOL of the step terms `steps` names (indices into the
+        step's terms, `StepSum.terms`) at these floors: what the partial
+        track swaps out for their measured share (`auto_sweep.blend`).
+        Only a `termwise` form can say which of its terms a step term is,
+        and an index past its width is a step this form is not of."""
+        if not self.width:
+            raise ValueError("a collapsed form cannot tell its step terms apart")
+        wanted = set(steps)
+        stray = sorted(k for k in wanted if not 0 <= k < self.width)
+        if stray:
+            raise ValueError(f"step terms {stray[:5]} are not among this "
+                             f"form's {self.width}")
+        return sum(max(a, b + c * link_latency_s, n * launch_floor_s)
+                   for k, (a, b, c, n) in zip(self.index, self.terms, strict=True)
+                   if k in wanted)
+
+    @classmethod
+    def termwise(cls, terms: Iterable[Tuple[int, Tuple[float, float, float, float]]],
+                 width: int) -> "FloorForm":
+        """The form of a step's `width` terms, `(step-term index,
+        coefficients)` pairs each kept apart under its index so a reader
+        can price any of them alone (`terms_at`); terms with every
+        coefficient 0 are left out."""
+        kept = [(k, t) for k, t in terms if any(t)]
+        if any(not 0 <= k < width for k, _t in kept):
+            raise ValueError(f"a step term past the step's {width}")
+        return cls(0.0, tuple(t for _k, t in kept), tuple(k for k, _t in kept),
+                   int(width))
+
     @classmethod
     def collapsed(cls, constant: float,
                   terms: Iterable[Tuple[float, float, float, float]]
@@ -1296,7 +1334,8 @@ class FloorForm:
         ray of a term is its coefficients over its first nonzero one, as
         rationals (`Fraction` of each float), so only terms that are
         exactly proportional share one. The one constructor a builder
-        calls (`CardForm.bind`, `sol_law._FloorTerms.form`)."""
+        calls when its terms need not be told apart (`CardForm.bind`); a
+        form whose terms a reader prices one by one is `termwise`."""
         merged: Dict[Tuple[Fraction, ...], List[float]] = {}
         for term in terms:
             pivot = Fraction(next((x for x in term if x), 0.0))
@@ -1315,14 +1354,18 @@ class FloorForm:
         """Columnar: the constant and one array per coefficient."""
         return {"constant": self.constant,
                 **{name: [term[i] for term in self.terms]
-                   for i, name in enumerate("abcn")}}
+                   for i, name in enumerate("abcn")},
+                **({"index": list(self.index), "width": self.width}
+                   if self.width else {})}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> "FloorForm":
         return cls(float(d["constant"]), tuple(
             (float(a), float(b), float(c), float(n))
             for a, b, c, n in zip(d["a"], d["b"], d["c"], d["n"],
-                                  strict=True)))
+                                  strict=True)),
+            tuple(int(k) for k in d.get("index") or ()),
+            int(d.get("width") or 0))
 
 
 @dataclass(frozen=True)
@@ -1562,6 +1605,19 @@ class StepSum:
             lambda t, bound=bound: (times[id(t)].t_op
                                     if times[id(t)].bound == bound else 0.0))
             for bound in BOUNDS}
+
+    def term_laws(self, name: str = "t_op") -> List[sp.Expr]:
+        """Each term's own share of `law`, in term order: its run's weight
+        (`_groups`, the weighting `total` applies) times its row's `name`
+        law — the summands `law` adds, one per term of the measured formula
+        (`measured_law`), so a reader can price any of them alone."""
+        out: List[sp.Expr] = []
+        for weight, run in self._groups(False):
+            out.extend(lifted_law(t.row, name) if weight == 1
+                       else weight * lifted_law(t.row, name) for t in run)
+        if len(out) != len(self.terms):
+            raise ValueError("a step's runs do not hold each term once")
+        return out
 
     def law(self, name: str = "t_op", *, account: bool = False) -> sp.Expr:
         """The SOL total of the rows' `name` law over the batch and the card

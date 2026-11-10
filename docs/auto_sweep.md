@@ -385,22 +385,6 @@ unmeasured collective is `missing`, and so every multi-GPU layout has no
 measured total until its collectives are measured. This is the rule working:
 a step whose collectives are unmeasured has no measured step time.
 
-### 5.5 The partial track (opt-in)
-
-Beside the all-or-nothing total there is one separately named blend,
-`Folded.partial`: the step's SOL total with every fully measured row's SOL
-share replaced by its measured share. Because the SOL total and the measured
-formula are one aggregation (`StepSum.total` over `t_op` and over `n·T`), a
-row's SOL share is its term's weight times its `t_op_s`, so
-
-    t_partial = t_sol − Σ_{measured rows} w·t_op + Σ_{measured rows} share
-
-A row with any term not measured keeps its SOL time whole. The fold states
-`t_partial_s` and `partial_measured_share` (the measured part of it, by time)
-on each phase, and `throughput.partial`; at no coverage it is `t_sol_s`, at
-full coverage `t_measured_s`. It is never called measured: the page shows it
-only behind a "Partial measured" checkbox, always beside its coverage.
-
 `MeasuredTrack.coverage()` also reports `unchecked`: how many measured rows
 rest on a corpus row whose cross-check is not `passed` (typically no fp32
 reference could be built). Those rows are used, because refusing them would
@@ -586,6 +570,45 @@ measurements immediately; if not, their coverage panels progressively lose
 missing keys as uploads land.
 
 
+### 5.6 The partial track (opt-in)
+
+Beside the all-or-nothing total there is one separately named blend: the
+step's SOL total with every measured term's SOL share swapped for its
+measured share. The SOL total and the measured formula are one aggregation
+(`StepSum.total` over `t_op` and over `n·T`), so a term's SOL share is its
+weight times its SOL leaf, and
+
+    t_partial = t_sol − Σ_{measured terms} w·t_op + Σ_{measured terms} w·n·T
+
+`auto_sweep.blend` is that line and its one definition. Who holds the SOL
+of the measured terms supplies it:
+
+- **An estimate or a sweep point** has its rows priced at the point, so each
+  term's SOL leaf rides the measure (`PointMeasure.sol`, from the row's
+  `t_op_s`; through a chunked prefill's fold with its launches) and the fold
+  states `t_partial_s`, `partial_measured_share` (the measured part by time)
+  and `throughput.partial` itself (`MatrixFold.partial`).
+  A measure that states no SOL has no partial here.
+- **A pool point** (the Gallery) has its SOL as a function of the two floors
+  the reader picks, so the fold leaves `t_partial_s` empty and, asked for
+  them (`measure_points(blend_terms=True)`), states which step terms are
+  measured (`measured_terms`, positions in `StepSum.terms`) and the
+  formula's share of them (`measured_part_s`) — neither for a phase whose
+  time is withheld; the reader prices the measured terms off the point's
+  floor form at its own floors (`FloorForm.terms_at`). This works because the serving-law record names
+  every step term in its law graph (`term_<k>`, `StepSum.term_laws`; its
+  `t_sol_s` is their sum) and the floor form keeps each term under its
+  index and the step's width (`FloorForm.termwise`), the same index the
+  measured formula uses; an index past the width is refused. A plain step
+  of a record that carries a draft is the prefix of its terms (the draft's
+  weigh 0 at verify width 1). The Gallery's rates keep only these step
+  facts per K, so a view's floors and acceptance enter where it draws.
+
+At no coverage the blend is `t_sol_s`, at full coverage `t_measured_s`. It is
+never called measured: the page shows it only behind a "Partial measured"
+checkbox, always beside its coverage.
+
+
 ## 6. Response contract for the frontend
 
 The TypeScript types are in `web/src/measured.ts` (`MeasuredCoverage`,
@@ -601,7 +624,7 @@ measured track through that module.
   The page applies the rule itself (`completeTotal`), so a number is never
   drawn under incomplete coverage. Unknown coverage counts as incomplete.
 - **The partial track** (`t_partial_s`, `throughput.partial`, the Gallery's
-  `frontier_partial`) is the one blended number (§5.5). It is drawn only when
+  `frontier_partial`) is the one blended number (§5.6). It is drawn only when
   the reader ticks "Partial measured", under its own name, with
   `partialCoverageText`: the share of the step's time that is measured and
   "N / M ops measured".
@@ -647,8 +670,8 @@ list.
 | `/inference/estimate` `phases.<phase>` | `t_measured_s` (null unless complete), `coverage`, and the older `measured_rows` / `total_rows` (the page falls back to these, with no states, when `coverage` is absent) |
 | `/inference/estimate-sweep`, each point's `phases.<phase>` | The same after a measured fold; its SOL projection carries no breakdown row counts |
 | `/inference/estimate-parallel-sweep`, each chart point | `<phase>_tps_per_gpu_measured`, `<phase>_t_measured_s` (null unless complete), `<phase>_measured_coverage` |
-| `/inference/estimate` and sweep points, `phases.<phase>` | `t_partial_s`, `partial_measured_share`, `throughput.partial` (§5.5; absent until a measured fold reads) |
-| `/gallery/frontier`, each model | `frontier_partial` (every point with a SOL time; each carries `partial_measured_share`), `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
+| `/inference/estimate` and sweep points, `phases.<phase>` | `t_partial_s`, `partial_measured_share`, `throughput.partial` (§5.6; absent until a measured fold reads) |
+| `/gallery/frontier`, each model | `frontier_partial` (every point with a SOL time, blended at the view's floors and K; each carries `partial_measured_share`), `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
 | Per-op rows (`per_op_timing*`, `phases.<phase>.flops_by_module`) | `t_measured_s` (`0` on zero-cost rows, null where not measured), `measured_state`, `measured_key` |
 
 ## 7. Caching: theory and measured answers

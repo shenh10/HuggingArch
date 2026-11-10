@@ -53,9 +53,9 @@ from .sweep_grid import (
 from .batch_sweep import point_measures
 
 
-_lawOutputs = {
-    "t_sol_s": "t_op",
-}
+#: A step law's per-term outputs are `term_<k>`, k the step term's index
+#: (`StepSum.terms`, the measured formula's), each its share of `t_sol_s`.
+_TERM = "term_"
 _MEASURE_POINTS_SCHEMA = "measure-points-v7"
 
 # One draft law serves every speculative K: the request says which draft stack
@@ -243,11 +243,12 @@ class LawGraph:
 
     @classmethod
     def of(cls, exprs: Mapping[str, sp.Expr]) -> "LawGraph":
-        values = [_withoutITE(exprs[name]) for name in _lawOutputs]
+        names = list(exprs)
+        values = [_withoutITE(exprs[name]) for name in names]
         replacements, reduced = _csePreservingExtrema(values)
         outputs = {
             name: sp.sstr(value)
-            for name, value in zip(_lawOutputs, reduced, strict=True)
+            for name, value in zip(names, reduced, strict=True)
         }
         inputs = tuple(sorted(
             {symbol.name for expr in values for symbol in expr.free_symbols}))
@@ -269,13 +270,23 @@ class LawGraph:
                    tuple((name, text) for name, text in value["definitions"]),
                    dict(value["outputs"]))
 
+    def termOutputs(self) -> tuple[str, ...]:
+        """The step's term outputs (`term_0`, `term_1`, …), in term order:
+        each the term's share of `t_sol_s` (`StepSum.term_laws`)."""
+        count = sum(1 for name in self.outputs if name.startswith(_TERM))
+        if not count:
+            raise ValueError(
+                "the law names no step term: not a law of this schema")
+        return tuple(self.outputs[f"{_TERM}{k}"] for k in range(count))
+
     def floorForm(self, point: Mapping[str, Any],
-                  floorCard: "FloorCard", name: str = "t_sol_s") -> FloorForm:
-        """Output `name` at `point` on a card as a function of the two
-        floors (`_FloorTerms`): the one form every floor is substituted
-        into."""
+                  floorCard: "FloorCard") -> FloorForm:
+        """The step at `point` on a card as a function of the two floors,
+        each step term kept apart under its index (`_FloorTerms`,
+        `FloorForm.termwise`): the one form every floor is substituted
+        into, and the one a measured term is swapped out of."""
         return _floorTerms(self.inputs, self.definitions,
-                           self.outputs[name]).form(
+                           self.termOutputs()).form(
             point, floorCard.zero, floorCard.unit, self.inputs)
 
     def evaluate(self, binding: Mapping[str, Any]) -> dict[str, Any]:
@@ -299,23 +310,29 @@ class _FloorTerms:
     each arm is a row's compute, memory, collective or launch time, and
     only the last two read a floor — a collective's fixed time is its link
     traversals times the link latency (`COMM_LATENCY_S_<collective>`), a
-    launch is `LAUNCH_S`. This is that sum read off the law's own CSE graph,
+    launch is `LAUNCH_S`. This is that sum read off the law's own CSE graph
+    — one graph output per step term (`term_k`, `StepSum.term_laws`) —
     every weight and arm an output of one program over the graph's
-    definitions; `FloorForm` is it at one point with the floors left free.
-    Nothing here is a second statement of the law: a law whose floors sit
-    anywhere but an affine arm of a top-level term is refused."""
+    definitions; `FloorForm` is it at one point with the floors left free,
+    each step term under its own index. Nothing here is a second statement
+    of the law: a term whose floors sit anywhere but an affine arm of one
+    max is refused."""
     program: Any
     firstOutput: int
-    #: Floor-free terms: (weight output, value output).
-    constants: tuple[tuple[int, int], ...]
-    #: Per max term: its weight output and per arm (output, floor or None).
-    terms: tuple[tuple[int, tuple[tuple[int, Optional[str]], ...]], ...]
+    #: How many step terms the law names (`term_<k>` outputs).
+    width: int
+    #: Floor-free parts: (step term, weight output, value output).
+    constants: tuple[tuple[int, int, int], ...]
+    #: Per max: its step term, weight output and per arm (output, floor
+    #: or None).
+    terms: tuple[tuple[int, int, tuple[tuple[int, Optional[str]], ...]], ...]
 
     def form(self, point: Mapping[str, Any], zero: Mapping[str, float],
              unit: Mapping[str, float], inputs: Sequence[str]) -> FloorForm:
         """The step's `FloorForm` at `point` on the card `zero` / `unit`
         bind with both floors 0 and 1 s: each arm read at the two (it is
-        affine in its one floor), weighted."""
+        affine in its one floor), weighted, each step term apart
+        (`FloorForm.termwise`)."""
         at0 = self.program(*({**point, **zero}[n] for n in inputs))
         at1 = self.program(*({**point, **unit}[n] for n in inputs))
         base = self.firstOutput
@@ -323,11 +340,11 @@ class _FloorTerms:
         def read(values: Sequence[Any], index: int) -> float:
             return float(values[base + index])
 
-        constant = 0.0
-        for weight, value in self.constants:
-            constant += read(at0, weight) * read(at0, value)
-        terms: list[tuple[float, float, float, float]] = []
-        for weightIndex, arms in self.terms:
+        fixed: dict[int, float] = {}
+        for k, weight, value in self.constants:
+            fixed[k] = fixed.get(k, 0.0) + read(at0, weight) * read(at0, value)
+        maxed: dict[int, tuple[float, float, float, float]] = {}
+        for k, weightIndex, arms in self.terms:
             w = read(at0, weightIndex)
             if w < 0:
                 raise ValueError(
@@ -345,18 +362,24 @@ class _FloorTerms:
                         raise ValueError(
                             f"a launch arm is {v0} s with no launch floor")
                     n = w * v1
-            if c == 0 and n == 0:
-                constant += max(a, b)
-            else:
-                terms.append((a, b, c, n))
-        return FloorForm.collapsed(constant, terms)
+            if k in maxed:
+                raise ValueError(f"step term {k} adds two maxima")
+            maxed[k] = (a, b, c, n)
+        for k, value in fixed.items():
+            if value and k in maxed:
+                raise ValueError(
+                    f"step term {k} adds a floor-free part to a max of "
+                    "floored arms: not one term of a floor form")
+        return FloorForm.termwise(
+            ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
+             for k in sorted({*fixed, *maxed})), self.width)
 
 
 @memoize(maxsize=1024)
 def _floorTerms(inputs: tuple[str, ...],
                 definitions: tuple[tuple[str, str], ...],
-                output: str) -> _FloorTerms:
-    """`output`'s law split into `_FloorTerms` (its docstring)."""
+                outputs: tuple[str, ...]) -> _FloorTerms:
+    """The term outputs' laws split into `_FloorTerms` (its docstring)."""
     exprs: dict[str, sp.Expr] = {}
     local: set[str] = set()
     for name, text in definitions:
@@ -395,14 +418,15 @@ def _floorTerms(inputs: tuple[str, ...],
                        for value, cond in expr.args)
         return False
 
-    outputs: list[str] = []
+    emitted: list[str] = []
 
     def emit(expr: Any) -> int:
-        outputs.append(sp.sstr(expr))
-        return len(outputs) - 1
+        emitted.append(sp.sstr(expr))
+        return len(emitted) - 1
 
-    constants: list[tuple[int, int]] = []
-    terms: list[tuple[int, tuple[tuple[int, Optional[str]], ...]]] = []
+    constants: list[tuple[int, int, int]] = []
+    terms: list[tuple[int, int, tuple[tuple[int, Optional[str]], ...]]] = []
+    step = [0]
 
     def arm(expr: sp.Expr) -> tuple[int, Optional[str]]:
         kinds = floors(expr)
@@ -414,7 +438,7 @@ def _floorTerms(inputs: tuple[str, ...],
     def split(expr: sp.Expr, weight: tuple[sp.Expr, ...]) -> None:
         w = sp.Mul(*weight) if weight else sp.Integer(1)
         if not floors(expr):
-            constants.append((emit(w), emit(expr)))
+            constants.append((step[0], emit(w), emit(expr)))
         elif isinstance(expr, sp.Symbol) and expr.name in exprs:
             split(exprs[expr.name], weight)
         elif isinstance(expr, sp.Add):
@@ -433,17 +457,19 @@ def _floorTerms(inputs: tuple[str, ...],
                     1 for _i, kind in arms if kind == "launch_floor") > 1:
                 raise ValueError(
                     "a step term waits on one collective and one launch")
-            terms.append((emit(w), arms))
+            terms.append((step[0], emit(w), arms))
         else:
             # A term whose max SymPy folded to its one floored arm.
-            terms.append((emit(w), (arm(expr),)))
+            terms.append((step[0], emit(w), (arm(expr),)))
 
-    split(_read(output, frozenset(local)), ())
+    for k, output in enumerate(outputs):
+        step[0] = k
+        split(_read(output, frozenset(local)), ())
     program = _compiledGraph(
         inputs, definitions,
-        tuple((f"_floor{i}", text) for i, text in enumerate(outputs)))
-    return _FloorTerms(program, len(definitions), tuple(constants),
-                       tuple(terms))
+        tuple((f"_floor{i}", text) for i, text in enumerate(emitted)))
+    return _FloorTerms(program, len(definitions), len(outputs),
+                       tuple(constants), tuple(terms))
 
 
 def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
@@ -814,8 +840,12 @@ def _phase(rows: list[Mapping[str, Any]],
     draft_rows = tuple(draft_rows)
     step = StepSum.of(rows, draft_rows=draft_rows,
                       draft_forwards=draft_forwards)
+    # The step's time is its terms' sum, stated once: each term an output
+    # (`term_<k>`, what a reader prices one by one) and `t_sol_s` their sum.
+    terms = step.term_laws("t_op")
     graph = LawGraph.of({
-        wire: step.law(name) for wire, name in _lawOutputs.items()
+        "t_sol_s": sp.Add(*terms),
+        **{f"{_TERM}{k}": term for k, term in enumerate(terms)},
     })
     return {"law": graph.to_json(),
             "collectives": list(_collectives((*rows, *draft_rows))),

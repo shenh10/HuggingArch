@@ -294,6 +294,9 @@ def test_draft_rows_enter_the_collective_sidecar(monkeypatch):
         def law(self, _name):
             return 0
 
+        def term_laws(self, _name):
+            return []
+
     monkeypatch.setattr(
         sol_law.StepSum, "of",
         lambda *rows, **_kwargs: Step())

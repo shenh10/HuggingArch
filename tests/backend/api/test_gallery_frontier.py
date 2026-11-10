@@ -52,6 +52,11 @@ def test_the_frontier_keeps_only_points_nothing_beats_on_both_axes():
     assert f.pareto_front([]) == []
 
 
+def _one_term(t):
+    """A step of one term, `t` seconds at any floors."""
+    return FloorForm.termwise([(0, (t, 0.0, 0.0, 0.0))], 1).to_json()
+
+
 def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
                 speculative=False, measure_record=None):
     """A theory point as `_layout_points` stores it: its decode step, the
@@ -65,10 +70,10 @@ def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
            "throughput": {"groups": 1, "num_gpus": 2}}
     return {"seq": seq, "label": "TP2", "num_gpus": 2,
             "sol": {"phases": {"decode": dec}},
-            "floors": None if speculative else FloorForm(plain_s, ()).to_json(),
+            "floors": None if speculative else _one_term(plain_s),
             **({} if measure_record is None else
                 {"measureRecord": measure_record}),
-            "draft": {str(k): FloorForm(t, ()).to_json()
+            "draft": {str(k): _one_term(t)
                       for k, t in (drafts or {}).items()}}
 
 
@@ -81,6 +86,23 @@ def _inline_measures(monkeypatch):
             (point.get("measures") or {}).get("decode")))
 
 
+def _fold_into(dec, *, t_measured=None, part=0.0, terms=()):
+    """What the measured fold states of a point's step
+    (`batch_sweep.apply_measured(blend_terms=True)`): its measured total
+    (None unless every term is measured — then the one term of `_one_term`
+    is), which step terms are measured and their share."""
+    if t_measured is not None:
+        terms, part = (0,), t_measured
+    dec.update(t_measured_s=t_measured, measured_terms=list(terms),
+               measured_part_s=part)
+
+
+def _fold_nothing(items, **_kw):
+    """A fold that measures nothing: each point's coverage as it stood."""
+    for item in items:
+        _fold_into(item["sol"]["phases"]["decode"])
+
+
 def _serving_law_record(*, max_batch=100, draft_max_batch=None,
                         speculative=False, measure=False):
     """A minimal current serving-law record: a real law graph (so projection
@@ -88,7 +110,8 @@ def _serving_law_record(*, max_batch=100, draft_max_batch=None,
     graph = {
         "inputs": ["B", "s_input", "s_verify"],
         "definitions": [],
-        "outputs": {"t_sol_s": "s_input*s_verify/1000000000000"},
+        "outputs": {"t_sol_s": "s_input*s_verify/1000000000000",
+                    "term_0": "s_input*s_verify/1000000000000"},
     }
     return {
         "schema": f.walkRecordSchema,
@@ -314,6 +337,7 @@ def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
         for item in items:
             item["sol"]["phases"]["decode"]["coverage"] = {
                 "measured": 1, "total": 1}
+            _fold_into(item["sol"]["phases"]["decode"], t_measured=0.02)
 
     monkeypatch.setattr(f, "measure_points", fold)
     for view, want in ((f.FrontierView("B200"), {1, 2}),
@@ -452,11 +476,7 @@ def test_measured_rows_fold_onto_the_frontier(monkeypatch):
     def apply(items, **_kw):
         for it in items:
             dec = it["sol"]["phases"]["decode"]
-            dec["throughput"]["measured"] = {
-                "time_per_output_token_s": 0.02, "per_gpu": 50.0}
-            dec["throughput"]["partial"] = {
-                "time_per_output_token_s": 0.025, "per_gpu": 40.0}
-            dec["partial_measured_share"] = 0.75
+            _fold_into(dec, t_measured=0.02)
             dec["coverage"] = {"measured": 3, "total": 3}
 
     monkeypatch.setattr(f, "measure_points", apply)
@@ -469,16 +489,49 @@ def test_measured_rows_fold_onto_the_frontier(monkeypatch):
     }, f.FrontierView("B200"))
     assert "_theory" not in out
     pt = out["frontier"][sk][0]
-    assert pt["tok_s_per_user"] == 100.0
-    assert pt["tok_s_per_user_measured"] == 50.0
-    assert pt["tok_s_per_gpu_measured"] == 50.0
+    assert pt["tok_s_per_user"] == pytest.approx(100.0)
+    # One token per step over the measured 20 ms, on 2 GPUs.
+    assert pt["tok_s_per_user_measured"] == pytest.approx(50.0)
+    assert pt["tok_s_per_gpu_measured"] == pytest.approx(25.0)
     meas = out["frontier_measured"][sk][0]
-    assert meas["tok_s_per_user_measured"] == 50.0
-    # The partial track rides the same point, with its measured share.
-    part = out["frontier_partial"][sk][0]
-    assert part["tok_s_per_user_partial"] == 40.0
-    assert part["tok_s_per_gpu_partial"] == 40.0
-    assert part["partial_measured_share"] == 0.75
+    assert meas["tok_s_per_user_measured"] == pytest.approx(50.0)
+
+
+def test_the_partial_track_swaps_measured_terms_at_the_view_s_floors(
+        monkeypatch):
+    """The partial frontier: the point's step form with the fold's measured
+    terms' SOL swapped for their measured share (`auto_sweep.blend`,
+    `FloorForm.terms_at`), at the view's floors — another floor moves the
+    SOL terms left, never the measured share."""
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope",
+                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+
+    def apply(items, **_kw):
+        for it in items:
+            dec = it["sol"]["phases"]["decode"]
+            _fold_into(dec, part=0.009, terms=(0,))
+            dec["coverage"] = {"measured": 1, "total": 2,
+                               "states": {"missing": ["k"]}}
+
+    monkeypatch.setattr(f, "measure_points", apply)
+    _inline_measures(monkeypatch)
+    sk = str(GALLERY_SEQ_LENS[0])
+    item = _timed_item(sk, batch=1)
+    # Term 0 compute-bound (6 ms), term 1 launch-bound: 2 launches.
+    item["floors"] = FloorForm.termwise(
+        [(0, (0.006, 0.0, 0.0, 0.0)), (1, (0.001, 0.0, 0.0, 2.0))], 2).to_json()
+    entry = {"model_id": "m", "frontier": {}, "layouts": [], "error": None,
+             "_theory": [{**item, "measures": {"decode": {}}}]}
+    for launch_us, sol_s in ((1.0, 0.007), (3000.0, 0.012)):
+        out = f._read_entry(entry, f.FrontierView(
+            "B200", launch_floor_us=launch_us))
+        pt = out["frontier_partial"][sk][0]
+        partial_s = 0.009 + (sol_s - 0.006)
+        assert out["frontier"][sk][0]["tpot_s"] == pytest.approx(sol_s)
+        assert pt["tpot_partial_s"] == pytest.approx(partial_s)
+        assert pt["partial_measured_share"] == pytest.approx(0.009 / partial_s)
+        assert out["frontier_measured"][sk] == []
 
 
 def test_the_measured_fold_does_not_walk(monkeypatch):
@@ -489,7 +542,7 @@ def test_the_measured_fold_does_not_walk(monkeypatch):
                         lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
     monkeypatch.setattr(f, "_layout_law", lambda *_a, **_k: (_ for _ in ()).throw(
         AssertionError("walked")))
-    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
+    monkeypatch.setattr(f, "measure_points", _fold_nothing)
     _inline_measures(monkeypatch)
     sk = str(GALLERY_SEQ_LENS[0])
     f._read_entry({
@@ -504,7 +557,7 @@ def test_incomplete_measured_coverage_does_not_publish_tok_s(monkeypatch):
     from backend.measure.scope import MeasurementScope
     monkeypatch.setattr(f, "_frontier_scope",
                         lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
-    monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
+    monkeypatch.setattr(f, "measure_points", _fold_nothing)
     _inline_measures(monkeypatch)
     sk = str(GALLERY_SEQ_LENS[0])
     item = _timed_item(sk, batch=1)
@@ -596,6 +649,7 @@ def test_one_fold_reads_each_measure_record_once(monkeypatch):
         for item in items:
             item["sol"]["phases"]["decode"]["coverage"] = {
                 "measured": 1, "total": 1}
+            _fold_into(item["sol"]["phases"]["decode"], t_measured=0.05)
 
     monkeypatch.setattr(f, "measure_points", apply)
     view = f.FrontierView("B200")
@@ -678,8 +732,7 @@ def _kept(monkeypatch, tmp_path, *, state="reads"):
     def apply(items, **_kw):
         folds.append(len(items))
         for it in items:
-            it["sol"]["phases"]["decode"]["throughput"]["measured"] = {
-                "time_per_output_token_s": 0.05, "per_gpu": 20.0}
+            _fold_into(it["sol"]["phases"]["decode"], t_measured=0.05)
             it["sol"]["phases"]["decode"]["coverage"] = {"measured": 1, "total": 1}
     monkeypatch.setattr(f, "measure_points", apply)
     return entries, reads, folds
@@ -725,9 +778,9 @@ def test_a_kept_view_is_read_without_its_entry(monkeypatch, tmp_path):
 
 def test_floors_reuse_the_fold_and_each_k_folds_its_own_formula(
         monkeypatch, tmp_path):
-    """Another floor or K draws off the entry's first part. Floors reuse the
-    plain measured rates; each K (and acceptance, which changes the published
-    rate) has its own fold under the same Kernel Bench snapshot."""
+    """Another floor or K draws off the entry's first part. Floors and
+    acceptance reuse a K's measured rates (step times, which neither
+    moves); each K has its own fold under the same Kernel Bench snapshot."""
     _entries, reads, folds = _kept(monkeypatch, tmp_path)
     real_reader = f._measureReader
     record_reads: list = []
@@ -744,7 +797,8 @@ def test_floors_reuse_the_fold_and_each_k_folds_its_own_formula(
     stored = f._Stored(model, "v1")
     cases = ((f.FrontierView("B200", comm_latency_us=5.0), 0),
              (f.FrontierView("B200", draft_tokens=1), 1),
-             (f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.6), 1))
+             (f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.6), 1),
+             (f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.9), 0))
     for view, reader_reads in cases:
         reads.clear()
         got = f._frontier_read(model, view)
@@ -884,13 +938,22 @@ def _read_folded(monkeypatch, items):
             cov = it["measures"]["decode"]["coverage"]
             dec = it["sol"]["phases"]["decode"]
             dec["coverage"] = cov
-            if cov["measured"] == cov["total"]:
-                tpot = dec["throughput"]["sol"]["time_per_output_token_s"]
-                dec["throughput"]["measured"] = {
-                    "time_per_output_token_s": tpot * 2,
-                    "per_gpu": dec["throughput"]["sol"]["per_gpu"] / 2}
+            tpot = dec["throughput"]["sol"]["time_per_output_token_s"]
+            _fold_into(dec, t_measured=(tpot * 2 if cov["measured"] == cov["total"]
+                                        else None))
+
+    def at_view(item, _view, fold=None):
+        """The point as stored, its measured rate off the fold's time."""
+        t = (fold or {}).get("t_measured_s")
+        if t is None:
+            return item
+        dec = item["sol"]["phases"]["decode"]
+        batch = dec["batch"]
+        return {**item, "sol": {"phases": {"decode": {**dec, "throughput": {
+            **dec["throughput"], "measured": {
+                "time_per_output_token_s": t, "per_gpu": batch / t}}}}}}
     monkeypatch.setattr(f, "measure_points", apply)
-    monkeypatch.setattr(f, "_at_view", lambda item, view, laws=None: item)
+    monkeypatch.setattr(f, "_at_view", at_view)
     return f._read_entry({"model_id": "m", "layouts": [], "error": None,
                           "_theory": items}, f.FrontierView("B200"))
 
@@ -1019,8 +1082,7 @@ def test_a_fold_the_lake_drops_mid_request_draws_sol_only(
         folds.append(len(items))
         for it in items:
             dec = it["sol"]["phases"]["decode"]
-            dec["throughput"]["measured"] = {
-                "time_per_output_token_s": 0.05, "per_gpu": 20.0}
+            _fold_into(dec, t_measured=0.05)
             dec["coverage"] = {"measured": 1, "total": 1}
 
     monkeypatch.setattr(f, "measure_points", apply)

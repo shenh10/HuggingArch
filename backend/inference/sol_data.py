@@ -27,8 +27,10 @@ from backend.measure.scope import ResultIdentity, of_walk
 #: it — one name for both. v2 named the card it was walked on (`walked_on`)
 #: and made a bundle one walk class's (`ServingWalkKey`). v3 made a record a
 #: real CSE graph. v4 carries the serving capacity view and the effective
-#: parallel config beside that graph.
-walkRecordSchema = "serving-law-v6"
+#: parallel config beside that graph. v7 names each step term in the graph
+#: (`term_<k>`): the decode floor form is kept per term, so a reader can
+#: swap a measured term out of it (`auto_sweep.blend`).
+walkRecordSchema = "serving-law-v7"
 servingContexts = tuple(ROUTINE_SEQ_LENS)
 defaultPrefillChunkSize = 8192
 

@@ -14,7 +14,7 @@ hide behind an exact-key sum.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,11 @@ class ChunkLaunchTerm:
     inputs: Any = None
     context: Any = None
     cadence: Any = 1
+    #: The term's SOL over its `launches`, one occurrence before the
+    #: formula's weight (`PointMeasure.sol` times the chunk's repetition),
+    #: or None when the chunk's measure states none. Summed with the
+    #: launches it rides: like them, a count of the same law.
+    sol: Optional[float] = None
 
 
 def _same_chunk_term_semantics(left: ChunkLaunchTerm,
@@ -82,6 +87,8 @@ def merge_chunk_launch_terms(
         out.append(ChunkLaunchTerm(
             key=key,
             launches=sum(term.launches for term in group),
+            sol=(None if any(term.sol is None for term in group)
+                 else sum(term.sol for term in group)),
             formula_weight=first.formula_weight,
             zero_cost=first.zero_cost,
             inputs=first.inputs,

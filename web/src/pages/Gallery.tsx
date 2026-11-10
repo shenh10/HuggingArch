@@ -617,10 +617,10 @@ export function Gallery() {
         ?? (front != null && !frontStale ? "no model serves this context on this GPU" : undefined)}
       stale={frontStale ? <span>Showing {front?.gpuSku} — {frontFailed ?? (frontState.phase === "loading" ? frontWaitingText : null)}</span> : undefined}
       title={`Decode Pareto frontier — ${fmtSeqLabel(Number(decCtx))} context · ${front?.gpuSku ?? gpuSku}`}
-      subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better. ${frontDraft
-        ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request. Solid is SOL; dashed is measured where Kernel Bench covers this speculative step.`
-        : ` Solid is SOL; dashed is measured where Kernel Bench covers the step.${partialOn
-          ? " Dotted is partial measured: measured ops at their measured time, the rest at SOL — hover a point for the share of its time that is measured." : ""}`}`}
+      subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better.${frontDraft
+        ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request.`
+        : ""} Solid is SOL; dashed is measured where Kernel Bench covers the step.${partialOn
+          ? " Dotted is partial measured: measured ops at their measured time, the rest at SOL — hover a point for the share of its time that is measured." : ""}`}
       controls={<Tabs options={decodeTabs} value={decCtx} onChange={setDecCtx} idPrefix="g-dec-tab" />}
       series={frontierSeries}
       height={500}
@@ -866,7 +866,7 @@ export function Gallery() {
               onBlur={applyFloors}
               onKeyDown={(e) => { if (e.key === "Enter") applyFloors(); }} />
           </label>
-          <label className="flex items-center gap-1.5 text-xs pb-2" title="Partial measured: each op Kernel Bench has measured at its measured time, every other op at its SOL time. Drawn dotted; each point says how much of its time is real measurement. Plain decode only.">
+          <label className="flex items-center gap-1.5 text-xs pb-2" title="Partial measured: each op Kernel Bench has measured at its measured time, every other op at its SOL time. Drawn dotted; each point says how much of its time is real measurement.">
             <input id="g-partial-on" type="checkbox" checked={partialOn} onChange={(e) => setPartialOn(e.target.checked)} />
             <span className="font-medium text-gray-600">Partial measured</span>
           </label>

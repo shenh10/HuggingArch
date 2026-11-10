@@ -404,7 +404,9 @@ def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
                                            comm["dtype_bytes"])
                        if comm and breakdown else None)))
         else:
+            # Not priced here: no time of the anchor's stands at this point.
             row["t_sol_s"] = 0.0
+            row.pop("t_op_s", None)
         if moved:
             row.update(_shape_columns_at(read, r))
             if point.get("routed") is not None:
@@ -758,11 +760,15 @@ def step_measure(step: StepSum, keyed: Mapping[int, Any], where: Mapping[int, st
     text, _symbols = written[shape]
     keys, launches, unkeyed, labels = ([] for _ in range(4))
     reasons, aggregation_ids, inputs, zero, terms = ([] for _ in range(5))
-    cadences = []
+    cadences, sol = [], []
     for t in step.terms:
         z = t.zero_cost()
         point = keyed.get(id(t.row))
         zero.append(z)
+        # The term's SOL leaf, as the SOL total adds it (`t_op_s`); a row
+        # priced without its times (a pool's key table) states none.
+        own = t.row.get("t_op_s") if point is not None else None
+        sol.append(None if own is None else float(own))
         if point is None:
             keys.append(None)
             launches.append(0.0)
@@ -802,7 +808,8 @@ def step_measure(step: StepSum, keyed: Mapping[int, Any], where: Mapping[int, st
         MeasuredFormula(text, tuple(zero)),
         context={"gpu": gpu_sku, "framework": framework},
         inputs=tuple(inputs),
-        aggregation_ids=tuple(aggregation_ids))
+        aggregation_ids=tuple(aggregation_ids),
+        sol=tuple(sol) if any(v is not None for v in sol) else ())
     return {"measure": measure if as_object else measure.to_json(),
             "terms": terms,
         **({"cadences": tuple(cadences)} if include_cadence else {})}
@@ -976,14 +983,17 @@ def fold_chunk_point_measures(chunk_map: Mapping[str, Any],
                     inputs=(measure.inputs[term_index] if measure.inputs else None),
                     context=(measure.contexts[term_index]
                              if measure.contexts else context),
-                    cadence=cadences[term_index]),
+                    cadence=cadences[term_index],
+                    sol=(None if not measure.sol
+                         or measure.sol[term_index] is None
+                         else float(measure.sol[term_index]) * repeat)),
                 measure_chunk, term_index, term_index))
 
     merged = merge_chunk_launch_terms(term for term, *_ in records)
     keys, launches, unkeyed, labels = ([] for _ in range(4))
     reasons, aggregation_ids, inputs, zero, terms = ([] for _ in range(5))
     text_parts: List[str] = []
-    contexts = []
+    contexts, sol = [], []
     # Match each result back to the first source record.  Unsafe groups retain
     # their own records term-for-term; safe groups intentionally collapse to
     # the first graph-row provenance.
@@ -1011,6 +1021,7 @@ def fold_chunk_point_measures(chunk_map: Mapping[str, Any],
         zero.append(out.zero_cost)
         terms.append(measure_chunk["terms"][measure_term])
         contexts.append(out.context)
+        sol.append(out.sol)
         if not out.zero_cost:
             base = f"n_{out_index}*T_{out_index}"
             text_parts.append(base if out.formula_weight == 1
@@ -1022,29 +1033,10 @@ def fold_chunk_point_measures(chunk_map: Mapping[str, Any],
                                             tuple(zero)),
             context=contexts[0] if contexts else None,
             inputs=tuple(inputs), contexts=tuple(contexts),
-            aggregation_ids=tuple(aggregation_ids)).to_json(),
+            aggregation_ids=tuple(aggregation_ids),
+            sol=tuple(sol) if any(v is not None for v in sol) else ()).to_json(),
         "terms": terms,
     }
-
-
-def measures_on_card(measures: Mapping[str, Mapping[str, Any]],
-                     gpu_sku: str) -> Dict[str, Dict[str, Any]]:
-    """A point's measures (`point_measures`) as the same rows on `gpu_sku`
-    state them: every key's card (`Key.gpu`) and the selection's card
-    (`step_measure`'s context) are `gpu_sku`'s; the shapes, dtype
-    environments, launches and formula are the rows' own, which a card of
-    the walk's class (`framework_bindings.card_class`) walks alike."""
-    out: Dict[str, Dict[str, Any]] = {}
-    for phase, m in measures.items():
-        pm = PointMeasure.from_json(m["measure"])
-        pm = replace(pm, keys=tuple(None if k is None else k._replace(gpu=gpu_sku)
-                                    for k in pm.keys),
-                     context={**(pm.context or {}), "gpu": gpu_sku},
-                     contexts=tuple(
-                         {**(context or {}), "gpu": gpu_sku}
-                         for context in pm.contexts))
-        out[phase] = {**m, "measure": pm.to_json()}
-    return out
 
 
 def selector(registry: Any, *, strategy: str,
@@ -1172,22 +1164,20 @@ def _measured_table(modules: List[Dict[str, Any]],
     return out
 
 
-def _row_sol(rows: Sequence[Mapping[str, Any]],
-             terms: Mapping[Any, Sequence[int]]
-             ) -> List[Tuple[Sequence[int], float]]:
-    """Each folded row's terms and its SOL time (`t_op_s`), what
-    `Folded.partial` blends."""
-    return [(terms[r["uid"]], float(r.get("t_op_s") or 0.0))
-            for r in rows if r.get("uid") in terms]
-
-
 def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, Any]],
-                   folds: Mapping[str, MatrixFold]) -> Dict[str, Any]:
+                   folds: Mapping[str, MatrixFold], *,
+                   blend_terms: bool = False) -> Dict[str, Any]:
     """`point` with its measured track, from the record-level matrix row.
 
     Each phase's fold is the same matrix path whether it has one Inference
     point or is one row of a Gallery record; this function only unfolds the
-    row into the response shapes that point asks for."""
+    row into the response shapes that point asks for.
+
+    `blend_terms` is for a reader that blends the partial track at its own
+    floors (a pool point, `FloorForm.terms_at`): each phase also states which
+    step terms are measured (`measured_terms`, positions in `StepSum.terms`)
+    and the formula's share of them (`measured_part_s`) — none for a phase
+    whose time is withheld."""
     for phase, m in measures.items():
         folded = folds[phase]
         track = folded.track
@@ -1208,8 +1198,7 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
                     parent: folded.subtotal(
                         _terms_of_rows(entry["per_op_timing"], indices, terms))
                 for parent, indices in declaration_terms(entry["per_op_timing"])}
-            partial = folded.partial(_row_sol(entry["per_op_timing"], terms),
-                                     entry.get("t_sol"))
+            partial = folded.partial(entry.get("t_sol"))
             entry.update(t_measured=track.t_s, coverage=track.coverage(),
                          t_partial=None if partial is None else partial["t_s"],
                          partial_measured_share=(None if partial is None
@@ -1239,16 +1228,16 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
             draft["t_measured_s"] = draft_share
             draft["per_forward"]["t_measured_s"] = (None if draft_share is None
                                                     else draft_share / forwards)
-        partial = None if withheld else folded.partial(
-            (row for name, terms in by_list.items()
-             for row in _row_sol(point.get(name) or [], terms)),
-            ph.get("t_sol_s"))
+        partial = None if withheld else folded.partial(ph.get("t_sol_s"))
         ph.update({"t_measured_s": None if withheld else track.t_s,
                    "t_partial_s": None if partial is None else partial["t_s"],
                    "partial_measured_share": (None if partial is None
                                               else partial["measured_share"]),
                    "measured_rows": track.measured_rows, "total_rows": track.total_rows,
                    "coverage": track.coverage()})
+        if blend_terms and not withheld:
+            ph.update(measured_terms=list(folded.measured_terms),
+                      measured_part_s=folded.measured_s)
         if "flops_by_module" in ph:
             modules = _measured_table(ph["flops_by_module"],
                                       by_list.get(main, {}), folded)
@@ -1317,8 +1306,10 @@ def measure_points(points: List[Dict[str, Any]], *, selection_mode: str,
                    measurement_scope: Any = None,
                    calibration_rows: Optional[list] = None,
                    kernel_mix: Optional[Mapping[str, str]] = None,
-                   timings: Optional[Dict[str, Any]] = None) -> None:
+                   timings: Optional[Dict[str, Any]] = None,
+                   blend_terms: bool = False) -> None:
     """Fold every point's measured totals through one record-level matrix.
+    `blend_terms`: `apply_measured`'s.
 
     A canonical Gallery reference names a row of an already-record matrix; a
     live Inference `PointMeasure` becomes a one-row matrix here. Selection,
@@ -1374,6 +1365,7 @@ def measure_points(points: List[Dict[str, Any]], *, selection_mode: str,
     for pt, phase, m, row, record_matrix in pending:
         if record_matrix is not None:
             row += offsets[id(record_matrix)]
-        apply_measured(pt["sol"], {phase: m}, {phase: folds[row]})
+        apply_measured(pt["sol"], {phase: m}, {phase: folds[row]},
+                       blend_terms=blend_terms)
     if timings is not None:
         timings["apply_measured_s"] = time.perf_counter() - started

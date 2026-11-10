@@ -3,6 +3,8 @@ measured track and its coverage, the measured formula, substitution at a
 point, a point's measure folded over a selection, and one walk per cell."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from backend.measure import auto_sweep as A
@@ -226,3 +228,26 @@ def test_one_walk_per_cell_in_order():
         return [fn(c) for c in items]
     assert A.walk_cells(_double, cells, mapper=mapper) == [[2, 4], [3]]
     assert calls == [2]
+
+
+def test_the_partial_swaps_each_measured_term_s_sol_for_its_measurement():
+    """`Folded.partial`: the SOL total with each measured term's weighted
+    SOL swapped for its measured share; a measure that states no SOL for
+    a measured term (a pool point) leaves the blend to its reader."""
+    from backend.measure.auto_sweep import Folded, MeasuredFormula, PointMeasure
+    from backend.measure.lookup import Key
+    key = Key("gemm", "{}", "{}", "H100", "decode")
+    measure = PointMeasure(
+        (key, key), (1.0, 2.0), (None, None), ("a", "b"), ("", ""),
+        MeasuredFormula("n_0*T_0 + 3*n_1*T_1", (False, False)),
+        sol=(0.010, 0.004))
+    folded = Folded(measure, (("measured", 0.012, "a", None),
+                              ("missing", None, "b", None)), (0.012, None))
+    t_sol = 0.010 + 3 * 0.004
+    got = folded.partial(t_sol)
+    assert got["t_s"] == pytest.approx(0.012 + 3 * 0.004)
+    assert got["measured_s"] == pytest.approx(0.012)
+    assert folded.measured_terms == (0,)
+    pool = Folded(replace(measure, sol=()), folded.rows, folded.times)
+    assert pool.partial(t_sol) is None
+    assert pool.measured_s == pytest.approx(0.012)
