@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Probe /health memory
         env:
-          HEALTH_URL: https://huggingarch.com/health
+          HEALTH_URL: https://www.huggingarch.com/health
           MAX_USED_PCT: "85"
         run: |
           set -euo pipefail
