@@ -155,9 +155,10 @@ def test_the_service_down_is_503_for_estimates_and_bench_only(client, wired, ben
 def test_uploads_and_promotions_never_move_a_theory_key(wired, monkeypatch, measurable_rows):
     """A theory-only result reads no measurements, so no key it is cached or
     joined under carries a scope element: a private upload, a public upload
-    and a promotion leave every theory key — the estimate's single-flight,
-    both sweeps' cache keys, the gallery's decode frontier — as it
-    was, while the measured keys of the same requests move
+        and a promotion leave every theory key — the estimate's single-flight,
+        both sweeps' cache keys, the gallery's SOL entry — as it
+        was, while the measured keys of the same requests (including a
+        speculative Gallery view's K-aware fold) move
     (docs/measured_calibration.md §7.1)."""
     import asyncio
 
@@ -186,17 +187,17 @@ def test_uploads_and_promotions_never_move_a_theory_key(wired, monkeypatch, meas
         return out
 
     def frontier_keys():
-        # The frontier's theory keys: the entry (its points name the pool
-        # records their measure keys live in), and a speculative view's
-        # drawing, whose measured track is off (`_view_scope`). A plain view's
-        # measured rates and drawing are keyed on the shared rows' scope and
-        # may move.
-        stored, view = _Stored(MODEL, "rv"), FrontierView("B200")
-        spec = FrontierView("B200", draft_tokens=1)
-        return [stored.entry_key(view),
-                stored.view_key(spec, *_view_scope(spec))]
+        # The frontier entry is theory-only: its points name the pool records
+        # where each view's measured keys live. A speculative drawing is now a
+        # measured consumer and is checked separately below.
+        return [_Stored(MODEL, "rv").entry_key(FrontierView("B200"))]
+
+    def speculative_key():
+        view = FrontierView("B200", draft_tokens=1)
+        return _Stored(MODEL, "rv").view_key(view, *_view_scope(view))
 
     frontier0 = frontier_keys()
+    speculative0 = speculative_key()
     theory0, measured0 = keys(prefer_measured=False), keys()
     (a, b) = measurable_rows
     _upload(wired, ALICE, [{**a["row"], "contributor": "alice"}])            # private
@@ -208,5 +209,6 @@ def test_uploads_and_promotions_never_move_a_theory_key(wired, monkeypatch, meas
     _upload(wired, ADMIN, [{**b["row"], "contributor": "pub"}], public=True)  # public
     assert keys(prefer_measured=False) == theory0
     assert frontier_keys() == frontier0
+    assert speculative_key() != speculative0
     measured1 = keys()
     assert all(x != y for x, y in zip(measured1, measured0, strict=True))

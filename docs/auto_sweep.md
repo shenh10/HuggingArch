@@ -300,18 +300,21 @@ bf16-only check could not have caught the divergence.)
 
 A sweep makes **one** Kernel Bench lookup for the union of every point's keys:
 
-1. each point carries its `PointMeasure`s (plain data, no selection inside);
-2. `batch_sweep.measured_selector` resolves whether the request reads
-   measurements at all (`calibration_overlay._resolve_overlay_context`: a
-   theory mode, or no scope and no posted rows, reads none), collects
-   `auto_sweep.sweep_keys`, calls `auto_sweep.look_up` once, builds the
-   registry (`op_calibration.registry_from_lookup`), and merges the request's
-   own `calibration_rows` over it;
-3. `batch_sweep.measure_points` folds each point's measures through that
-   selection (`PointMeasure.fold`) and applies the result
-   (`batch_sweep.apply_measured`): each row's own time, each module group's
-   and declaration parent's share, the phase total and coverage, the draft's
-   share, the measured throughputs.
+1. a canonical Gallery point names a row of a record-level
+   `MeasureMatrix`; a live Inference or Scaling point becomes a one-row (or
+   small dense) matrix at the fold boundary, so there is one path at both
+   granularities;
+2. `batch_sweep._measured_selector_for` resolves whether the request reads
+   measurements, collects the matrix's distinct `(key, context, op, input)`
+   questions, calls `auto_sweep.look_up` once, builds the registry
+   (`op_calibration.registry_from_lookup`), and merges the request's own
+   `calibration_rows` over it;
+3. `MeasureMatrix.fold` selects each question once, binds the selected launch
+   times through the point × term key matrix, evaluates the formula over
+   whole rows, and vectorises coverage by state. `batch_sweep.apply_measured`
+   unfolds the row a response asks for: each row's own time, each module
+   group's and declaration parent's share, the phase total and coverage, the
+   draft's share, the measured throughputs.
 4. The same fold records stage timings — reading `PointMeasure`s, collecting
    and deduplicating keys, the lookup round trip (service and network split
    by the service's `service_s`), selector construction and selection, and
@@ -338,15 +341,18 @@ total, with another leaf:
 `row_roofline.StepSum.measured_law` writes the formula with the same weights
 as the SOL total (pipeline stages, a draft's forwards), and
 `auto_sweep.MeasuredFormula` carries it as text with `n_k` / `T_k` bound per
-point. `Folded.track` is the whole formula; `Folded.subtotal(terms)` is the
-same formula with every other term's time bound to zero, and refuses a
-partial subtotal. Every measured number in a response is one of the two: the
-phase total, the draft's share, each module group's `t_measured_agg`, each
+point. `MeasuredFormula.at` reads one row; `MeasuredFormula.at_many` gives
+the same compiled declaration two-dimensional `n` / `T` bindings. A matrix
+fold's total and `MatrixFold.subtotal(terms)` are therefore the same formula
+— the latter with every other term's time bound to zero — and a partial
+subtotal is still refused. Every measured number in a response is one of the
+two: the phase total, the draft's share, each module group's
+`t_measured_agg`, each
 declaration parent's share (grouped by `inference/declaration_groups.py`), an
 encoder stack's time.
 
 There is exactly one owner of "how long does one step of this deployment
-take, measured": `MeasuredFormula` / `Folded` for the value and
+take, measured": `MeasuredFormula` / `MatrixFold` for the value and
 `MeasuredTrack` for the coverage. Code that prices a step states an unread
 track (`MeasuredTrack.unread`) and waits for the fold; code that reads one
 value aggregates nothing; and the frontend adds nothing up. Sums over
@@ -400,6 +406,185 @@ rest on a corpus row whose cross-check is not `passed` (typically no fp32
 reference could be built). Those rows are used, because refusing them would
 fall back to the roofline, but the count lets a reader tell a total built on
 checked numbers from one that is not.
+
+### 5.5 Speculative steps in the measured track
+
+The draft is a third row list of the same walked step, not a second measured
+system. The canonical record's measure table is `measure-points-v7`: a point
+selector carries `draftTokens`, while strings, shapes and physical keys remain
+record-level facts shared by every K.
+
+#### What a speculative step launches
+
+A recursive MTP speculative decode step at K draft tokens runs:
+
+1. **K draft forwards**, one per drafted token. Each is the model's declared
+   MTP stack (`aux_kind: mtp`, named by `SpeculativeDraft.stacks_of`) at `B`
+   requests, `s_query=1`, and the verify step's cache length. The walked rows
+   are `per_op_timing_draft`; `StepSum` multiplies their formula by
+   `SpeculativeDraft.forwards == K`.
+2. **One verify forward** through the backbone at `s_query=K+1`. Its rows are
+   `per_op_timing_decode`; the same `StepSum` adds them beside the draft.
+
+Every launch becomes a `PointRow` through `calibration_overlay.point_keys`,
+exactly as plain decode does. Its physical key is
+`op_calibration.PhysicalKey(signature, physical_shape, dtype_env_json, gpu,
+phase)`: `physical_identity` projects the op's shape, the leaf supplies the
+dtype environment, the card stamps `gpu`, and the phase is `decode`. No
+consumer derives a speculative key from K itself.
+
+The natural overlap and the new shapes follow from those projections:
+
+- Verify GEMMs whose identity retains `B` and `s_query` are new at K>0
+  (`B×(K+1)` differs from plain decode's `B×1`).
+- Grouped/routed GEMMs commonly collapse the token count into `n_tokens` (and
+  `s_expert_rows`), so a K=1 verify at batch B can reuse a plain-decode key
+  from another public batch when their `n_tokens` agree.
+- Decode attention is new at `s_query>1` (and, where relevant, the longer
+  cache length); the recursive draft's attention is `s_query=1`, so it can
+  reuse a plain-decode attention key when the MTP stack's head geometry
+  matches.
+- MTP-stack-only head, router, embedding, quant and collective shapes are new
+  when no backbone row projects to the same key.
+
+At H100-SXM, as-shipped precision, memory fraction 0.9, the public context ×
+batch grid, and each model's first Gallery layout that K=1 serves, the K=1
+key tables are; counts are distinct non-null `PhysicalKey`s over that grid
+zero-cost and unplaced rows are not measurements and are excluded:
+
+| Model (layout) | Plain keys | Verify keys | Draft keys | K=1 union | New vs plain |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-35B-A3B (TP1) | 219 | 222 | 169 | 373 | 204 |
+| DeepSeek-V4.1-Flash (EP8·DP8) | 716 | 721 | 429 | 1,127 | 830 |
+
+A raw exact-key lookup in the read-only `/scratch1/lake-v3-candidate` (an
+effective shared row exists; this is not yet the envelope selector's final
+coverage) finds:
+
+| Model | Plain hit | Verify hit | Draft hit | K=1 union hit | New-key hit |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.5-35B-A3B | 219/219 (100%) | 156/222 (70.3%) | 169/169 (100%) | 307/373 (82.3%) | 138/204 (67.6%) |
+| DeepSeek-V4.1-Flash | 499/716 (69.7%) | 248/721 (34.4%) | 286/429 (66.7%) | 520/1,127 (46.1%) | 352/830 (42.4%) |
+
+The two models show the two ends of the spectrum. Qwen's one-forward MTP
+stack reuses plain backbone keys at K=1, while its verify width adds the 204
+keys. DeepSeek reuses many backbone and routed-GEMM keys but has MTP-specific
+head, router and grouped-GEMM shapes: at context 4096 and batch 8, 18 of its
+39 distinct draft keys are new.
+
+#### Ownership and the serving-law record
+
+- `SpeculativeDraft` owns the step composition (stacks, style, forwards,
+  tokens per forward). A parallel draft changes `tokens_per_forward` and
+  therefore its row keys; it goes through the same `point_keys` boundary. The
+  first implementation only publishes the recursive MTP style the Gallery
+  currently requests.
+- `point_keys` remains the only key producer for verify rows, draft rows and
+  the Kernel Bench plan. There is no “speculative key” helper and no consumer
+  that rewrites a plain shape for K.
+- The decode binding remains the only statement of which step a point
+  describes: `binding.speculative_draft_tokens == K`. A K=0 fold may not read
+  a K>0 `PointMeasure`, and a K>0 fold may not substitute a K=0 measure even
+  where their key sets intersect.
+- The existing record-level measure table remains one table. Its schema moves
+  from `measure-points-v6` to a K-aware v7 by adding `draftTokens` (default
+  0) to each point selector: `(gpu, context, batch, K)`. Strings, shapes,
+  dtype environments and physical keys stay globally deduplicated; a K only
+  adds a `PointMeasure` variant when its formula or launch weights differ.
+  Recursive draft keys are shared across K, so the table does not copy the key
+  table once per K.
+- The producer derives K=0 and every `FRONTIER_DRAFT_TOKENS` view from the
+  same live walks: backbone rows are read at `s_verify=K+1`, recursive draft
+  rows at `s_query=1`, and `point_measures` writes the K-weighted formula.
+  Acceptance rate and the two floors do not change keys and do not create
+  another table variant.
+- Capacity continues to own serving, not the measured fold. K points are
+  admitted through the record's draft capacity and the public batch grid; an
+  unfit context is priced by the capacity owner's `without_step` answer, and
+  Gallery/ladder filtering still uses `point_served`. The fold never broadens
+  capacity to obtain a measurement.
+
+The measured fold for a K view reads that view's `PointMeasure`, calls the
+same one-lookup `measured_selector`, and applies it to a SOL point whose
+binding names the same K. Complete coverage yields `t_measured_s`, the draft
+share and measured throughput; partial coverage yields only per-term values
+and the coverage state. No SOL value is presented as measured.
+
+#### Measurement plan and queues
+
+The plan does not start from the persistent key table: a stored table has
+enough identity to fold, but not the full launch geometry a job needs. The
+speculative planner walks the same model/layout/precision, asks `point_keys`
+for the live verify and draft `PointRow`s at each public K and point, and
+converts those `PointRow`s with the same launch identity the normal plan
+already uses (`PointRow.key + aggregation_id`). The normal and speculative
+planners share that conversion; neither writes a second shape derivation.
+
+The queue is the gap owner: with `--skip-existing`, it asks the restored
+authoritative lake under the real selection mode and runs only keys that fold
+reports missing. This avoids re-measuring the large plain overlap above. A plan
+may name the same physical launch under two structural nodes; after the first
+measurement the coverage question answers the second, so the physical launch is
+measured once. Recursive draft launches also repeat K times in a step's
+formula, but the plan emits one forward's launch.
+
+H100 and RTX-4090 receive ordinary Kernel Bench plan files from that union.
+The existing queues run them, and the authoritative uploader uploads and
+promotes them as shared rows. The card is stamped by the measurement driver;
+the plan itself stays cardless where its class allows it.
+
+#### Frontend behavior
+
+The K selector no longer forces `measured_track.state = none`. It receives the
+measured fold for the requested K:
+
+- complete points draw the measured curve/rate using the step's effective
+  accepted-token count;
+- incomplete points draw SOL only and show `measured / total` plus the exact
+  missing/ambiguous/unplaced/declined lists;
+- a lake outage is `unavailable`, an engine bug is `engine_error`, and a
+  model/view with no admissible K point says that — none of these is hidden
+  behind the retired “Kernel Bench measures only plain decode” message.
+
+Coverage remains a property of the K view. Partial coverage is useful
+information: it names the exact launches the measurement plan will add.
+
+#### Acceptance gates
+
+Implementation is not complete just because a K curve appears. The gates are:
+
+1. **Producer oracle:** for Qwen, DeepSeek and a non-MTP model, each stored K
+   `PointMeasure` equals the direct speculative estimate at the same point,
+   after removing only anomaly numerators as the existing pool oracle does.
+2. **Binding oracle:** a fold asks for and receives exactly the requested K;
+   K=0 cannot consume a K>0 point and vice versa, including points whose key
+   sets intersect.
+3. **Plan oracle:** the speculative plan's launch identity and `PointRow` are
+   byte-equal to the direct `point_keys` result at the same model, layout,
+   card, context, batch and K, including dtype and launch count.
+4. **Fold oracle:** with the fixture lake, complete K coverage reproduces the
+   direct measured total/draft share/throughput; missing any one key leaves
+   `t_measured_s` absent and reports that key.
+5. **Frontend oracle:** a K view with complete points draws measured points,
+   partial coverage draws SOL plus coverage, and no code path synthesizes a
+   measured value from SOL.
+
+#### Engine and warm impact
+
+The row key and validator schemas do not change, so the lake's data-rules
+revision does not change and no lake migration runs. The serving-law measure
+table schema does change, and its producer lives under `backend/inference`;
+that flips `engine_version`, invalidates SOL-pool and deterministic Gallery
+artifacts, and requires a new artifact generation.
+
+This should ship in the same release as the matrix-fold and warm-scheduling
+batches when they are ready. One engine version then produces one SOL-pool
+archive, one deterministic Gallery archive, and one scheduled full warm.
+Ideally the speculative gap plan runs on H100/4090 and its rows are promoted
+into the authoritative lake before that deploy, so new K views can fold
+measurements immediately; if not, their coverage panels progressively lose
+missing keys as uploads land.
+
 
 ## 6. Response contract for the frontend
 

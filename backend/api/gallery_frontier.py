@@ -70,6 +70,7 @@ import logging
 import statistics
 import functools
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from backend.api._models import BatchPoint, InferenceEstimateSweepRequest
@@ -144,7 +145,7 @@ from backend.code_trace.provider import recording, run_recorded
 from backend.inference.sol_law import (
     draftForwardsLaw,
     servingLawCapacity,
-    servingMeasurePoints,
+    servingMeasureMatrix,
     servingLawPoints,
     servingLawRecord,
 )
@@ -624,12 +625,9 @@ def _stepDraftTokens(dec: Mapping[str, Any]) -> int:
 
 def _view_scope(view: FrontierView) -> Tuple[Any, str]:
     """The measurement scope a view's measured track reads, and its state:
-    none under a draft — the measured rows are keyed on the plain step's
-    kernels, so a speculative step has no measured track here — else the
-    shared rows' (`_frontier_scope`). A request reads it once and draws
-    every model under it (`build_frontier`)."""
-    if view.draft_tokens:
-        return NO_MEASUREMENTS, "none"
+    the shared rows' (`_frontier_scope`); a speculative view reads the K-aware
+    measure table its record carries. A request reads it once and draws every
+    model under it (`build_frontier`)."""
     return _frontier_scope()
 
 
@@ -646,54 +644,68 @@ def _labelled(drawing: dict, state: str) -> dict:
     return {**drawing, "measured_track": {"state": state}}
 
 
-def _measureReader(core: dict, gpu_sku: str,
+def _measureReader(core: dict, gpu_sku: str, view: FrontierView,
                    timings: Optional[Dict[str, Any]] = None) -> Callable[
                        [int, dict], Optional[dict]]:
     """Read points' measures from the canonical records they name.
 
     The entry carries only a record name per point and the pool bundle's key;
     the records' deduplicated key tables remain their one copy. Each record is
-    read and projected once per fold, and the `PointMeasure`s expanded here
-    live only for this request.
+    read and projected once per fold. No `PointMeasure` is materialized per
+    Gallery point: the fold reads the record's point × term matrix.
     """
     timings = {} if timings is None else timings
     bundle = core.get("_measurePool")
-    wanted: Dict[str, List[Tuple[int, int]]] = {}
+    wanted: Dict[str, List[Tuple[int, int, int]]] = {}
     for point in core.get("_theory") or []:
         name = point.get("measureRecord")
-        dec = point["sol"]["phases"]["decode"]
-        if name is not None and not _stepDraftTokens(dec):
+        at = _at_view(point, view)
+        if at is None:
+            continue
+        dec = at["sol"]["phases"]["decode"]
+        if _stepDraftTokens(dec) != int(view.draft_tokens):
+            raise MeasurementFoldMismatch(
+                f"frontier point {point.get('label')} binds K="
+                f"{_stepDraftTokens(dec)}, not the requested K={view.draft_tokens}")
+        if name is not None:
             wanted.setdefault(str(name), []).append(
-                (int(point["seq"]), int(dec["batch"])))
-    records: Dict[str, Any] = {}
-    points: Dict[Tuple[str, str, int, int], dict] = {}
+                (int(point["seq"]), int(dec["batch"]), int(view.draft_tokens)))
+    if not wanted:
+        raise MeasurementFoldMismatch(
+            f"the entry has no K={view.draft_tokens} point with a measure record")
+    matrices: Dict[str, Any] = {}
+    points: Dict[Tuple[str, str, int, int, int], tuple[Any, int]] = {}
 
     def read(_i: int, point: dict) -> Optional[dict]:
         name = point.get("measureRecord")
         if bundle is None or name is None:
-            return None
+            raise MeasurementFoldMismatch(
+                "a frontier point that can be drawn carries no measure record")
         name = str(name)
         dec = point["sol"]["phases"]["decode"]
-        if _stepDraftTokens(dec):
-            return None
-        at = (name, gpu_sku, int(point["seq"]), int(dec["batch"]))
+        if _stepDraftTokens(dec) != int(view.draft_tokens):
+            raise MeasurementFoldMismatch(
+                f"frontier point {point.get('label')} binds K="
+                f"{_stepDraftTokens(dec)}, not the requested K={view.draft_tokens}")
+        at = (name, gpu_sku, int(point["seq"]), int(dec["batch"]),
+              int(view.draft_tokens))
         if at not in points:
-            if name not in records:
+            if name not in matrices:
                 started = time.perf_counter()
                 stored = sharedSolPool.record(str(bundle), name)
                 timings["measure_record_read_s"] = (
                     timings.get("measure_record_read_s", 0.0)
                     + time.perf_counter() - started)
-                timings["measure_records"] = len(records) + 1
+                timings["measure_records"] = len(matrices) + 1
                 if stored is None:
                     raise MeasurementFoldMismatch(
                         f"the serving-law record {name} is not readable")
                 # A pool record is `{parallel, walk}`; the law is its walk.
-                records[name] = stored.get("walk", stored)
+                record = stored.get("walk", stored)
             started = time.perf_counter()
             try:
-                expanded = servingMeasurePoints(
-                    records[name], card=Card.of(gpu_sku),
+                matrix = servingMeasureMatrix(
+                    record, card=Card.of(gpu_sku),
                     points=wanted.get(name) or [])
             except (KeyError, ValueError) as e:
                 raise MeasurementFoldMismatch(
@@ -702,9 +714,13 @@ def _measureReader(core: dict, gpu_sku: str,
             timings["measure_point_read_s"] = (
                 timings.get("measure_point_read_s", 0.0)
                 + time.perf_counter() - started)
-            for (context, batch), measure in expanded.items():
-                points[(name, gpu_sku, context, batch)] = measure
-        return points.get(at)
+            matrices[name] = matrix
+            for coordinates, row in matrix.point_rows.items():
+                points[(name, gpu_sku, *coordinates)] = (matrix, row)
+        matrix = matrices[name]
+        matrix, row = points[at]
+        return {"matrix": matrix, "row": row, "terms": [],
+                "phase": "decode"}
 
     read.timings = timings
     return read
@@ -712,23 +728,28 @@ def _measureReader(core: dict, gpu_sku: str,
 
 def _measured_rates(core: dict,
                     measureAt: Callable[[int, dict], Optional[dict]],
+                    view: FrontierView,
                     scope: Any) -> dict:
     """What the measured fold (`batch_sweep.measure_points`) says of each
-    plain point under `scope`, by the point's index in the entry: its
+    point of this view under `scope`, by the point's index in the entry: its
     measured throughput (`rates`; absent for a point the fold publishes no
     measured time for), and its decode coverage (`coverage`,
-    `_PointCoverage`). Floors, K and acceptance move neither, so every
-    plain view under `scope` reads these; which points are on its frontier
-    is the view's (`_draw`)."""
+    `_PointCoverage`). K selects this view's measure table; acceptance changes
+    the folded point's published throughput."""
     index: List[int] = []
     items: List[dict] = []
     timings: Dict[str, Any] = {}
     for i, t in enumerate(core.get("_theory") or []):
-        m = measureAt(i, t)
-        if m is not None and not _stepDraftTokens(t["sol"]["phases"]["decode"]):
-            index.append(i)
-            items.append({"sol": copy.deepcopy(t["sol"]),
-                          "measures": {"decode": m}})
+        at = _at_view(t, view)
+        if at is None:
+            continue
+        m = measureAt(i, at)
+        if m is None:
+            raise MeasurementFoldMismatch(
+                f"frontier point {t.get('label')} has no K={view.draft_tokens} measure")
+        index.append(i)
+        items.append({"sol": copy.deepcopy(at["sol"]),
+                      "measures": {"decode": m}})
     timings["measure_points"] = len(items)
     total = time.monotonic()
     if items:
@@ -922,18 +943,21 @@ def _point_coverage(cov: dict, i: int, core: dict) -> list:
     return got
 
 
-def _rates_cover(core: dict, rates: dict) -> bool:
-    """Whether a rates entry folds every plain point in this entry.
+def _rates_cover(core: dict, rates: dict, view: FrontierView) -> bool:
+    """Whether a rates entry folds every point of this view.
 
     A draft-only capacity point is a K-step stored for K views; its binding
-    is the one statement of which step it is. The measured rates are the
-    plain decode track, so their coverage obligation is exactly K=0.
+    is the one statement of which step it is, and the requested view is the
+    only obligation of its measured rates.
     """
     try:
         coverage = rates.get("coverage") or {}
         for i, point in enumerate(core.get("_theory") or []):
-            decode = point["sol"]["phases"]["decode"]
-            if not _stepDraftTokens(decode):
+            at = _at_view(point, view)
+            if at is None:
+                continue
+            decode = at["sol"]["phases"]["decode"]
+            if _stepDraftTokens(decode) == int(view.draft_tokens):
                 _point_coverage(coverage, i, core)
     except (MeasurementFoldMismatch, KeyError, TypeError):
         return False
@@ -1035,9 +1059,13 @@ class _Stored(NamedTuple):
 
     def rates_key(self, view: FrontierView, scope: Any) -> str:
         """The measured rates': the selection that picks each key's row
-        (`_GALLERY_SELECTION`) is the fold's, so it keys them."""
+        (`_GALLERY_SELECTION`) is the fold's, and K selects a different
+        `PointMeasure` formula. Floors do not move a measured launch time;
+        acceptance is kept because the published rate changes with it."""
         return self._key("gallery-frontier-measured",
-                         [*view.walk_parts(), _GALLERY_SELECTION], scope,
+                         [*view.walk_parts(), int(view.draft_tokens),
+                          float(view.acceptance_rate) if view.draft_tokens else None,
+                          _GALLERY_SELECTION], scope,
                          _DRAWING_SCHEMA)
 
     def view_key(self, view: FrontierView, scope: Any, state: str) -> str:
@@ -1074,15 +1102,15 @@ class _Stored(NamedTuple):
         if state == "reads":
             key = self.rates_key(view, scope) if self.version else None
             rates = _FRONTIER_VIEWS.get(key) if key else None
-            if rates is not None and not _rates_cover(core, rates):
+            if rates is not None and not _rates_cover(core, rates, view):
                 rates = None
             if rates is None:
                 try:
                     timings: Dict[str, Any] = {}
                     rates = _measured_rates(
-                        core, _measureReader(core, view.gpu_sku, timings),
-                        scope)
-                    if rates is None or not _rates_cover(core, rates):
+                        core, _measureReader(core, view.gpu_sku, view, timings),
+                        view, scope)
+                    if rates is None or not _rates_cover(core, rates, view):
                         raise MeasurementFoldMismatch(
                             "the fold did not cover every frontier point")
                 except MeasurementsUnavailable as e:
@@ -1457,6 +1485,156 @@ async def build_frontier(view: FrontierView,
         **head,
         "models": models,
         "errors_count": sum(1 for m in models if m.get("error")),
+    }
+
+
+@dataclass(frozen=True)
+class _WarmLayoutWork:
+    """One offline layout job, with the cost that ordered it in the queue."""
+
+    model_id: str
+    layout_index: int
+    cost: int
+    item: tuple[Any, ...]
+
+
+def _warm_layout_works(
+        walks: list[tuple[str, dict]], view: FrontierView,
+        model_params: Mapping[str, Any]) -> list[_WarmLayoutWork]:
+    """Every missing model × layout job, most expensive first.
+
+    The cost is the existing main-model parameter fact times the layout's GPU
+    count. It is a scheduling estimate, not a persisted fact and not a second
+    identity: its only owner is this offline queue.
+    """
+    out: list[_WarmLayoutWork] = []
+    for model_id, plan in walks:
+        params = int(model_params.get(model_id) or 0)
+        for index, layout in enumerate(plan["layouts"]):
+            gpus = ParallelConfig.from_dict(layout).cluster_size
+            out.append(_WarmLayoutWork(
+                model_id=model_id, layout_index=index,
+                cost=max(1, params) * int(gpus),
+                item=(model_id, plan["cards"],
+                      float(view.gpu_memory_fraction),
+                      _GALLERY_PRECISION.canonical(), layout)))
+    return sorted(out, key=lambda work: (-work.cost, work.model_id,
+                                          work.layout_index))
+
+
+def _layout_job(work: _WarmLayoutWork) -> tuple[dict, Any]:
+    """One offline layout walk, isolated to that layout's own answer."""
+    try:
+        return run_recorded(None, _layout_law, work.item)
+    except Exception as exc:
+        return ({"error": str(exc)}, None)
+
+
+async def warm_frontier(view: FrontierView,
+                        model_params: Mapping[str, Any]) -> dict:
+    """Warm one card by putting every model's layouts in one ranked queue.
+
+    This is the offline shape of `build_frontier`, not its request path. All
+    missing layouts are submitted together through the existing `run_ranked`
+    cell slots, largest first; a model's entry is finished only after every
+    one of its layouts has landed, then `_finish_frontier` stores the same
+    walk and Gallery entry the interactive path stores.
+    """
+    generation = spec_generation()
+    model_ids = sorted(iter_snapshot_ids())
+    head = _frontier_head(view)
+    report_partial(head=head)
+    track = await run_off_loop(_view_scope, view)
+
+    read_slots = asyncio.Semaphore(_model_concurrency())
+
+    async def read_one(model_id: str) -> dict:
+        async with read_slots:
+            try:
+                return await run_off_loop(
+                    _frontier_read, model_id, view, track)
+            except Exception as exc:
+                return {"drawn": _draw(
+                    {"model_id": model_id, "layouts": [], "error": str(exc)},
+                    view, "none", None)}
+
+    reads = list(await asyncio.gather(*[read_one(mid) for mid in model_ids]))
+    drawings: dict[str, dict] = {}
+    walks: list[tuple[str, dict]] = []
+    for model_id, got in zip(model_ids, reads, strict=True):
+        if "drawn" in got:
+            drawings[model_id] = got["drawn"]
+        else:
+            walks.append((model_id, got["walk"]))
+
+    works = _warm_layout_works(walks, view, model_params)
+    print(f"frontier {view.gpu_sku}: {len(walks)} models to walk · "
+          f"{len(works)} layouts · largest first", flush=True)
+    outcomes: dict[str, list[tuple[dict, Any] | None]] = {
+        model_id: [None] * len(plan["layouts"])
+        for model_id, plan in walks
+    }
+    remaining = {model_id: len(plan["layouts"]) for model_id, plan in walks}
+    finish_tasks: dict[str, Any] = {}
+    layouts_done = 0
+    models_done = 0
+    report_progress(0, len(works))
+
+    async def finish_one(model_id: str, plan: dict) -> dict:
+        if outcomes[model_id]:
+            answers, traces = zip(*(outcomes[model_id]), strict=True)
+            answers, traces = list(answers), list(traces)
+        else:
+            answers, traces = [], []
+        try:
+            out = await run_ranked(
+                _finish_frontier, model_id, view, plan, answers,
+                track, traces, name=model_id)
+            nonlocal models_done
+            models_done += 1
+            print(f"frontier {view.gpu_sku}: {models_done}/{len(walks)} · "
+                  f"{model_id}", flush=True)
+            return out
+        except Exception as exc:
+            return _draw({"model_id": model_id, "layouts": [],
+                          "error": str(exc)}, view, "none", None)
+
+    def maybe_finish(model_id: str, plan: dict) -> None:
+        if remaining[model_id] == 0:
+            finish_tasks[model_id] = asyncio.create_task(
+                finish_one(model_id, plan))
+
+    for model_id, plan in walks:
+        maybe_finish(model_id, plan)
+
+    async def layout(work: _WarmLayoutWork) -> None:
+        nonlocal layouts_done
+        try:
+            outcomes[work.model_id][work.layout_index] = await run_ranked(
+                _layout_job, work, name=work.model_id)
+        except Exception as exc:
+            outcomes[work.model_id][work.layout_index] = (
+                {"error": str(exc)}, None)
+        remaining[work.model_id] -= 1
+        layouts_done += 1
+        report_progress(layouts_done, len(works))
+        for model_id, plan in walks:
+            if model_id == work.model_id:
+                maybe_finish(model_id, plan)
+                break
+
+    await asyncio.gather(*[asyncio.create_task(layout(work))
+                           for work in works])
+    finished = (await asyncio.gather(
+        *(finish_tasks[model_id] for model_id in sorted(finish_tasks)))
+        if finish_tasks else [])
+    by_model = dict(zip(sorted(finish_tasks), finished, strict=True))
+    models = [drawings.get(mid) or by_model[mid] for mid in model_ids]
+    ensure_spec_generation(generation)
+    return {
+        **head,
+        "models": models,
+        "errors_count": sum(1 for model in models if model.get("error")),
     }
 
 

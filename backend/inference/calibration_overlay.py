@@ -19,7 +19,7 @@ This module is the rewrite. Two input dataclasses (`WorkloadShape` /
 `CalibrationOverlay.apply(analysis, workload, deployment, ...)` is the only
 entry point: each row's identity and theory classification, and its
 `PointRow`. What is measured is the measured fold's (`batch_sweep.
-measured_selector`, `auto_sweep.PointMeasure.fold`).
+measured_selector`, `inference.measure_matrix.MeasureMatrix.fold`).
 
 Stage placement in the pipeline:
 
@@ -29,7 +29,6 @@ Stage placement in the pipeline:
 """
 from __future__ import annotations
 
-import json  # noqa: F401
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
@@ -41,9 +40,6 @@ if TYPE_CHECKING:
 from backend.arch.eval.dim import as_extent, as_number
 from backend.arch.sharding import ENCODE
 from backend.arch.eval.analysis import Point
-from backend.measure.lookup import Key  # noqa: F401
-from backend.measure.auto_sweep import MeasuredFormula, PointMeasure  # noqa: F401
-
 from .benchmark_identity import (
     RowIdentity,
     routed_launch,

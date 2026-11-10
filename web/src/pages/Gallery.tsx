@@ -618,7 +618,7 @@ export function Gallery() {
       stale={frontStale ? <span>Showing {front?.gpuSku} — {frontFailed ?? (frontState.phase === "loading" ? frontWaitingText : null)}</span> : undefined}
       title={`Decode Pareto frontier — ${fmtSeqLabel(Number(decCtx))} context · ${front?.gpuSku ?? gpuSku}`}
       subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better. ${frontDraft
-        ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request. SOL only — Kernel Bench measures the plain step.`
+        ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request. Solid is SOL; dashed is measured where Kernel Bench covers this speculative step.`
         : ` Solid is SOL; dashed is measured where Kernel Bench covers the step.${partialOn
           ? " Dotted is partial measured: measured ops at their measured time, the rest at SOL — hover a point for the share of its time that is measured." : ""}`}`}
       controls={<Tabs options={decodeTabs} value={decCtx} onChange={setDecCtx} idPrefix="g-dec-tab" />}
@@ -630,7 +630,6 @@ export function Gallery() {
             track: frontById.get(s.key)?.measured_track }))}
           ctx={decCtx}
           gpuSku={front?.gpuSku ?? gpuSku}
-          speculative={front?.draft != null}
         />
       }
     />
@@ -871,7 +870,7 @@ export function Gallery() {
             <input id="g-partial-on" type="checkbox" checked={partialOn} onChange={(e) => setPartialOn(e.target.checked)} />
             <span className="font-medium text-gray-600">Partial measured</span>
           </label>
-          <label className="flex items-center gap-1.5 text-xs pb-2" title="Speculative decoding with the model's own MTP draft: each step runs K one-token draft forwards and one verify over K + 1 positions, and keeps 1 + α·K tokens per request. Only models with an MTP draft are drawn; Kernel Bench's measured track is off.">
+          <label className="flex items-center gap-1.5 text-xs pb-2" title="Speculative decoding with the model's own MTP draft: each step runs K one-token draft forwards and one verify over K + 1 positions, and keeps 1 + α·K tokens per request. Only models with an MTP draft are drawn; Kernel Bench covers this speculative step where every key is measured.">
             <input id="g-spec-on" type="checkbox" checked={specOn} onChange={(e) => setSpecOn(e.target.checked)} />
             <span className="font-medium text-gray-600">Speculative decoding (MTP)</span>
           </label>

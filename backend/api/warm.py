@@ -28,6 +28,9 @@ writes follow the same `remote_ok` / `remote_if` gates as the endpoints, and
 queued remote writes are drained before the process exits.
 
 The gallery has no precision axis: every model is shown as shipped.
+Its offline frontier warm hands one card class every missing model × layout
+walk in one ranked queue (parameter count × layout GPUs, largest first); a
+model's entry is assembled only after all of its layouts have landed.
 """
 from __future__ import annotations
 
@@ -50,7 +53,9 @@ from backend.api.gallery_overview import (
     build_model_facts,
     featured_examples,
 )
-from backend.api.gallery_frontier import FrontierView, build_frontier, keepSharedWalk
+from backend.api.gallery_frontier import (
+    FrontierView, keepSharedWalk, warm_frontier,
+)
 from backend.api.sweep_runtime import (
     _SWEEP_CACHE_DIR,
     compute_estimate_sweep_cached,
@@ -356,17 +361,19 @@ class WarmProcess:
             self.pidfile.unlink(missing_ok=True)
 
 
-def _warm_frontier(gpu: str) -> bool:
+def _warm_frontier(gpu: str,
+                   model_params: dict[str, int | None]) -> bool:
     """Every model's decode Pareto frontier on `gpu` (`/gallery/frontier`):
     one GPU view spans every layout the frontier prices, so it is one job
     per GPU. The first GPU of a walk class walks each model for every card
     of the class (`gallery_frontier._layout_law`); the class's other GPUs
     price that walk."""
     print(f"warming the decode frontier on {gpu}", flush=True)
-    return _report_payload(asyncio.run(build_frontier(FrontierView(gpu))))
+    return _report_payload(asyncio.run(warm_frontier(FrontierView(gpu),
+                                                     model_params)))
 
 
-def _warm_model_facts() -> None:
+def _warm_model_facts() -> dict[str, int | None]:
     """Every model's own facts (`/gallery/models`) — the half of the
     gallery that shows before any GPU view has computed. Cheap; run before
     the frontier so a first visitor sees the page at once."""
@@ -375,6 +382,8 @@ def _warm_model_facts() -> None:
     models = payload.get("models") or []
     print(f"model facts: {len(models) - payload.get('errors_count', 0)}"
           f"/{len(models)} models", flush=True)
+    return {model.get("model_id", ""): model.get("total_params")
+            for model in models}
 
 
 def _report_payload(payload: dict) -> bool:
@@ -433,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--workers", type=int, default=None,
         help="Sweep pool size for this process (env HA_WARM_WORKERS, "
-             "default min(4, cpu-2)).",
+             "default min(32, cpu-2)).",
     )
     parser.add_argument(
         "--show-config", action="store_true",
@@ -464,10 +473,10 @@ def main(argv: list[str] | None = None) -> int:
         warmGallery = bool(
             not args.sweeps or args.landing or args.gallery or args.gpus)
         if warmGallery:
-            _warm_model_facts()
+            model_params = _warm_model_facts()
         if args.landing and warmGallery:
             print("warming the homepage default view", flush=True)
-            if not _warm_frontier(GALLERY_LANDING_GPU):
+            if not _warm_frontier(GALLERY_LANDING_GPU, model_params):
                 print("landing warm produced no successful entries",
                       file=sys.stderr)
                 rc = 1
@@ -476,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
                              default=_gallery_gpus())
             any_ok = False
             for gpu in gpus:
-                if _warm_frontier(gpu):
+                if _warm_frontier(gpu, model_params):
                     any_ok = True
             if gpus and not any_ok:
                 print("warm produced no successful entries", file=sys.stderr)

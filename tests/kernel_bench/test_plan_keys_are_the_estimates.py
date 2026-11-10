@@ -37,6 +37,15 @@ from backend.inference.calibration_overlay import (
 from backend.inference.framework_bindings import DEFAULT_FRAMEWORK, get_binding
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.phases import phase_binding
+from backend.arch.eval.analysis import Point
+from backend.inference.capacity import (
+    CapacityKnobs,
+    _capacity_pending,
+    _capacity_preparation,
+    _point_rows,
+)
+from backend.api.estimate_env import resolve_estimate_environment
+from backend.api._models import InferenceEstimateRequest
 from kernel_bench.plan import build_jobs
 from tests.snapshots import resolve_snapshot
 
@@ -110,6 +119,55 @@ class TestTheTwoSidesAskOneKey(unittest.TestCase):
                     self.assertEqual(job["dtype_env"],
                                      json.loads(point.dtype_env_json))
                     self.assertEqual(job["dims"], json.loads(point.shape_json))
+
+    def test_a_speculative_plan_carries_verify_and_draft_keys(self):
+        """K's MTP forward is walked at s_query=1, not at the K+1 verify."""
+        from kernel_bench.plan import PlanPoint, build_jobs_with_unplaced
+        model = "Qwen/Qwen3.5-35B-A3B"
+        resolved = resolve_snapshot(model)
+        jobs, _dropped, _records = build_jobs_with_unplaced(
+            model_id=model, phase="decode", avg_output_tokens=0,
+            points=[PlanPoint(SEQ, 0, 2, BATCH)],
+            resolved=resolved, parallel=ParallelConfig(), gpu="H100-SXM")
+        request = InferenceEstimateRequest(
+            model_id=model, gpu_sku="H100-SXM", avg_input_tokens=SEQ,
+            avg_output_tokens=0, decode_batch_size=BATCH,
+            speculative_draft_tokens=1, speculative_draft="recursive",
+            selection_mode="theoretical_only")
+        environment = resolve_estimate_environment(request)
+        knobs = CapacityKnobs.from_kwargs(environment, envelope=frozenset({
+            "config", "gpu_sku", "avg_output_tokens", "prefill_batch_size",
+            "decode_batch_size", "prefill_chunk_size"}))
+        preparation = _capacity_preparation(
+            config=environment["config"], gpu_sku="H100-SXM", knobs=knobs)
+        pending = _capacity_pending(
+            preparation, avg_input_tokens=SEQ, avg_output_tokens=0,
+            prefill_batch_override=1, decode_batch_override=BATCH,
+            breakdown=False, fold_prefill_chunks=False, prefill_capacity=False)
+        answer = pending.finish()
+        moved = _point_rows(
+            answer, preparation,
+            {"per_op_timing_decode": BATCH, "per_op_timing_draft": BATCH},
+            pending, Point({}), breakdown=False, costs=False)
+        expected = set()
+        for name, walk in pending.walk_of_rows.items():
+            if name not in ("per_op_timing_decode", "per_op_timing_draft"):
+                continue
+            rows = moved[name]
+            binding = preparation.framework_binding
+            for point in point_keys(
+                    walk.analysis, rows, walk.workload,
+                    build_deployment_context(
+                        framework=binding.framework, framework_binding=binding,
+                        parallel=ParallelConfig(), gpu_sku="", phase="decode"),
+                    model_id=model, spec_hash=resolved.identity_hash()):
+                if point.key is not None:
+                    expected.add((point.key.signature, point.key.shape_json,
+                                  point.key.dtype_env_json, point.key.phase,
+                                  point.aggregation_id))
+        got = {(*job["physical_key"], job["node_spec_id"]) for job in jobs}
+        self.assertTrue(expected)
+        self.assertEqual(got, expected)
 
     def test_a_declined_row_is_not_planned(self):
         """A leaf whose own dtype the corpus has no token for is keyed by the

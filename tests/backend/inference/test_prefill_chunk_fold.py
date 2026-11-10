@@ -127,8 +127,9 @@ def test_one_graph_row_owns_all_of_its_chunk_terms():
             {"uid": "token"}, {"uid": "attention"}],
         "phases": {"prefill": {}},
     }
+    folded = measure.fold(_select(times))
     apply_measured(point, {"prefill": {**endpoint, "phase": "prefill"}},
-                   _select(times))
+                   {"prefill": folded})
     token, attention = point["per_op_timing"]
     assert token["t_measured_s"] == pytest.approx(0.036)
     # This leaf aggregates all three distinct Lq terms, not only the last one.

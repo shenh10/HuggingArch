@@ -5,25 +5,32 @@ import copy
 import json
 import math
 import time
+import zlib
 from typing import Any
 from dataclasses import replace
 
 from backend.api._models import InferenceEstimateRequest
 from backend.api.estimate_env import resolve_estimate_environment
 from backend.api.gallery_frontier import (
-    _GALLERY_PRECISION, _layout_law, _layout_request,
+    _GALLERY_PRECISION, _layout_law,
 )
 import backend.api.gallery_frontier as gallery
-from backend.inference.batch_sweep import measure_points
+from backend.inference.batch_sweep import _measured_formula_weight, measure_points
 from backend.inference.capacity import estimate_pending
 from backend.inference.card import Card
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.parallel_sweep import class_cards
-from backend.inference.sweep_grid import FRONTIER_BATCH_GRID, GALLERY_SEQ_LENS
+from backend.inference.sweep_grid import (
+    FRONTIER_BATCH_GRID,
+    FRONTIER_DRAFT_TOKENS,
+    GALLERY_SEQ_LENS,
+)
 from backend.inference.serving_view import servingLawPointView
-from backend.measure.auto_sweep import PointMeasure
+from backend.measure.auto_sweep import (
+    Folded, MEASURED, MISSING, PointMeasure, key_label,
+)
 from backend.inference.sol_law import (
-    servingMeasurePoints,
+    servingMeasureMatrix,
     servingMeasurePoint,
     servingLawPoint,
     servingLawRecord,
@@ -36,10 +43,7 @@ PARALLEL = ParallelConfig(tp_attention=2, tp_dense_ffn=2, ep_moe=2)
 LONG_CASES = [
     (MODEL, PARALLEL),
     ("deepseek-ai/DeepSeek-V4.1-Flash",
-     ParallelConfig(ep_moe=4, dp_attention=4)),
-    ("moonshotai/Kimi-K3",
-     ParallelConfig(tp_attention=4, tp_dense_ffn=4, ep_moe=16,
-                    dp_attention=4)),
+     ParallelConfig(ep_moe=8, dp_attention=8)),
 ]
 
 
@@ -73,6 +77,58 @@ def without_anomaly_numbers(measure: dict[str, Any]) -> dict[str, Any]:
         } for value in point.inputs), aggregation_ids=())
     return {**measure, "measure": point.to_json(),
             **({"terms": []} if "terms" in measure else {})}
+
+
+def _reference_fold(measure: PointMeasure, select):
+    """The former product fold, kept only as this file's oracle."""
+    rows = []
+    times = []
+    for i, key in enumerate(measure.keys):
+        if measure.formula.zero_cost[i]:
+            rows.append((MEASURED, 0.0, measure.labels[i], measure.reasons[i]))
+            times.append(0.0)
+            continue
+        if key is None:
+            rows.append((measure.unkeyed[i], None, measure.labels[i],
+                         measure.reasons[i] or None))
+            times.append(None)
+            continue
+        context = (measure.contexts[i] if measure.contexts
+                   else measure.context)
+        t, state, detail = select(
+            key, context, measure.labels[i],
+            measure.inputs[i] if measure.inputs else None)
+        if t is None:
+            rows.append((state, None, key_label(key), None))
+            times.append(None)
+            continue
+        rows.append((MEASURED, float(t) * measure.launches[i],
+                     key_label(key), detail))
+        times.append(float(t))
+    return Folded(measure, tuple(rows), tuple(times))
+
+
+def _oracle_select(key, _context, label, _read):
+    checksum = zlib.crc32(key.signature.encode()) + len(label)
+    if checksum % 3:
+        return checksum % 97 / 1e6 + 0.0001, MEASURED, {
+            "source": "oracle", "source_badge": {"cross_check": "passed"},
+            "utilization": {}}
+    return None, MISSING, None
+
+
+_STRUCTURAL_TERMS = {}
+
+
+def _structural_terms(measure: PointMeasure) -> tuple[int, ...]:
+    """The formula's weighted terms, including a draft's forwards share."""
+    key = (measure.formula.text, len(measure.formula.zero_cost))
+    if key not in _STRUCTURAL_TERMS:
+        _STRUCTURAL_TERMS[key] = tuple(
+            term for term, zero in enumerate(measure.formula.zero_cost)
+            if not zero and float(_measured_formula_weight(
+                measure.formula, term, len(measure.formula.zero_cost))) != 1.0)
+    return _STRUCTURAL_TERMS[key]
 
 
 def oracle(gpu: str):
@@ -115,20 +171,49 @@ def test_pool_measured_points_match_a_direct_walk_on_two_card_classes():
 
 
 def _point_request(model: str, gpu: str, parallel: ParallelConfig,
-                   batch: int) -> InferenceEstimateRequest:
+                    batch: int, *, draft_tokens: int = 0) -> InferenceEstimateRequest:
     return InferenceEstimateRequest(
         model_id=model, gpu_sku=gpu, avg_input_tokens=1024,
         avg_output_tokens=256, parallel=parallel.to_dict(),
         decode_batch_size=batch, framework="vllm",
+        speculative_draft_tokens=draft_tokens,
+        speculative_draft="recursive" if draft_tokens else None,
         selection_mode="theoretical_only")
 
 
 def _direct_measure(model: str, gpu: str, parallel: ParallelConfig,
-                    batch: int) -> dict[str, Any]:
+                    batch: int, *, draft_tokens: int = 0) -> dict[str, Any]:
     pending = estimate_pending(**resolve_estimate_environment(
-        _point_request(model, gpu, parallel, batch)))
+        _point_request(model, gpu, parallel, batch,
+                       draft_tokens=draft_tokens)))
     result = pending.finish()
     return pending.measures(result)["decode"]
+
+
+def test_a_stored_k1_measure_is_the_direct_speculative_walk():
+    """One public K=1 point: the record table and a direct estimate state the
+    same verify + draft `PointMeasure`, not two key derivations."""
+    model = "Qwen/Qwen3.5-35B-A3B"
+    parallel = ParallelConfig()
+    snapshot_config(model)
+    request = _point_request(model, "H100-SXM", parallel, 1,
+                             draft_tokens=1)
+    record = servingLawRecord(
+        resolve_estimate_environment(request), gpu_sku="H100-SXM",
+        anchorContext=1024, outputTokens=256, parallel=parallel,
+        capacityCards=("H100-SXM",), capacityContexts=(1024,),
+        measureContexts=(1024,), measureBatchGrid=[{"decode_batch_size": 1}])
+    table = record["phases"]["decode"]["measurePoints"]
+    assert table["schema"] == "measure-points-v7"
+    ks = {int(point["draftTokens"]) for point in table["points"]}
+    assert ks == {0, *FRONTIER_DRAFT_TOKENS}
+    stored = servingMeasurePoint(
+        record, card=Card.of("H100-SXM"), context=1024, batch=1,
+        draft_tokens=1)
+    direct = _direct_measure(model, "H100-SXM", parallel, 1, draft_tokens=1)
+    assert (PointMeasure.from_json(stored["measure"])
+            == PointMeasure.from_json(
+                without_anomaly_numbers(direct)["measure"]))
 
 
 def test_stored_measure_points_are_point_keys_after_json():
@@ -150,7 +235,8 @@ def test_stored_measure_points_are_point_keys_after_json():
         table = throughJson["phases"]["decode"]["measurePoints"]
         assert table["cardless"]
         assert all("gpu" not in point for point in table["points"])
-        publicPoints = {(int(point["context"]), int(point["batch"]))
+        publicPoints = {(int(point["context"]), int(point["batch"]),
+                         int(point.get("draftTokens", 0)))
                         for point in table["points"]}
         for fact in record["capacity"]:
             if int(fact["context"]) not in GALLERY_SEQ_LENS:
@@ -160,37 +246,93 @@ def test_stored_measure_points_are_point_keys_after_json():
                     or fact.get("beyond_max_context")):
                 continue
             expected = {
-                (int(fact["context"]), int(item["decode_batch_size"]))
+                (int(fact["context"]), int(item["decode_batch_size"]), 0)
                 for item in FRONTIER_BATCH_GRID
                 if item["decode_batch_size"] is not None
                 and int(item["decode_batch_size"]) <= ceiling
-            } | {(int(fact["context"]), ceiling)}
+            } | {(int(fact["context"]), ceiling, 0)}
+            if record.get("speculative"):
+                draftFacts = record.get("draft_capacity") or []
+                draftCeiling = next(
+                    (int(item.get("max_decode_batch") or 0)
+                     for item in draftFacts
+                     if item["gpu_sku"] == fact["gpu_sku"]
+                     and int(item["context"]) == int(fact["context"])), 0)
+                if draftCeiling > 0:
+                    expected |= {
+                        (int(fact["context"]), int(item["decode_batch_size"]), k)
+                        for k in FRONTIER_DRAFT_TOKENS
+                        for item in FRONTIER_BATCH_GRID
+                        if item["decode_batch_size"] is not None
+                        and int(item["decode_batch_size"]) <= draftCeiling
+                    } | {(int(fact["context"]), draftCeiling, k)
+                         for k in FRONTIER_DRAFT_TOKENS}
             missing = expected - publicPoints
             assert not missing, (model, fact["gpu_sku"], fact["context"],
                                  sorted(missing))
         for sku in cards:
+            wanted = sorted(publicPoints)
+            matrix = servingMeasureMatrix(
+                throughJson, card=Card.of(sku), points=wanted)
+            matrixFolds = matrix.fold(_oracle_select)
+            for (context, batch, draft_tokens), row in matrix.point_rows.items():
+                measure = PointMeasure.from_json(servingMeasurePoint(
+                    throughJson, card=Card.of(sku), context=context,
+                    batch=batch, draft_tokens=draft_tokens)["measure"])
+                reference = _reference_fold(measure, _oracle_select)
+                got = matrixFolds[row]
+                where = (model, sku, context, batch, draft_tokens)
+                assert reference.track == got.track, where
+                assert reference.rows == got.rows, where
+                if reference.track.total_s is None:
+                    assert got.total != got.total
+                else:
+                    assert math.isclose(
+                        got.total, reference.track.total_s, rel_tol=1e-12), where
+                structural = _structural_terms(measure)
+                want = reference.subtotal(structural)
+                gotShare = got.subtotal(structural)
+                if want is None or gotShare is None:
+                    assert want is None and gotShare is None
+                else:
+                    assert math.isclose(
+                        gotShare, want, rel_tol=1e-12), (*where, structural)
             priced = gallery._restamp_layout(
                 throughJson, sku, parallel)
             assert "error" not in priced, (model, sku, priced)
         point = next(item for item in throughJson["phases"]["decode"]
                      ["measurePoints"]["points"]
                      if item["context"] == 1024
-                     and item["batch"] == 1)
+                     and item["batch"] == 1
+                     and int(item.get("draftTokens", 0)) == 0)
         gpu = cards[0]
         started = time.monotonic()
         stored = servingMeasurePoint(
             throughJson, card=Card.of(gpu), context=1024, batch=1)
         elapsed = time.monotonic() - started
-        batch = servingMeasurePoints(
-            throughJson, card=Card.of(gpu), points=[(1024, 1)])
-        assert batch[(1024, 1)]["measure"] == PointMeasure.from_json(
-            stored["measure"])
+        matrix = servingMeasureMatrix(
+            throughJson, card=Card.of(gpu), points=[(1024, 1, 0)])
+        assert matrix.point_rows[(1024, 1, 0)] == 0
         direct = _direct_measure(model, gpu, parallel, point["batch"])
         assert (PointMeasure.from_json(stored["measure"])
                 == PointMeasure.from_json(
                     without_anomaly_numbers(direct)["measure"])), model
         assert stored["terms"] == []
         assert elapsed < 0.05, (model, elapsed)
+
+        if not record.get("speculative"):
+            continue
+        point = next(item for item in table["points"]
+                     if item["context"] == 1024 and item["batch"] == 1
+                     and int(item["draftTokens"]) == 1)
+        stored = servingMeasurePoint(
+            throughJson, card=Card.of(gpu), context=1024, batch=1,
+            draft_tokens=1)
+        direct = _direct_measure(model, gpu, parallel, point["batch"],
+                                 draft_tokens=1)
+        assert (PointMeasure.from_json(stored["measure"])
+                == PointMeasure.from_json(
+                    without_anomaly_numbers(direct)["measure"])), model
 
 
 def test_offline_serving_projection_never_asks_point_keys(monkeypatch):

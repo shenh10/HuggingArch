@@ -39,18 +39,24 @@ from .gpu_specs import peak_flops_for_dtype, peak_hbm_bw
 from .phases import Speculation, phase_binding, phase_throughput, step_tokens
 from .parallel_config import ParallelConfig
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
+from backend.measure.measure_matrix import MeasureMatrix
 from .row_roofline import FloorForm, StepSum, floor_of, law_symbol, rung_symbols
 from .sol_data import walkRecordSchema as servingLawSchema
 from .calibration_overlay import point_keys
 from .serving_view import servingCapacityView
 from backend.code_trace.memo import memoize
-from .sweep_grid import FRONTIER_BATCH_GRID, GALLERY_SEQ_LENS
+from .sweep_grid import (
+    FRONTIER_BATCH_GRID,
+    FRONTIER_DRAFT_TOKENS,
+    GALLERY_SEQ_LENS,
+)
 from .batch_sweep import point_measures
 
 
 _lawOutputs = {
     "t_sol_s": "t_op",
 }
+_MEASURE_POINTS_SCHEMA = "measure-points-v7"
 
 # One draft law serves every speculative K: the request says which draft stack
 # exists, while this symbol says how many forwards the point runs.
@@ -459,7 +465,7 @@ def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
 
 
 def _measurePointsToJson(
-        items: Sequence[tuple[str, int, int, PointMeasure]]
+        items: Sequence[tuple[str, int, int, int, PointMeasure]]
 ) -> dict[str, Any]:
     """One decode grid's concrete lookups as ordinary JSON tables.
 
@@ -550,12 +556,12 @@ def _measurePointsToJson(
                        for value in measure.keys),
             context={**(measure.context or {}), "gpu": ""})
 
-    grouped: dict[tuple[int, int], list[tuple[str, PointMeasure]]] = {}
-    for gpu, context, batch, measure in items:
-        grouped.setdefault((int(context), int(batch)), []).append(
+    grouped: dict[tuple[int, int, int], list[tuple[str, PointMeasure]]] = {}
+    for gpu, context, batch, draft_tokens, measure in items:
+        grouped.setdefault((int(context), int(batch), int(draft_tokens)), []).append(
             (gpu, measure))
     points = []
-    for (context, batch), atPoint in grouped.items():
+    for (context, batch, draft_tokens), atPoint in grouped.items():
         firstGpu, first = atPoint[0]
         normalized = withoutCard(first)
         cardless = all(
@@ -571,6 +577,7 @@ def _measurePointsToJson(
                 keyed.append((i, key(physical, read, cardless=cardless)))
             point = {
                 "context": context, "batch": batch,
+                "draftTokens": draft_tokens,
                 "variant": variant(measure),
                 "contextIndex": indexed(
                     contexts, at_context, withoutCard(measure).context
@@ -581,7 +588,7 @@ def _measurePointsToJson(
             if not cardless:
                 point["gpu"] = gpu
             points.append(point)
-    return {"schema": "measure-points-v6", "strings": strings,
+    return {"schema": _MEASURE_POINTS_SCHEMA, "strings": strings,
             "contexts": contexts, "variants": variants,
             "keyColumns": [list(column) for column in zip(*keys, strict=True)]
             if keys else [],
@@ -593,7 +600,8 @@ def _measurePointsToJson(
 
 
 def _measurePointAt(table: Mapping[str, Any], *, gpu_sku: str,
-                    context: int, batch: int, point: Any = None,
+                    context: int, batch: int, draft_tokens: int = 0,
+                    point: Any = None,
                     as_object: bool = False,
                     shared: Optional[Dict[Any, Any]] = None
                     ) -> dict[str, Any]:
@@ -605,7 +613,8 @@ def _measurePointAt(table: Mapping[str, Any], *, gpu_sku: str,
         for candidate in table["points"]:
             if (candidate.get("gpu", gpu_sku) == gpu_sku
                     and int(candidate["context"]) == int(context)
-                    and int(candidate["batch"]) == int(batch)):
+                    and int(candidate["batch"]) == int(batch)
+                    and int(candidate.get("draftTokens", 0)) == int(draft_tokens)):
                 point = candidate
                 break
     if point is None:
@@ -665,7 +674,8 @@ def _measurePointAt(table: Mapping[str, Any], *, gpu_sku: str,
 
 
 def servingMeasurePoint(record: Mapping[str, Any], *, card: Card,
-                        context: int, batch: int) -> dict[str, Any]:
+                        context: int, batch: int,
+                        draft_tokens: int = 0) -> dict[str, Any]:
     """A record's stored decode measurement at one public point.
 
     The producer derived every key through `calibration_overlay.point_keys`.
@@ -674,49 +684,32 @@ def servingMeasurePoint(record: Mapping[str, Any], *, card: Card,
     table = record.get("phases", {}).get("decode", {}).get("measurePoints")
     if table is None:
         raise ValueError("the serving law carries no measured points")
+    if table.get("schema") != _MEASURE_POINTS_SCHEMA:
+        raise ValueError(
+            f"a serving law measure table must be {_MEASURE_POINTS_SCHEMA}, "
+            f"got {table.get('schema')!r}")
     return _measurePointAt(
-        table, gpu_sku=card.sku, context=int(context), batch=int(batch))
+        table, gpu_sku=card.sku, context=int(context), batch=int(batch),
+        draft_tokens=int(draft_tokens))
 
 
-def servingMeasurePoints(record: Mapping[str, Any], *, card: Card,
-                         points: Sequence[Tuple[int, int]]
-                         ) -> Dict[Tuple[int, int], dict[str, Any]]:
-    """Many of one record's stored decode measurements, in one table pass.
-
-    A Gallery entry names the same record at many public points. Locating the
-    rows once here keeps the record's deduplicated key table the one owner
-    while a fold expands only the points that view asks for.
-    """
+def servingMeasureMatrix(record: Mapping[str, Any], *, card: Card,
+                         points: Sequence[Tuple[int, int, int]]) -> MeasureMatrix:
+    """A record's measured points as the matrix its fold reads."""
     table = record.get("phases", {}).get("decode", {}).get("measurePoints")
     if table is None:
         raise ValueError("the serving law carries no measured points")
-    cardless = bool(table.get("cardless"))
-    rows: Dict[Tuple[str, int, int], Any] = {}
-    for point in table["points"]:
-        gpu = card.sku if cardless else point.get("gpu")
-        rows[(str(gpu), int(point["context"]), int(point["batch"]))] = point
-    out: Dict[Tuple[int, int], dict[str, Any]] = {}
-    missing: list[Tuple[int, int]] = []
-    shared: Dict[Any, Any] = {}
-    for context, batch in points:
-        point = rows.get((str(card.sku), int(context), int(batch)))
-        if point is None:
-            missing.append((int(context), int(batch)))
-            continue
-        out[(int(context), int(batch))] = _measurePointAt(
-            table, gpu_sku=card.sku, context=int(context), batch=int(batch),
-            point=point, as_object=True, shared=shared)
-    if missing:
-        context, batch = missing[0]
-        raise KeyError(f"the serving law has no measured point for {card.sku} "
-                       f"at {context} tokens and batch {batch}")
-    return out
+    if table.get("schema") != _MEASURE_POINTS_SCHEMA:
+        raise ValueError(
+            f"a serving law measure table must be {_MEASURE_POINTS_SCHEMA}, "
+            f"got {table.get('schema')!r}")
+    return MeasureMatrix.of_record(table, card=card, wanted=points)
 
 
 def _measurePointTables(pending: Any, preparation: Any,
-                        phases: Mapping[str, Any],
                         base: Mapping[str, Any],
-                        capacity: Sequence[Mapping[str, Any]], *,
+                        plain_capacity: Sequence[Mapping[str, Any]],
+                        draft_capacity: Optional[Sequence[Mapping[str, Any]]] = None, *,
                         cards: Sequence[str],
                         contexts: Sequence[int],
                         batchGrid: Sequence[Mapping[str, Any]]
@@ -730,62 +723,81 @@ def _measurePointTables(pending: Any, preparation: Any,
     symbolic row key. The public pool carries the decode measured track:
     prefill and custom plan points walk and ask `point_keys` there.
     """
+    base_phases = base.get("phases") or {}
     base = {name: rows for name, rows in base.items()
             if name in ("per_op_timing_decode", "per_op_timing_draft")}
-    facts = {(str(fact["gpu_sku"]), int(fact["context"])): fact
-             for fact in capacity}
-    byPhase: Dict[str, list[tuple[str, int, int, PointMeasure]]] = {}
-    representative = Card.of(cards[0])
-    onCard = _restamp_gpu(preparation, representative)
+    all_facts = {"plain": plain_capacity, "draft": draft_capacity or plain_capacity}
+    byPhase: Dict[str, list[tuple[str, int, int, int, PointMeasure]]] = {}
+    speculative = preparation.draft is not None
+    draft_phase = dict(base_phases.get("decode") or {})
+    plain_phase = {key: value for key, value in draft_phase.items()
+                   if key != "speculative_draft"}
+    if speculative and "speculative_draft" not in draft_phase:
+        raise ValueError("the walked decode phase does not state its draft")
+    ks = (0, *FRONTIER_DRAFT_TOKENS) if speculative else (0,)
     for context in contexts:
-        cardFacts = [(gpu_sku, facts.get((gpu_sku, int(context))))
-                     for gpu_sku in cards]
-        cardFacts = [pair for pair in cardFacts if pair[1] is not None]
-        if not cardFacts:
-            continue
-        wanted = {int(batchPoint["decode_batch_size"])
-                  for batchPoint in batchGrid
-                  if batchPoint["decode_batch_size"] is not None}
-        wanted.update(int(pair[1]["max_decode_batch"]) for pair in cardFacts)
-        for decodeBatch in sorted(wanted):
-            if decodeBatch <= 0:
+        for k in ks:
+            facts = {(str(fact["gpu_sku"]), int(fact["context"])): fact
+                     for fact in all_facts["plain" if k == 0 else "draft"]}
+            cardFacts = [(gpu_sku, facts.get((gpu_sku, int(context))))
+                         for gpu_sku in cards]
+            cardFacts = [pair for pair in cardFacts if pair[1] is not None]
+            if not cardFacts:
                 continue
-            if not any(point_served(
-                    max_batch_per_gpu=fact["max_decode_batch"],
-                    beyond_max_context=fact["beyond_max_context"],
-                    requests=decodeBatch or 1)
-                    for _gpu_sku, fact in cardFacts):
-                continue
-            batches = {
-                "per_op_timing_decode": decodeBatch,
-                "per_op_timing_draft": decodeBatch,
+            wanted = {int(batchPoint["decode_batch_size"])
+                      for batchPoint in batchGrid
+                      if batchPoint["decode_batch_size"] is not None}
+            wanted.update(int(pair[1]["max_decode_batch"]) for pair in cardFacts)
+            phase = plain_phase if k == 0 else {
+                **draft_phase,
+                "speculative_draft": {
+                    **draft_phase["speculative_draft"],
+                    "draft_tokens": k, "forwards": k,
+                },
             }
-            rows = _point_rows(
-                base, onCard, batches, pending,
-                Point({"s_input": int(context)}), breakdown=False,
-                costs=False)
-            for gpu_sku, fact in cardFacts:
-                if not point_served(
+            atPreparation = replace(preparation, s_verify=k + 1)
+            onCard = _restamp_gpu(atPreparation, Card.of(cards[0]))
+            for decodeBatch in sorted(wanted):
+                if decodeBatch <= 0:
+                    continue
+                if not any(point_served(
                         max_batch_per_gpu=fact["max_decode_batch"],
                         beyond_max_context=fact["beyond_max_context"],
-                        requests=decodeBatch or 1):
+                        requests=decodeBatch or 1)
+                        for _gpu_sku, fact in cardFacts):
                     continue
-                keyed: Dict[str, list[Any]] = {}
-                for name, walk in pending.walk_of_rows.items():
-                    if name not in base:
+                batches = {
+                    "per_op_timing_decode": decodeBatch,
+                    "per_op_timing_draft": decodeBatch,
+                }
+                rows = _point_rows(
+                    base, onCard, batches, pending,
+                    Point({"s_input": int(context)}), breakdown=False,
+                    costs=False)
+                for gpu_sku, fact in cardFacts:
+                    if not point_served(
+                            max_batch_per_gpu=fact["max_decode_batch"],
+                            beyond_max_context=fact["beyond_max_context"],
+                            requests=decodeBatch or 1):
                         continue
-                    keyed[name] = point_keys(
-                        walk.analysis, rows.get(name) or [], walk.workload,
-                        replace(walk.deployment, gpu_sku=gpu_sku),
-                        model_id=walk.model_id, spec_hash=walk.spec_hash)
-                measures = point_measures(
-                    pending, rows, keyed, {"decode": phases.get("decode")},
-                    gpu_sku=gpu_sku, as_objects=True)
-                for phase, measure in measures.items():
-                    byPhase.setdefault(phase, []).append(
-                        (gpu_sku, int(context), decodeBatch, measure["measure"]))
+                    keyed: Dict[str, list[Any]] = {}
+                    for name, walk in pending.walk_of_rows.items():
+                        if name not in base:
+                            continue
+                        keyed[name] = point_keys(
+                            walk.analysis, rows.get(name) or [], walk.workload,
+                            replace(walk.deployment, gpu_sku=gpu_sku),
+                            model_id=walk.model_id, spec_hash=walk.spec_hash)
+                    measures = point_measures(
+                        pending, rows, keyed, {"decode": phase},
+                        gpu_sku=gpu_sku, as_objects=True)
+                    for phase_name, measure in measures.items():
+                        byPhase.setdefault(phase_name, []).append(
+                            (gpu_sku, int(context), decodeBatch, k,
+                             measure["measure"]))
     return {phase: _measurePointsToJson(items)
             for phase, items in byPhase.items()}
+
 
 
 def _phase(rows: list[Mapping[str, Any]],
@@ -922,28 +934,18 @@ def servingLawRecord(environment: Mapping[str, Any], *, gpu_sku: str,
                          draft_forwards=draftForwards),
     }
     base = pending.finish()
-    # The measured overlay is the plain decode step even when the SOL law also
-    # carries a draft: strip the draft metadata, and read the main rows at
-    # verify width 1. This is a point view over the one visit, not a second
-    # plain preparation or walk.
-    measurePhases = dict(base.get("phases") or {})
-    if preparation.draft is not None:
-        measurePhases["decode"] = {
-            key: value for key, value in measurePhases["decode"].items()
-            if key != "speculative_draft"}
-    measurePreparation = (replace(preparation, s_verify=1)
-                          if preparation.draft is not None else preparation)
     draftCapacity = (
         None if preparation.draft is None else _capacityFacts(
             preparation, outputTokens,
             cards=capacityCards or (gpu_sku,),
             contexts=capacityContexts or (1024,),
             prefillChunkSize=environment.get("prefill_chunk_size")))
-    # The measured overlay is the plain step's: no speculative draft's rows
-    # enter it. Its concrete public points are derived here, through the one
-    # `point_keys` road a plan uses, and stored as plain data.
+    # K=0 and every public speculative K are point views over this one walk,
+    # each keyed through the same `point_keys` road a plan uses. The table's
+    # K field is the only difference between the views; its strings, shapes
+    # and physical keys remain record-level deduplicated facts.
     measures = _measurePointTables(
-        pending, measurePreparation, measurePhases, base, capacity,
+        pending, preparation, base, capacity, draftCapacity,
         cards=capacityCards or (gpu_sku,),
         contexts=GALLERY_SEQ_LENS if measureContexts is None
         else measureContexts,

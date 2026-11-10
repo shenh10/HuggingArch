@@ -25,7 +25,8 @@ cell can be walked in a worker process and the lookup made in the API's.
     its structural weight), `sweep_keys` (the union of every point's keys),
     `look_up` (the one lookup), `MeasuredFormula` (the measured total
     Σ w_k·n_k·T_k as law text, written by the estimator's one step
-    aggregation) and `MeasuredTrack` (the fold and its coverage).
+    aggregation, read at one point or over a matrix of points) and
+    `MeasuredTrack` (the fold and its coverage).
 
 The measured total is all or nothing. Each row is in exactly one coverage
 state (`STATES`); the total exists only when every row is `measured`, and a
@@ -36,6 +37,7 @@ missing.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping as ABCMapping
 import math
 from functools import lru_cache
 from dataclasses import dataclass, field, replace
@@ -95,7 +97,7 @@ UNPLACED_REASONS = (MISSING_SIGNATURE, MISSING_PROJECTION, PIPELINE_STAGE)
 @dataclass(frozen=True)
 class MeasuredTrack:
     """The measured track of a set of rows: its coverage, and its total —
-    which the one measured formula gives (`PointMeasure.fold`), and which
+    which the one measured formula gives (`MeasureMatrix.fold`), and which
     exists only at full coverage.
 
     The coverage counts rows, not launches, and lists the rows in each state
@@ -371,6 +373,21 @@ class MeasuredFormula:
                                      else float(times[k]))
         return float(evaluate(self.text, binding)) if binding else 0.0
 
+    def at_many(self, launches: Any, times: Any) -> Any:
+        """The same law at many points, with two-dimensional bindings.
+
+        The expression is the one declaration `at` reads; only its bindings
+        are columns. This is the record-level fold's total, not a second
+        Gallery formula.
+        """
+        count = len(self.zero_cost)
+        if not isinstance(launches, ABCMapping):
+            launches = {
+                f"n_{i}": launches[:, i] for i in range(count)}
+        if not isinstance(times, ABCMapping):
+            times = {f"T_{i}": times[:, i] for i in range(count)}
+        return evaluate(self.text, {**launches, **times})
+
 
 def key_label(key: Key) -> str:
     """A key as the coverage lists it."""
@@ -439,37 +456,17 @@ class PointMeasure:
                 if k is not None and not z]
 
     def fold(self, select: Callable[[Key, Any, str, Any], Tuple[Optional[float], str, Any]]
-             ) -> "Folded":
-        """The measurement at this point (`Folded`). `select(key, context,
+             ) -> Any:
+        """The measurement at this point, as one row of a `MeasureMatrix`.
+
+        `select(key, context,
         label, inputs)` is the estimator's selection over the sweep's one
         lookup (`label` the row's own, which a kernel pin reads; `inputs`
         what it reads of the row): one launch's time, `measured` and what it
         says of the measurement (`detail`, opaque), or None, `missing` /
         `ambiguous` and None."""
-        rows: List[Tuple[str, Optional[float], str, Any]] = []
-        times: List[Optional[float]] = []
-        for i, key in enumerate(self.keys):
-            if self.formula.zero_cost[i]:
-                rows.append((MEASURED, 0.0, self.labels[i], self.reasons[i]))
-                times.append(0.0)
-                continue
-            if key is None:
-                rows.append((self.unkeyed[i], None, self.labels[i], self.reasons[i] or None))
-                times.append(None)
-                continue
-            context = self.contexts[i] if self.contexts else self.context
-            t, state, detail = select(key, context, self.labels[i],
-                                      self.inputs[i] if self.inputs else None)
-            if state not in (MEASURED, MISSING, AMBIGUOUS) or (t is None) == (state == MEASURED):
-                raise ValueError(f"selection of {key_label(key)}: {t!r} with state {state!r}")
-            label = key_label(key)
-            if t is None:
-                rows.append((state, None, label, None))
-                times.append(None)
-                continue
-            rows.append((MEASURED, float(t) * self.launches[i], label, detail))
-            times.append(float(t))
-        return Folded(self, tuple(rows), tuple(times))
+        from backend.measure.measure_matrix import MeasureMatrix
+        return MeasureMatrix.of_measures([self]).fold(select)[0]
 
     def to_json(self) -> Dict[str, Any]:
         """Plain data, compact: every string (key fields, labels) once in a

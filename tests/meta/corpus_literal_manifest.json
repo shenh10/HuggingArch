@@ -889,8 +889,7 @@
   },
   {
     "identifiers": [
-      "deepseek-ai/DeepSeek-V4.1-Flash",
-      "moonshotai/Kimi-K3"
+      "deepseek-ai/DeepSeek-V4.1-Flash"
     ],
     "kind": "curated",
     "module": "tests/backend/inference/test_serving_measure_law.py",

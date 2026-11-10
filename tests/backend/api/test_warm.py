@@ -29,7 +29,8 @@ def _facts_calls(monkeypatch):
 
     async def fake_facts():
         calls.append("facts")
-        return {"models": [{"model_id": "m", "error": None}], "errors_count": 0}
+        return {"models": [{"model_id": "m", "error": None,
+                            "total_params": 7}], "errors_count": 0}
 
     monkeypatch.setattr(warm, "build_model_facts", fake_facts)
     return calls
@@ -53,11 +54,11 @@ def _frontier_calls(monkeypatch):
     """Stub the decode frontier; returns the GPUs a run built it for."""
     gpus = []
 
-    async def fake_frontier(view):
-        gpus.append(view.gpu_sku)
+    async def fake_frontier(view, model_params):
+        gpus.append((view.gpu_sku, dict(model_params)))
         return _OK
 
-    monkeypatch.setattr(warm, "build_frontier", fake_frontier)
+    monkeypatch.setattr(warm, "warm_frontier", fake_frontier)
     return gpus
 
 
@@ -72,21 +73,21 @@ def test_default_warms_both_surfaces_and_the_gallery_landing_first(
     (`GALLERY_GPUS`), not the wider sweep one: the Kernel Bench card has no
     Gallery frontier to fill."""
     assert warm.main([]) == 0
-    assert _frontier_calls[0] == GALLERY_LANDING_GPU
-    assert sorted(_frontier_calls) == sorted(GALLERY_GPUS)
-    assert "RTX-4090" not in _frontier_calls
+    assert _frontier_calls[0][0] == GALLERY_LANDING_GPU
+    assert sorted(gpu for gpu, _params in _frontier_calls) == sorted(GALLERY_GPUS)
+    assert all(gpu != "RTX-4090" for gpu, _params in _frontier_calls)
     assert len(_sweep_calls) == 1
 
 
 def test_gpu_flag_replaces_the_sku_list(_frontier_calls):
     assert warm.main(["--gpu", "H100-SXM", "--gpu", "H200"]) == 0
-    assert _frontier_calls == ["H100-SXM", "H200"]
+    assert [gpu for gpu, _params in _frontier_calls] == ["H100-SXM", "H200"]
 
 
 def test_all_gpus_does_not_widen_the_gallery_frontier(_frontier_calls):
     # The frontier serves the gallery's GPUs alone; --all-gpus is the sweeps'.
     assert warm.main(["--all-gpus"]) == 0
-    assert sorted(_frontier_calls) == sorted(GALLERY_GPUS)
+    assert sorted(gpu for gpu, _params in _frontier_calls) == sorted(GALLERY_GPUS)
     # Selecting a Gallery scope opts out of Scaling unless --sweeps says it.
     # The all-GPU widening itself is tested below with the sweeps stub.
 
@@ -94,7 +95,8 @@ def test_all_gpus_does_not_widen_the_gallery_frontier(_frontier_calls):
 def test_the_gallery_flag_warms_the_gallery_alone(
         _frontier_calls, _sweep_calls):
     assert warm.main(["--gallery"]) == 0
-    assert sorted(_frontier_calls) == sorted(GALLERY_GPUS)
+    assert sorted(gpu for gpu, _params in _frontier_calls) == sorted(
+        GALLERY_GPUS)
     assert _sweep_calls == []
 
 
@@ -120,16 +122,16 @@ def test_all_gpus_sweeps_use_the_spec_table(monkeypatch, _frontier_calls):
 
 
 def test_warm_all_failed_is_nonzero(monkeypatch):
-    async def fake_frontier(view):
+    async def fake_frontier(view, model_params):
         return _FAIL
 
-    monkeypatch.setattr(warm, "build_frontier", fake_frontier)
+    monkeypatch.setattr(warm, "warm_frontier", fake_frontier)
     assert warm.main([]) == 1
 
 
 def test_landing_warms_the_homepage_default(_frontier_calls):
     assert warm.main(["--landing"]) == 0
-    assert _frontier_calls == [GALLERY_LANDING_GPU]
+    assert [gpu for gpu, _params in _frontier_calls] == [GALLERY_LANDING_GPU]
 
 
 def test_landing_and_sweeps_run_both(monkeypatch, _frontier_calls):
@@ -141,7 +143,7 @@ def test_landing_and_sweeps_run_both(monkeypatch, _frontier_calls):
 
     monkeypatch.setattr(warm, "warm_sweeps", fake_sweeps)
     assert warm.main(["--landing", "--sweeps"]) == 0
-    assert _frontier_calls == [GALLERY_LANDING_GPU]
+    assert [gpu for gpu, _params in _frontier_calls] == [GALLERY_LANDING_GPU]
     assert order == ["sweeps"]
 
 
@@ -149,11 +151,11 @@ def test_pidfile_holds_the_pid_while_running_and_is_removed(monkeypatch, tmp_pat
     pidfile = tmp_path / "warm.pid"
     during = []
 
-    async def fake_frontier(view):
+    async def fake_frontier(view, model_params):
         during.append(pidfile.read_text().strip())
         return _OK
 
-    monkeypatch.setattr(warm, "build_frontier", fake_frontier)
+    monkeypatch.setattr(warm, "warm_frontier", fake_frontier)
     assert warm.main(["--landing", "--pidfile", str(pidfile)]) == 0
     assert during == [str(os.getpid())]
     assert not pidfile.exists()
@@ -164,11 +166,11 @@ def test_workers_flag_sizes_this_process_pool(monkeypatch):
 
     sizes = []
 
-    async def fake_frontier(view):
+    async def fake_frontier(view, model_params):
         sizes.append(_sweep_pool._max_workers())
         return _OK
 
-    monkeypatch.setattr(warm, "build_frontier", fake_frontier)
+    monkeypatch.setattr(warm, "warm_frontier", fake_frontier)
     assert warm.main(["--landing", "--workers", "3"]) == 0
     assert sizes == [min(3, os.cpu_count() or 1)]
 
@@ -209,7 +211,7 @@ def test_a_gallery_warm_builds_the_decode_frontier_once_per_gpu(_frontier_calls)
     """The frontier spans every layout of a node, so a gallery warm builds
     it once per GPU."""
     assert warm.main(["--gpu", "H100-SXM", "--gpu", "H200"]) == 0
-    assert _frontier_calls == ["H100-SXM", "H200"]
+    assert [gpu for gpu, _params in _frontier_calls] == ["H100-SXM", "H200"]
 
 
 def test_every_gallery_warm_fills_the_model_facts_first(monkeypatch, _facts_calls):
@@ -245,6 +247,21 @@ def test_an_offline_warm_takes_up_to_32_workers_and_leaves_two_cores(monkeypatch
     assert warm.WarmProcess.default_workers() == 32
     monkeypatch.setattr(warm.os, "cpu_count", lambda: 8)
     assert warm.WarmProcess.default_workers() == 6
+
+
+def test_the_default_warm_pool_uses_the_wide_offline_budget(monkeypatch):
+    """The offline warm is the only heavy process on its machine, so its
+    default reaches 32 workers rather than the API's conservative default."""
+    monkeypatch.delenv("HA_WARM_WORKERS", raising=False)
+    monkeypatch.setattr(warm.os, "cpu_count", lambda: 112)
+    assert warm.WarmProcess.default_workers() == 32
+
+
+def test_the_frontier_receives_the_model_facts_parameter_costs(
+        _frontier_calls):
+    """Layout order reads the parameter facts the warm just produced."""
+    assert warm.main(["--landing"]) == 0
+    assert _frontier_calls == [(GALLERY_LANDING_GPU, {"m": 7})]
 
 
 def test_the_warm_runs_its_jobs_in_its_pool(monkeypatch):

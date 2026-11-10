@@ -79,6 +79,41 @@ class TestBrokenPoolRecovery(unittest.TestCase):
             self.assertIsInstance(_sweep_pool._pool, _InlineExecutor)
 
 
+def test_a_late_worker_answer_does_not_overwrite_a_cancelled_bridge(monkeypatch):
+    """A caller may cancel its submitted work while the worker is running."""
+    class RunningFuture:
+        callback = None
+
+        def add_done_callback(self, callback):
+            self.callback = callback
+
+    class RunningExecutor:
+        worker = None
+
+        def submit(self, *_args, **_kwargs):
+            self.worker = RunningFuture()
+            return self.worker        # running: no answer yet
+
+    class Provider:
+        def snapshot(self):
+            return None
+
+        def merge(self, *_args, **_kwargs):
+            pass
+
+    executor = RunningExecutor()
+    monkeypatch.setattr(_sweep_pool, "_get_pool", lambda *_a, **_k: executor)
+    provider = Provider()
+    monkeypatch.setattr(_sweep_pool, "provider", lambda *_a, **_k: provider)
+    out = _sweep_pool.submit(lambda value: value, 42)
+    assert out.cancel()
+
+    done = Future()
+    done.set_result((42, None))
+    executor.worker.callback(done)    # formerly InvalidStateError
+    assert out.cancelled()
+
+
 def test_cgroup_cpu_quota_caps_the_pool(tmp_path, monkeypatch):
     """A container whose affinity mask lists every host core but whose
     cgroup grants a few cores' time sizes its pool by the quota: a pool of

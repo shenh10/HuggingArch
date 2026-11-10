@@ -1237,6 +1237,21 @@ def _stamp_gpu_on_result(
     pre_rows = rows["per_op_timing"]
     dec_rows = rows["per_op_timing_decode"]
     draft_rows = rows["per_op_timing_draft"]
+
+    def laws_for(name: str, moved: list) -> Optional[Any]:
+        """The walk whose laws `moved` rows read, None when this result has
+        no such phase. A small-batch Scaling point can omit an infeasible
+        prefill while keeping decode; the walked row lists — not this
+        function's shape assumption — say which phases the result carries."""
+        if not moved:
+            return None
+        if name not in walks:
+            raise ValueError(
+                f"the result carries {name} rows but no walk to read their laws from")
+        return walks[name]
+
+    pre_laws = laws_for("per_op_timing", pre_rows)
+    dec_laws = laws_for("per_op_timing_decode", dec_rows)
     # Each phase at its rows' verify width (`_point_rows`).
     widths = p_dst.verify_widths()
     pre = phase_at(
@@ -1244,16 +1259,16 @@ def _stamp_gpu_on_result(
         Point({**point.counts, "B": pre_b, "s_verify": widths["per_op_timing"]}),
         p_dst.peak_flops,
         p_dst.peak_bw, fabric,
-        cell=walks["per_op_timing"].analysis, breakdown=breakdown,
-        launch_s=launch_s)
+        cell=pre_laws.analysis, breakdown=breakdown,
+        launch_s=launch_s) if pre_laws is not None else {}
     dec = phase_at(
         dec_in, dec_rows,
         Point({**point.counts, "B": dec_b,
                "s_verify": widths["per_op_timing_decode"]}),
         p_dst.peak_flops,
         p_dst.peak_bw, fabric,
-        cell=walks["per_op_timing_decode"].analysis, breakdown=breakdown,
-        draft_rows=draft_rows, launch_s=launch_s)
+        cell=dec_laws.analysis, breakdown=breakdown,
+        draft_rows=draft_rows, launch_s=launch_s) if dec_laws is not None else {}
     utm = p_dst.unique_tokens_multiplier or 1
     ng = max(1, int(p_dst.cluster_size or 1))
     if pre:
@@ -1271,7 +1286,8 @@ def _stamp_gpu_on_result(
         "unique_tokens_multiplier": utm,
         "num_gpus": ng,
         "cluster_size": ng,
-        "phases": {"prefill": pre, "decode": dec},
+        "phases": {name: phase for name, phase in (
+            ("prefill", pre), ("decode", dec)) if phase},
         # The layout's, not the card's: an axis split fewer ways than asked.
         "parallel_warnings": base["parallel_warnings"],
         # The model's and the request's, not the card's.
@@ -2289,7 +2305,7 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
                     "phases": {name: _phase_at_length(
                         phase, pw, ceilings, avg_input_tokens=length,
                         avg_output_tokens=out_tokens, s_prefix_cached=prefix)
-                        for name, phase in anchor["phases"].items()}}
+                        for name, phase in anchor["phases"].items() if phase}}
         shared = {k: v for k, v in base.items() if k != "vs_naive_delta"}
         points = []
         # This context's chunked prefills, folded once per endpoint
@@ -3004,6 +3020,16 @@ def _phase_at_length(phase_dict: Mapping[str, Any], p: _CapacityPreparation,
     request (`phase_frame`). Its numbers are the point's rows'
     (`batch_sweep.phase_at`). A counted draft's FLOPs line keeps the walk's
     forward, as a point at another batch does."""
+    if ("binding" not in phase_dict or "formulas" not in phase_dict):
+        if (phase_dict.get("batch") is None
+                and phase_dict.get("time_unpublished_reason")):
+            # A phase with no step at the anchor has no workload binding to
+            # move. Its owner already published why; inventing a binding here
+            # would make an unrunnable prefill look served at another length.
+            return dict(phase_dict)
+        raise ValueError(
+            f"the walked {phase_dict.get('phase', '?')} phase states no step "
+            "and no refusal, so another context cannot re-price it")
     phase = phase_dict["phase"]
     bind = phase_binding(phase=phase, avg_input_tokens=avg_input_tokens,
                          avg_output_tokens=avg_output_tokens,

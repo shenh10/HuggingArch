@@ -515,11 +515,22 @@ def _build_jobs_over_points(
         ) for stack in stacks]
 
     def _step_results(point: PlanPoint) -> List[List[Any]]:
+        if point.s_verify > 1 and phase != "decode":
+            raise ValueError(
+                "a speculative verify width belongs to a decode step; pass "
+                "phase=decode and s_verify=K+1")
         refusal = prefix_refusal(parallel, phase=phase,
                                  input_tokens=point.seq_len,
                                  s_prefix_cached=point.s_prefix_cached)
         if refusal is not None:
             raise ValueError(refusal)
+        draft = None
+        if point.s_verify > 1:
+            from backend.arch.eval.program import Program
+            from backend.inference.speculative_draft import SpeculativeDraft
+            draft = SpeculativeDraft.of(
+                Program.of(resolved), style="recursive",
+                draft_tokens=point.s_verify - 1)
 
         def at_stage(stage: Optional[int]) -> Any:
             return analyze(
@@ -546,7 +557,35 @@ def _build_jobs_over_points(
                 # MTP runs real kernels. Estimate timing stays backbone-only;
                 # the harness measures every stack the step walks. An encoder
                 # is no part of the step: it is planned in its encode phase.
-                include_aux_timing=True,
+                # A speculative point's backbone is the VERIFY forward; its
+                # MTP stack is walked below at the recursive draft's own
+                # width, not at K+1. At K=0 the old whole-step behaviour
+                # remains: every aux stack the step walks is measurable.
+                include_aux_timing=draft is None,
+                precision=precision,
+                gpu=card,
+                breakdown=False,
+            )
+
+        def draft_analysis() -> Any:
+            if draft is None:
+                raise ValueError("internal error: no draft to walk")
+            return analyze(
+                resolved, parallel=parallel, framework_binding=binding,
+                batch_size=point.batch,
+                step_eval=draft.step(
+                    resolved, parallel,
+                    batch=point.batch,
+                    avg_input_tokens=point.seq_len,
+                    avg_output_tokens=avg_output_tokens,
+                    ep_load_factor=point.ep_load_factor,
+                    precision=precision, cells=cells),
+                phase="decode",
+                # The MTP stack runs after its latest computed input: the
+                # last pipeline stage, not whichever stage the memory
+                # account happened to bind.
+                stage=(parallel.pp - 1) if parallel.pp > 1 else None,
+                timed_stacks=draft.stacks,
                 precision=precision,
                 gpu=card,
                 breakdown=False,
@@ -561,8 +600,11 @@ def _build_jobs_over_points(
         # were found, with numbers no rank runs) and by a factor that grows
         # with pp.
         if parallel.pp > 1:
-            return [[at_stage(s)] for s in range(parallel.pp)]
-        return [[at_stage(None)]]
+            ranks = [[at_stage(s)] for s in range(parallel.pp)]
+            ranks[-1].append(draft_analysis())
+            return ranks
+        return [[at_stage(None), draft_analysis()]] if draft is not None else [
+            [at_stage(None)]]
 
 
     # Per-rank shapes come from analyze's own rows: its walk applies the

@@ -664,6 +664,32 @@ class TestSweepRobustness(unittest.TestCase):
             pending.priced_on(same_class, OtherStage())
         self.assertIn("pipeline stage", str(off_stage.exception))
 
+    def test_a_result_with_no_prefill_rows_is_not_stamped_from_a_prefill_walk(self):
+        """Small-batch Scaling can carry decode alone: its row lists say
+        which phases exist, so the stamper must not ask every walk by name."""
+        from backend.arch.eval.analysis import Point
+        from backend.inference import capacity as cap
+
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        knobs = cap.CapacityKnobs(model_id="meta-llama/Llama-3.2-1B")
+        prep = cap._capacity_preparation(config=llama, gpu_sku="H100-SXM",
+                                         knobs=knobs)
+        pending = cap._capacity_pending(
+            prep, avg_input_tokens=256, avg_output_tokens=16,
+            prefill_batch_override=1, decode_batch_override=1, breakdown=False)
+        base = pending.finish()
+        rows = {"per_op_timing": [], "per_op_timing_decode":
+                base["per_op_timing_decode"], "per_op_timing_draft": []}
+        walks = {"per_op_timing_decode": pending.walk_of_rows[
+            "per_op_timing_decode"]}
+        out = cap._stamp_gpu_on_result(
+            base, prep, pending.ceilings, pending.walked_on,
+            batches={"per_op_timing": 1, "per_op_timing_decode": 1,
+                     "per_op_timing_draft": 1},
+            rows=rows, walks=walks, point=Point({}), breakdown=False)
+        self.assertEqual(list(out["phases"]), ["decode"])
+        self.assertTrue(out["phases"]["decode"])
+
     def test_a_layout_walks_once_per_card_class(self):
         """`_estimate_layout` over the default series walks each card CLASS
         once — on the class's roomiest card (`class_cards`) — and not once

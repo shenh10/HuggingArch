@@ -77,8 +77,7 @@ function CoverageDetail({ cov, modelId, gpuSku }: { cov: FrontierCoverage; model
 }
 
 /** Why no model has coverage to show, or null when some do. */
-function whyNone(rows: CoverageRow[], speculative: boolean): string | null {
-  if (speculative) return "Speculative decoding is on: Kernel Bench measures the plain decode step, so there is no measured track to cover.";
+function whyNone(rows: CoverageRow[]): string | null {
   if (rows.some((r) => r.track?.state === "reads")) return null;
   if (rows.some((r) => r.track?.state === "unavailable")) return "The Kernel Bench lake could not be read; coverage is unknown, not zero.";
   if (rows.some((r) => r.track?.state === "engine_error")) return "A measured-fold engine error occurred; SOL is shown while the error is investigated.";
@@ -87,16 +86,15 @@ function whyNone(rows: CoverageRow[], speculative: boolean): string | null {
 }
 
 export function CoverageTable({
-  rows, ctx, gpuSku, speculative,
+  rows, ctx, gpuSku,
 }: {
   rows: CoverageRow[];
   /** The chart's context tab, a `seq_lens` entry as a string. */
   ctx: string;
   gpuSku: string;
-  speculative: boolean;
 }) {
   const [open, setOpen] = useState<Record<string, boolean>>({});
-  const reason = whyNone(rows, speculative);
+  const reason = whyNone(rows);
   const covOf = (r: CoverageRow) => r.track?.coverage?.[ctx] ?? null;
   // Most covered first: median share, then best point's share; models with
   // no coverage at this context last.

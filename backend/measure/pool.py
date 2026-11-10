@@ -366,7 +366,17 @@ def submit(fn: Callable[..., _R], /, *args: Any,
         if exc is not None:
             if isinstance(exc, BrokenProcessPool):
                 _discard(pool)
+            # The worker's failure still owns the pool's state even when the
+            # caller has cancelled its bridge; otherwise one cancelled request
+            # hides a broken pool from every later one.
+            if out.cancelled():
+                return
             out.set_exception(exc)
+            return
+        # A caller may cancel the bridge while the worker job is already
+        # running.  The bridge's state is this side's fact; a late worker
+        # answer must not overwrite it.
+        if out.cancelled():
             return
         value, trace = done.result()
         provider().merge(trace, into=requester)

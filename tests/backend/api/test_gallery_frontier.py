@@ -15,6 +15,9 @@ import pytest
 
 import backend.api.gallery_frontier as f
 from backend.code_trace.provider import recording
+from backend.measure.measure_matrix import MeasureMatrix
+from backend.measure.auto_sweep import MeasuredFormula, PointMeasure
+from backend.measure.lookup import Key
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.row_roofline import FloorForm
 from backend.inference.parallel_sweep import class_cards
@@ -74,7 +77,7 @@ def _inline_measures(monkeypatch):
     would read them from the records those points name."""
     monkeypatch.setattr(
         f, "_measureReader",
-        lambda _core, _gpu_sku, _timings: lambda _i, point: (
+        lambda _core, _gpu_sku, _view, _timings: lambda _i, point: (
             (point.get("measures") or {}).get("decode")))
 
 
@@ -272,7 +275,6 @@ def test_a_point_with_no_step_under_the_view_is_not_drawn():
              "_theory": [both, plain_only, drafted_only]}
     k1 = f._read_entry(entry, f.FrontierView("B200", draft_tokens=1))
     assert sorted(p["batch"] for p in k1["frontier"][sk]) == [4, 6]
-    assert k1["measured_track"] == {"state": "none"}
     assert f._at_view(plain_only, f.FrontierView("B200", draft_tokens=2)) is None
     assert f._at_view(drafted_only, f.FrontierView("B200")) is None
 
@@ -314,32 +316,34 @@ def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
                 "measured": 1, "total": 1}
 
     monkeypatch.setattr(f, "measure_points", fold)
-    f._measured_rates(
-        entry, lambda _i, point: (
-            {"any": 1}
-            if point["sol"]["phases"]["decode"]["binding"][
-                "speculative_draft_tokens"] == 0 else None),
-        None)
-    assert set(folded) <= {1, 2}
-    rates = f._measured_rates(
-        entry, lambda _i, point: (
-            {"any": 1}
-            if point["sol"]["phases"]["decode"]["binding"][
-                "speculative_draft_tokens"] == 0 else None),
-        None)
-    assert f._rates_cover(entry, rates)
+    for view, want in ((f.FrontierView("B200"), {1, 2}),
+                       (f.FrontierView("B200", draft_tokens=1), {1, 2, 3})):
+        folded.clear()
+        rates = f._measured_rates(
+            entry, lambda _i, _point: {"any": 1}, view, None)
+        assert set(folded) == want
+        assert f._rates_cover(entry, rates, view)
 
     from backend.measure.scope import MeasurementScope
     monkeypatch.setattr(f, "_frontier_scope", lambda: (
         MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
     monkeypatch.setattr(
         f, "_measureReader",
-        lambda _core, _gpu, _timings: lambda _i, point: (
+        lambda _core, _gpu, _view, _timings: lambda _i, point: (
             {"any": 1}
             if point["sol"]["phases"]["decode"]["binding"][
                 "speculative_draft_tokens"] == 0 else None))
     plain = f._read_entry(entry, f.FrontierView("B200"))
     assert plain["measured_track"]["state"] == "reads"
+
+    monkeypatch.setattr(
+        f, "_measureReader",
+        lambda _core, _gpu, _view, _timings: lambda _i, point: (
+            {"any": 1}
+            if point["sol"]["phases"]["decode"]["binding"][
+                "speculative_draft_tokens"] == 1 else None))
+    drafted = f._read_entry(entry, f.FrontierView("B200", draft_tokens=1))
+    assert drafted["measured_track"]["state"] == "reads"
 
 
 def test_a_model_with_no_mtp_draft_reads_an_empty_speculative_frontier():
@@ -572,10 +576,21 @@ def test_one_fold_reads_each_measure_record_once(monkeypatch):
         f, "sharedSolPool",
         type("Pool", (), {"record": staticmethod(
             lambda *_args: reads.append(1) or {"record": True})}))
+    measures = [
+        PointMeasure(
+            (Key("op", '{"B":1}', '{}', "B200", "decode"),), (float(batch),),
+            (None,), ("op",), ("",), MeasuredFormula("T_0*n_0", (False,)),
+            {"framework": "vllm", "gpu": "B200"}, ({"any": 1},))
+        for batch in (1, 2)
+    ]
+    record_matrix = MeasureMatrix.of_measures(measures)
+    record_matrix.point_rows.update({
+        (int(GALLERY_SEQ_LENS[0]), 1, 0): 0,
+        (int(GALLERY_SEQ_LENS[0]), 2, 0): 1,
+    })
     monkeypatch.setattr(
-        f, "servingMeasurePoints",
-        lambda record, *, card, points: {
-            (context, batch): {"any": batch} for context, batch in points})
+        f, "servingMeasureMatrix",
+        lambda _record, *, card, points: record_matrix)
 
     def apply(items, **_kwargs):
         for item in items:
@@ -583,8 +598,9 @@ def test_one_fold_reads_each_measure_record_once(monkeypatch):
                 "measured": 1, "total": 1}
 
     monkeypatch.setattr(f, "measure_points", apply)
+    view = f.FrontierView("B200")
     rates = f._measured_rates(
-        core, f._measureReader(core, "B200", {}), None)
+        core, f._measureReader(core, "B200", view, {}), view, None)
     assert reads == [1]
     assert rates["timings"]["measure_records"] == 1
     assert rates["timings"]["measure_points"] == 2
@@ -652,7 +668,7 @@ def _kept(monkeypatch, tmp_path, *, state="reads"):
     monkeypatch.setattr(f, "_resolve_one", lambda mid: (None, object(), "v1"))
     monkeypatch.setattr(
         f, "_measureReader",
-        lambda _core, _gpu_sku, _timings: lambda _i, point: (
+        lambda _core, _gpu_sku, _view, _timings: lambda _i, point: (
             {"any": 1} if point.get("measureRecord") else None))
     scope = MeasurementScope(None, "lake", 1, 1, "r")
     monkeypatch.setattr(f, "_frontier_scope", lambda: (
@@ -677,7 +693,8 @@ def _built_entry(monkeypatch, cards=("B200",), calls=None):
     def restamp(_walked, _gpu_sku, cfg, _walk_key=None, _view=None):
         return {
             "theory": [
-                _timed_item(str(seq), measure_record="test-record")
+                _timed_item(str(seq), measure_record="test-record",
+                           drafts={k: 0.012 for k in FRONTIER_DRAFT_TOKENS})
                 for seq in GALLERY_SEQ_LENS
             ],
             "draft_errors": [],
@@ -706,11 +723,11 @@ def test_a_kept_view_is_read_without_its_entry(monkeypatch, tmp_path):
                                          ParallelConfig(tp_attention=2))["theory"])]
 
 
-def test_floors_and_k_read_the_entry_but_never_its_measure_records(
+def test_floors_reuse_the_fold_and_each_k_folds_its_own_formula(
         monkeypatch, tmp_path):
-    """Another floor or K draws off the entry's first part; the measured
-    rates folded once per Kernel Bench snapshot are reused, so the measures
-    record those points name is not read for them."""
+    """Another floor or K draws off the entry's first part. Floors reuse the
+    plain measured rates; each K (and acceptance, which changes the published
+    rate) has its own fold under the same Kernel Bench snapshot."""
     _entries, reads, folds = _kept(monkeypatch, tmp_path)
     real_reader = f._measureReader
     record_reads: list = []
@@ -725,15 +742,17 @@ def test_floors_and_k_read_the_entry_but_never_its_measure_records(
     f._finish_frontier(model, f.FrontierView("B200"), plan, results)
     record_reads.clear()
     stored = f._Stored(model, "v1")
-    for view in (f.FrontierView("B200", comm_latency_us=5.0),
-                 f.FrontierView("B200", draft_tokens=2),
-                 f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.6)):
+    cases = ((f.FrontierView("B200", comm_latency_us=5.0), 0),
+             (f.FrontierView("B200", draft_tokens=1), 1),
+             (f.FrontierView("B200", draft_tokens=3, acceptance_rate=0.6), 1))
+    for view, reader_reads in cases:
         reads.clear()
         got = f._frontier_read(model, view)
         assert "drawn" in got
         assert reads == [stored.entry_key(view)]
-        assert record_reads == []
-    assert len(folds) == 1
+        assert len(record_reads) == reader_reads
+        record_reads.clear()
+    assert len(folds) == 3
     # A new snapshot folds again, off the records the entry names.
     from backend.measure.scope import MeasurementScope
     monkeypatch.setattr(f, "_frontier_scope", lambda: (
@@ -741,7 +760,7 @@ def test_floors_and_k_read_the_entry_but_never_its_measure_records(
     reads.clear()
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200"))
     assert reads == [stored.entry_key(f.FrontierView("B200"))]
-    assert record_reads == [1] and len(folds) == 2
+    assert record_reads == [1] and len(folds) == 4
 
 
 def test_an_entry_missing_its_measure_record_draws_sol(monkeypatch, tmp_path):
@@ -763,7 +782,7 @@ def test_an_entry_missing_its_measure_record_draws_sol(monkeypatch, tmp_path):
         AssertionError("walked")))
     got = f._frontier_read(model, f.FrontierView("B200"))
     assert got["drawn"]["measured_track"]["state"] == "engine_error"
-    assert "did not cover" in got["drawn"]["measured_track"]["error"]
+    assert "has no K=0 measure" in got["drawn"]["measured_track"]["error"]
     assert got["drawn"]["frontier"][str(GALLERY_SEQ_LENS[0])]
     # A view that reads no measurements draws off the same entry.
     assert "drawn" in f._frontier_read(model, f.FrontierView("B200", draft_tokens=1))
@@ -882,7 +901,6 @@ def test_coverage_of_a_fully_measured_frontier(monkeypatch):
     out = _read_folded(monkeypatch, [
         _covered_item(sk, batch=1, tpot=0.01, coverage=full),
         _covered_item(sk, batch=8, tpot=0.02, coverage=full)])
-    assert out["measured_track"]["state"] == "reads"
     assert len(out["frontier_measured"][sk]) == 2
     assert out["measured_track"]["coverage"][sk] == {
         "points": 2, "complete": 2, "best": {"measured": 4, "total": 4},
@@ -958,7 +976,7 @@ def test_a_frontier_point_the_fold_did_not_reach_is_refused(monkeypatch):
     out = _read_folded(monkeypatch, [item])
     assert out["frontier"][sk]
     assert out["measured_track"]["state"] == "engine_error"
-    assert "did not cover" in out["measured_track"]["error"]
+    assert "has no K=0 measure" in out["measured_track"]["error"]
 
 
 def test_no_coverage_when_the_lake_is_unavailable(monkeypatch):
@@ -1081,7 +1099,7 @@ def test_a_fold_mismatch_is_an_engine_error_not_a_lake_outage(
     model, view = "test/Model", f.FrontierView("B200")
     sk = str(GALLERY_SEQ_LENS[0])
 
-    def incomplete(core, _measureAt, _scope):
+    def incomplete(core, _measureAt, _view, _scope):
         plain = [str(i) for i, point in enumerate(core["_theory"])
                  if not f._stepDraftTokens(point["sol"]["phases"]["decode"])]
         return {"rates": {}, "timings": {},
@@ -1128,15 +1146,17 @@ def test_one_request_reads_the_lake_once(monkeypatch):
     assert seen == [track] * 3
 
 
-def test_no_coverage_under_a_speculative_view(monkeypatch):
-    monkeypatch.setattr(f, "_frontier_scope", lambda: (_ for _ in ()).throw(
-        AssertionError("a speculative view reads no rows")))
+def test_a_speculative_view_without_its_k_measure_is_an_engine_error(monkeypatch):
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope", lambda: (
+        MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
     sk = str(GALLERY_SEQ_LENS[0])
     out = f._read_entry({"model_id": "m", "layouts": [], "error": None,
                          "_theory": [_timed_item(sk, drafts={1: 0.012})]},
                         f.FrontierView("B200", draft_tokens=1))
     assert out["frontier"][sk]
-    assert out["measured_track"] == {"state": "none"}
+    assert out["measured_track"]["state"] == "engine_error"
+    assert "no K=1 point with a measure record" in out["measured_track"]["error"]
 
 
 def test_a_kept_view_carries_its_coverage_and_floors_reuse_the_fold(
