@@ -81,8 +81,11 @@ class PublicServingLawRequest:
 
 def projectServingLawPoints(
         record: Mapping[str, Any],
-        request: PublicServingLawRequest) -> list[list[dict | None]]:
-    """Project a serving record's contexts and batches in one call."""
+        request: PublicServingLawRequest, *,
+        floorForms: bool = False) -> list[list[dict | None]]:
+    """Project a serving record's contexts and batches in one call; with
+    ``floorForms`` each decode phase also carries its step as a function of
+    the two floors (`sol_law.servingLawPoints`)."""
     return servingLawPoints(
         record,
         card=Card.of(request.card),
@@ -99,5 +102,6 @@ def projectServingLawPoints(
             request.environment.get("comm_latency_us") or 0.0),
         launch_floor_us=float(
             request.environment.get("launch_floor_us") or 0.0),
-        servedOnly=False)
+        servedOnly=False,
+        floorForms=floorForms)
 

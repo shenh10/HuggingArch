@@ -51,14 +51,15 @@ of it the 2,545 distinct unmeasured keys the coverage panel names). A view alrea
 no entry; another view reads the points and their named records
 (`_frontier_read`).
 
-Each point's step is cached as a function of the two floors (`FloorForm`),
-and for a model with an MTP draft at every K of `FRONTIER_DRAFT_TOKENS`
-too — priced when the entry is built (the warm builds it), one speculative
-walk per layout with every K read off it by substitution.
-A view's floors,
-K and acceptance are substituted when it is drawn (`_draw`); none of
-them walks. A K whose step failed to price is published with the views at
-that K (`draft_errors`).
+Each point's step is cached as a function of the two floors (`FloorForm`,
+the projection's own form of the law: `sol_law._FloorTerms`), and for a
+model with an MTP draft at every K of `FRONTIER_DRAFT_TOKENS` too —
+projected once when the entry is built (the warm builds it), one
+speculative law per layout with every K read off it by substitution. So
+the entry is keyed on the walk alone (`entry_key`): a view's floors, K and
+acceptance are substituted when it is drawn (`_at_view`); none of them
+walks or projects. A K whose step failed to price is published with the
+views at that K (`draft_errors`).
 """
 from __future__ import annotations
 
@@ -166,7 +167,7 @@ pareto_front = _pareto_front
 # version): the entry, and what views read off it (the measured rates and a
 # drawn view). A drawing's fields change without the entry's, and an entry is
 # priced again only when its own do.
-_FRONTIER_SCHEMA = "gallery-frontier-v12"
+_FRONTIER_SCHEMA = "gallery-frontier-v13"
 _DRAWING_SCHEMA = "gallery-frontier-drawing-v5"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
@@ -234,10 +235,13 @@ class FrontierView(NamedTuple):
             draft_tokens=draft_tokens,
             **self._servingLawAxes(draft_tokens=draft_tokens))
 
-    def entry_parts(self) -> List[Any]:
-        """What a model's cached entry is priced under, including its floors."""
-        return [*self.walk_parts(), float(self.comm_latency_us),
-                float(self.launch_floor_us)]
+    def entry_view(self) -> "FrontierView":
+        """The view a model's entry is projected under: this one at the
+        default floors under plain decode. Every point carries its step as
+        a function of the floors and each K's beside it, so neither the
+        floors nor the draft enter the entry (`walk_parts` keys it); a view
+        substitutes its own when it is drawn (`_at_view`)."""
+        return FrontierView(self.gpu_sku, self.gpu_memory_fraction)
 
     def walk_cards(self) -> List[str]:
         """The cards one walk serves this view from, the walk card first:
@@ -383,7 +387,7 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
     the walk's refusal or error, said on this card."""
     if walked.get("schema") == walkRecordSchema:
         card = Card.of(gpu_sku)
-        view = view if view is not None else FrontierView(gpu_sku)
+        view = (view if view is not None else FrontierView(gpu_sku)).entry_view()
         layoutStarted = time.perf_counter()
 
         theory: List[dict] = []
@@ -407,10 +411,15 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                     acceptanceRate=FRONTIER_ACCEPTANCE_DEFAULT,
                     comm_latency_us=view.comm_latency_us,
                     launch_floor_us=view.launch_floor_us,
-                    servedOnly=True)
+                    servedOnly=True, floorForms=True)
             request = view.servingLawRequest(
                 walk_key, record["parallel"], draft_tokens=draft_tokens)
-            return projectServingLawPoints(record, request)
+            return projectServingLawPoints(record, request, floorForms=True)
+
+        def form(served: dict) -> dict:
+            """The point's decode step as a function of the floors, moved
+            off its decode phase onto the point (`_theory_item`)."""
+            return served["phases"]["decode"].pop("floors")
 
         try:
             points = rows(walked)
@@ -430,7 +439,7 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                 item = _theory_item(
                     str(seq), label, parallel_mode(cfg), num_gpus,
                     _batch_key(served["phases"]["decode"]["batch"]), served,
-                    measureRecord, None)
+                    measureRecord, form(served))
                 theory.append(item)
                 byPoint[(str(seq), served["phases"]["decode"]["batch"])] = item
         # A layout no card serves has no point a draft could extend; its K
@@ -459,15 +468,17 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                             requests=batchPoint["decode_batch_size"] or 1):
                         continue
                     batch = served["phases"]["decode"]["batch"]
+                    stepForm = form(served)
                     item = byPoint.get((str(seq), batch))
                     if item is None:
+                        # A batch only the draft's capacity admits: a
+                        # K-step point, with no plain step (`_at_view`).
                         item = _theory_item(
                             str(seq), label, parallel_mode(cfg), num_gpus,
                             _batch_key(batch), served, None, None)
                         theory.append(item)
                         byPoint[(str(seq), batch)] = item
-                    item.setdefault("draftTimes", {})[textK] = served[
-                        "phases"]["decode"]["t_sol_s"]
+                    item.setdefault("draft", {})[textK] = stepForm
         return {
             "theory": theory,
             "draft_errors": draftErrors,
@@ -559,29 +570,35 @@ def _public_entry(entry: dict) -> dict:
 
 def _at_view(item: dict, view: FrontierView,
              ) -> Optional[dict]:
-    """A theory point with its decode step under the view: the step's
-    time already projected at the entry's floors — the plain step's, or with
-    K drafted tokens the speculative step's at that K — the
-    tokens a step keeps at the view's acceptance (`phases.step_tokens`), and
-    its throughput off those (`phases.phase_throughput`, the estimate's own
+    """A theory point with its decode step under the view: the step as a
+    function of the two floors (`FloorForm`) — the plain step's, or with
+    K drafted tokens the speculative step's at that K — at the view's
+    floors, the one place a view's floors enter a frontier; the tokens a
+    step keeps at the view's acceptance (`phases.step_tokens`), and its
+    throughput off those (`phases.phase_throughput`, the estimate's own
     reading). The decode binding is the one owner of which step a stored
-    point is (`speculative_draft_tokens`): None when the view has no form at
-    that K, or under plain decode for a point stored from a K-step — a batch
-    the draft's smaller capacity ceiling admits but plain decode does not.
-    A plain point that publishes no time is left as it is."""
+    point is (`speculative_draft_tokens`): None when the point has no step
+    at the view's K (its projection failed, `draft_errors`), or under
+    plain decode for a point stored from a K-step — a batch the draft's
+    smaller capacity ceiling admits but plain decode does not. A plain
+    point stored without its form is not an entry of this schema."""
     k = int(view.draft_tokens)
     sol = item["sol"]
     dec = dict(sol["phases"]["decode"])
     if not k and _stepDraftTokens(dec):
         return None
-    draftTime = (item.get("draftTimes") or {}).get(str(k)) if k else None
-    if draftTime is not None:
-        dec["t_sol_s"] = draftTime
-    else:
-        form = (item.get("draft") or {}).get(str(k)) if k else item.get("floors")
+    if k:
+        form = (item.get("draft") or {}).get(str(k))
         if form is None:
-            return None if k else item
-        dec["t_sol_s"] = FloorForm.from_json(form).at(*view.floors_s())
+            return None
+    else:
+        form = item.get("floors")
+        if form is None:
+            raise ValueError(
+                f"frontier point {item.get('label')} at {item.get('seq')} "
+                "carries no step form: not a "
+                f"{_FRONTIER_SCHEMA} entry")
+    dec["t_sol_s"] = FloorForm.from_json(form).at(*view.floors_s())
     if k:
         binding = dict(dec["binding"])
         tokens, formula = step_tokens(
@@ -1010,11 +1027,10 @@ class _Stored(NamedTuple):
 
     def entry_key(self, view: FrontierView) -> str:
         """The entry's: under the constant scope `none` (SOL: no
-        measurement moves it), in the form the view reads
-        (`FrontierView.entry_parts`) — not the K or acceptance, and for a law
-        entry not the floors (each point carries its step as a function of
-        them)."""
-        return self._key("gallery-frontier", view.entry_parts(),
+        measurement moves it), under the walk alone (`FrontierView.
+        walk_parts`) — not the floors, K or acceptance: each point carries
+        its step as a function of the floors, at every K (`entry_view`)."""
+        return self._key("gallery-frontier", view.walk_parts(),
                          NO_MEASUREMENTS)
 
     def rates_key(self, view: FrontierView, scope: Any) -> str:

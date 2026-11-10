@@ -102,10 +102,11 @@ _GALLERY = KeyedCache(
     single_flight=True,
 )
 
-# A model's decode-frontier entry (`gallery_frontier`) is megabytes of JSON
-# — DeepSeek-V3 on H100 with every layout and speculative K: 16 MB, of
-# which 6.5 MB its points' Kernel Bench measures; Kimi-K3: ~150 MB, 126 MB
-# of them measures — one per model per GPU view (6 GPUs × every model). It
+# A model's decode-frontier entry (`gallery_frontier`) is megabytes of JSON,
+# most of it each point's step as a function of the floors at every K
+# (`FloorForm`) — DeepSeek-V3 on H100 with every layout: 9.0 MB, Kimi-K3:
+# 0.85 MB; all 63 models on H100: 357 MB (measured 2026-11-10) — one per
+# model per GPU view (6 GPUs × every model). It
 # is kept in two parts on disk and in the remote tier only (`_FRONTIER`):
 # no process holds an entry in memory. What a page reads is a view's
 # drawing — the frontier points under its floors, K and acceptance, and the

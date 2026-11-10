@@ -649,6 +649,20 @@ def law_symbol(name: str) -> sp.Symbol:
 _WORKLOAD_BY_NAME = {symbol.name: symbol for symbol in WORKLOAD}
 
 
+def floor_of(name: str) -> Optional[str]:
+    """Which of the two floors a law's name is a time of, by its family in
+    the vocabulary (`_LAW_NAME`): "latency" for a collective's fixed time
+    (`COMM_LATENCY_S[_<collective>]`, link traversals times the link
+    latency), "launch_floor" for `LAUNCH_S`, None for every other name."""
+    m = _LAW_NAME.fullmatch(name)
+    if m is None:
+        return None
+    for family in ("latency", "launch_floor"):
+        if m.group(family):
+            return family
+    return None
+
+
 def read_row_law(text: str) -> sp.Expr:
     """Law text (`sp.sstr` of a row's or a step's law) back as the law: the
     one reader, over the closed vocabulary (`law_symbol`). The operators are
@@ -1272,13 +1286,43 @@ class FloorForm:
             max(a, b + c * link_latency_s, n * launch_floor_s)
             for a, b, c, n in self.terms)
 
+    @classmethod
+    def collapsed(cls, constant: float,
+                  terms: Iterable[Tuple[float, float, float, float]]
+                  ) -> "FloorForm":
+        """The form of `constant` and `terms`, every set of terms equal up
+        to a positive weight collapsed into one: `w x max(a, b + cα, nL)`
+        is `max(wa, wb + wcα, wnL)`, so terms on one ray add. Exact: the
+        ray of a term is its coefficients over its first nonzero one, as
+        rationals (`Fraction` of each float), so only terms that are
+        exactly proportional share one. The one constructor a builder
+        calls (`CardForm.bind`, `sol_law._FloorTerms.form`)."""
+        merged: Dict[Tuple[Fraction, ...], List[float]] = {}
+        for term in terms:
+            pivot = Fraction(next((x for x in term if x), 0.0))
+            if not pivot:
+                continue
+            ray = tuple(Fraction(x) / pivot for x in term)
+            if ray in merged:
+                merged[ray] = [s + x for s, x in zip(merged[ray], term,
+                                                    strict=True)]
+            else:
+                merged[ray] = list(term)
+        return cls(float(constant),
+                   tuple((a, b, c, n) for a, b, c, n in merged.values()))
+
     def to_json(self) -> Dict[str, Any]:
-        return {"constant": self.constant, "terms": [list(t) for t in self.terms]}
+        """Columnar: the constant and one array per coefficient."""
+        return {"constant": self.constant,
+                **{name: [term[i] for term in self.terms]
+                   for i, name in enumerate("abcn")}}
 
     @classmethod
     def from_json(cls, d: Mapping[str, Any]) -> "FloorForm":
-        return cls(float(d["constant"]),
-                   tuple(tuple(float(x) for x in t) for t in d["terms"]))
+        return cls(float(d["constant"]), tuple(
+            (float(a), float(b), float(c), float(n))
+            for a, b, c, n in zip(d["a"], d["b"], d["c"], d["n"],
+                                  strict=True)))
 
 
 @dataclass(frozen=True)
@@ -1422,7 +1466,7 @@ class CardForm:
                 constant += max(a, b)
             else:
                 terms.append((a, b, c, n))
-        return FloorForm(constant, tuple(terms))
+        return FloorForm.collapsed(constant, terms)
 
     def to_json(self) -> Dict[str, Any]:
         return {"terms": [list(t) for t in self.terms],

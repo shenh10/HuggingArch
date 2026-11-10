@@ -20,6 +20,7 @@ from backend.inference.defaults import (
     LAUNCH_FLOOR_US_DEFAULT,
 )
 from backend.inference.parallel_config import ParallelConfig
+from backend.inference.row_roofline import FloorForm
 from backend.inference.sol_law import (
     LawGraph,
     cardBinding,
@@ -135,6 +136,46 @@ def test_a_point_grid_is_the_same_point_projection_read_once():
         for batch in (1, 8, None)
     ]
     assert grid == [oneAtATime]
+
+
+def test_a_decode_floor_form_is_the_law_at_every_floor():
+    """A projected decode step's floor form (`floors`) substituted at any
+    floors is the law evaluated with those floors bound into the card
+    (`cardBinding`) — a second road through the graph, not through the
+    form. Exercises the link-latency arms of a TP2 all-reduce ladder and
+    the launch arms, across batches and verify widths."""
+    environment = _environment()
+    parallel = ParallelConfig(tp_attention=2, tp_dense_ffn=2,
+                              tp_moe_expert=2)
+    record = servingLawRecord(
+        environment, gpu_sku="H100-SXM", anchorContext=4096,
+        outputTokens=256, parallel=parallel,
+        capacityCards=("H100-SXM",), capacityContexts=(8192,))
+    card = Card.of("H100-SXM")
+    law = LawGraph.from_json(record["phases"]["decode"]["law"])
+    [row] = servingLawPoints(
+        record, card=card, contexts=(8192,), decodeBatches=(1, 64),
+        outputTokens=256, verifyWidth=3,
+        comm_latency_us=COMM_LATENCY_US_DEFAULT,
+        launch_floor_us=LAUNCH_FLOOR_US_DEFAULT, floorForms=True)
+    for point, batch in zip(row, (1, 64), strict=True):
+        form = FloorForm.from_json(point["phases"]["decode"]["floors"])
+        assert form.terms
+        for comm_us, launch_us in ((0.0, 0.0), (2.3, 3.7), (40.0, 0.1),
+                                   (0.5, 25.0)):
+            direct = float(law.evaluate({
+                **cardBinding(record, card, comm_latency_us=comm_us,
+                              launch_floor_us=launch_us),
+                "B": batch, "s_input": 8192, "s_output": 256,
+                "s_prefix": 0, "s_verify": 3, "rho": 1})["t_sol_s"])
+            assert form.at(comm_us * 1e-6, launch_us * 1e-6) == pytest.approx(
+                direct, rel=1e-12)
+    # Without the flag a point publishes the time alone.
+    [[plain, _]] = servingLawPoints(
+        record, card=card, contexts=(8192,), decodeBatches=(1, 64),
+        outputTokens=256, comm_latency_us=COMM_LATENCY_US_DEFAULT,
+        launch_floor_us=LAUNCH_FLOOR_US_DEFAULT)
+    assert "floors" not in plain["phases"]["decode"]
 
 
 def test_a_law_binds_no_card_of_another_walk_class():

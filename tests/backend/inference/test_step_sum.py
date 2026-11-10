@@ -510,3 +510,22 @@ class TestTheDispatchIsCasesOverThePayload:
             assert t[2] == pytest.approx(t[0] + slope * 7e-6, rel=1e-12)
             # The slope is the instances times the algorithm's hops.
             assert slope == pytest.approx(3 * (1 if batch == 1 else 2), rel=1e-9)
+
+
+def test_a_floor_form_collapses_proportional_terms_exactly():
+    """Terms equal up to a positive weight are one term (`w·max(a, b+cα, nL)
+    = max(wa, wb+wcα, wnL)`); terms that are not exactly proportional stay
+    apart; the form is the same function at any floors, and its columnar
+    JSON reads back as itself."""
+    from backend.inference.row_roofline import FloorForm
+
+    terms = [(0.25, 0.0, 0.0, 1.0), (0.75, 0.0, 0.0, 3.0),
+             (0.25, 0.0, 0.0, 1.0000000000000002), (1e-6, 3e-6, 4.0, 0.0),
+             (0.0, 0.0, 0.0, 0.0)]
+    raw = FloorForm(0.5, tuple(terms))
+    form = FloorForm.collapsed(0.5, terms)
+    assert len(form.terms) == 3
+    for floors in ((0.0, 0.0), (2.3e-6, 3.7e-6), (1e-5, 1e-7), (0.0, 0.5)):
+        assert form.at(*floors) == pytest.approx(raw.at(*floors), rel=1e-15)
+    assert FloorForm.from_json(json.loads(json.dumps(form.to_json()))) == form
+    assert set(form.to_json()) == {"constant", "a", "b", "c", "n"}

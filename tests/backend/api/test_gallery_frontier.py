@@ -16,6 +16,7 @@ import pytest
 import backend.api.gallery_frontier as f
 from backend.code_trace.provider import recording
 from backend.inference.parallel_config import ParallelConfig
+from backend.inference.row_roofline import FloorForm
 from backend.inference.parallel_sweep import class_cards
 from backend.inference.sweep_grid import (
     FRONTIER_BATCH_GRID,
@@ -61,10 +62,10 @@ def _timed_item(seq, *, batch=4, plain_s=0.01, drafts=None,
            "throughput": {"groups": 1, "num_gpus": 2}}
     return {"seq": seq, "label": "TP2", "num_gpus": 2,
             "sol": {"phases": {"decode": dec}},
-            "floors": None if speculative else {"constant": plain_s, "terms": []},
+            "floors": None if speculative else FloorForm(plain_s, ()).to_json(),
             **({} if measure_record is None else
                 {"measureRecord": measure_record}),
-            "draft": {str(k): {"constant": t, "terms": []}
+            "draft": {str(k): FloorForm(t, ()).to_json()
                       for k, t in (drafts or {}).items()}}
 
 
@@ -360,30 +361,41 @@ def test_a_speculative_view_is_its_own_request_but_not_its_own_entry():
             != k2.key_parts())
     # Acceptance is not a key under plain decode.
     assert f.FrontierView("B200", acceptance_rate=0.6).key_parts() == plain.key_parts()
-        # One entry serves every K and acceptance, keyed by its floors.
-    assert (plain.entry_parts() == k2.entry_parts() == f.FrontierView(
-        "B200", draft_tokens=3, acceptance_rate=0.6).entry_parts())
+    # One entry serves every floor, K and acceptance: each point carries its
+    # step as a function of the floors at every K, substituted when drawn.
+    stored = f._Stored("m", "v1")
     floored = f.FrontierView("B200", comm_latency_us=5.0)
+    assert (stored.entry_key(plain) == stored.entry_key(k2)
+            == stored.entry_key(floored) == stored.entry_key(f.FrontierView(
+                "B200", launch_floor_us=9.0, draft_tokens=3,
+                acceptance_rate=0.6)))
+    assert floored.key_parts() != plain.key_parts()
     fraction = f.FrontierView("B200", gpu_memory_fraction=.8)
     assert not fraction.keeps_walk()
-    assert floored.entry_parts() != plain.entry_parts()
-    assert floored.entry_parts() != f.FrontierView(
-        "B200", launch_floor_us=9.0, draft_tokens=2).entry_parts()
+    assert stored.entry_key(fraction) != stored.entry_key(plain)
 
 
-def test_a_serving_entry_draws_each_k_off_its_kept_step_time():
-    """A serving entry's point keeps every K's step total (`draftTimes`),
-    not a form: a K view reads it and keeps 1 + α·K tokens of it."""
+def test_a_serving_entry_draws_each_k_and_floor_off_its_step_forms():
+    """A serving entry's point keeps every K's step as a function of the
+    floors: a view substitutes its own floors (here a launch-bound term
+    `max(a, n·L)`) and keeps 1 + α·K tokens of it. A K with no form has no
+    step; a plain point without its form is not an entry of this schema."""
     sk = str(GALLERY_SEQ_LENS[0])
     item = _timed_item(sk)
-    item.pop("floors"), item.pop("draft")
-    item["draftTimes"] = {"2": 0.016}
-    view = f.FrontierView("B200", draft_tokens=2, acceptance_rate=0.5)
+    item["draft"] = {"2": FloorForm(0.01, ((0.004, 0.0, 0.0, 1000.0),)).to_json()}
+    view = f.FrontierView("B200", draft_tokens=2, acceptance_rate=0.5,
+                          launch_floor_us=1.0)
     dec = f._at_view(item, view)["sol"]["phases"]["decode"]
-    assert dec["t_sol_s"] == 0.016
-    assert dec["throughput"]["sol"]["time_per_output_token_s"] == 0.016 / 2
+    assert dec["t_sol_s"] == pytest.approx(0.01 + 0.004)
+    assert dec["throughput"]["sol"]["time_per_output_token_s"] == pytest.approx(
+        0.014 / 2)
+    slow = view._replace(launch_floor_us=6.0)
+    assert f._at_view(item, slow)["sol"]["phases"]["decode"][
+        "t_sol_s"] == pytest.approx(0.01 + 0.006)
     assert f._at_view(item, f.FrontierView("B200", draft_tokens=1)) is None
-    assert f._at_view(item, f.FrontierView("B200")) is item
+    item.pop("floors")
+    with pytest.raises(ValueError, match="no step form"):
+        f._at_view(item, f.FrontierView("B200"))
 
 
 def test_the_route_refuses_a_draft_length_off_the_pickers(monkeypatch):
@@ -446,14 +458,10 @@ def test_measured_rows_fold_onto_the_frontier(monkeypatch):
     monkeypatch.setattr(f, "measure_points", apply)
     _inline_measures(monkeypatch)
     sk = str(GALLERY_SEQ_LENS[0])
-    sol = {"phases": {"decode": {"batch": 1, "throughput": {
-        "concurrent_requests": 1, "sol": {
-            "time_per_output_token_s": 0.01, "per_gpu": 100.0}}}}}
     out = f._read_entry({
         "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
         "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU · TP1/EP1/CP1/DP1",
-                     "num_gpus": 1, "sol": sol, "measures": {"decode": {}}}],
+        "_theory": [{**_timed_item(sk, batch=1), "measures": {"decode": {}}}],
     }, f.FrontierView("B200"))
     assert "_theory" not in out
     pt = out["frontier"][sk][0]
@@ -482,8 +490,7 @@ def test_the_measured_fold_does_not_walk(monkeypatch):
     sk = str(GALLERY_SEQ_LENS[0])
     f._read_entry({
         "model_id": "m", "frontier": {sk: []}, "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU", "num_gpus": 1,
-                     "sol": {"phases": {"decode": {}}}, "measures": {}}],
+        "_theory": [{**_timed_item(sk, batch=1), "measures": {}}],
     }, f.FrontierView("B200"))
 
 
@@ -496,16 +503,13 @@ def test_incomplete_measured_coverage_does_not_publish_tok_s(monkeypatch):
     monkeypatch.setattr(f, "measure_points", lambda items, **k: None)
     _inline_measures(monkeypatch)
     sk = str(GALLERY_SEQ_LENS[0])
-    sol = {"phases": {"decode": {"batch": 1, "throughput": {
-        "concurrent_requests": 1,
-        "sol": {"time_per_output_token_s": 0.01, "per_gpu": 100.0},
-        "measured": None},
-        "coverage": {"measured": 2, "total": 3, "states": {"missing": ["k"]}}}}}
+    item = _timed_item(sk, batch=1)
+    item["sol"]["phases"]["decode"]["coverage"] = {
+        "measured": 2, "total": 3, "states": {"missing": ["k"]}}
     out = f._read_entry({
         "model_id": "m", "frontier": {sk: [_pt(100, 100)]},
         "layouts": [], "error": None,
-        "_theory": [{"seq": sk, "label": "1×GPU · TP1/EP1/CP1/DP1",
-                     "num_gpus": 1, "sol": sol, "measures": {"decode": {}}}],
+        "_theory": [{**item, "measures": {"decode": {}}}],
     }, f.FrontierView("B200"))
     pt = out["frontier"][sk][0]
     assert "tok_s_per_user_measured" not in pt
@@ -522,7 +526,7 @@ def test_every_k_is_one_projection_of_every_context(monkeypatch):
     assert all(c["contexts"] == list(GALLERY_SEQ_LENS) for c in calls)
     assert res["draft_errors"] == []
     point = _theory_at(res, GALLERY_SEQ_LENS[0])[0]
-    assert sorted(point["draftTimes"]) == sorted(
+    assert sorted(point["draft"]) == sorted(
         str(k) for k in FRONTIER_DRAFT_TOKENS)
 
 
@@ -620,7 +624,7 @@ def test_one_k_that_fails_is_that_ks_error(monkeypatch):
     assert [(e["draft_tokens"], e["error"]) for e in res["draft_errors"]] == [
         (bad, "verify width refused")]
     point = _theory_at(res, GALLERY_SEQ_LENS[0])[0]
-    assert sorted(point["draftTimes"]) == sorted(
+    assert sorted(point["draft"]) == sorted(
         str(k) for k in FRONTIER_DRAFT_TOKENS if k != bad)
 
 

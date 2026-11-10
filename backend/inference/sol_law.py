@@ -39,7 +39,7 @@ from .gpu_specs import peak_flops_for_dtype, peak_hbm_bw
 from .phases import Speculation, phase_binding, phase_throughput, step_tokens
 from .parallel_config import ParallelConfig
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
-from .row_roofline import StepSum, law_symbol, rung_symbols
+from .row_roofline import FloorForm, StepSum, floor_of, law_symbol, rung_symbols
 from .sol_data import walkRecordSchema as servingLawSchema
 from .calibration_overlay import point_keys
 from .serving_view import servingCapacityView
@@ -263,6 +263,15 @@ class LawGraph:
                    tuple((name, text) for name, text in value["definitions"]),
                    dict(value["outputs"]))
 
+    def floorForm(self, point: Mapping[str, Any],
+                  floorCard: "FloorCard", name: str = "t_sol_s") -> FloorForm:
+        """Output `name` at `point` on a card as a function of the two
+        floors (`_FloorTerms`): the one form every floor is substituted
+        into."""
+        return _floorTerms(self.inputs, self.definitions,
+                           self.outputs[name]).form(
+            point, floorCard.zero, floorCard.unit, self.inputs)
+
     def evaluate(self, binding: Mapping[str, Any]) -> dict[str, Any]:
         program = _compiledGraph(
             self.inputs, self.definitions, tuple(self.outputs.items()))
@@ -274,6 +283,161 @@ class LawGraph:
             self.outputs,
             values[firstOutput:firstOutput + len(self.outputs)],
             strict=True))
+
+
+@dataclass(frozen=True)
+class _FloorTerms:
+    """A step law's terms by the floor each waits on, compiled once per law.
+
+    A step's time is `Σ_k w_k x Max(arms_k)` (`StepSum`, `build_row_exprs`):
+    each arm is a row's compute, memory, collective or launch time, and
+    only the last two read a floor — a collective's fixed time is its link
+    traversals times the link latency (`COMM_LATENCY_S_<collective>`), a
+    launch is `LAUNCH_S`. This is that sum read off the law's own CSE graph,
+    every weight and arm an output of one program over the graph's
+    definitions; `FloorForm` is it at one point with the floors left free.
+    Nothing here is a second statement of the law: a law whose floors sit
+    anywhere but an affine arm of a top-level term is refused."""
+    program: Any
+    firstOutput: int
+    #: Floor-free terms: (weight output, value output).
+    constants: tuple[tuple[int, int], ...]
+    #: Per max term: its weight output and per arm (output, floor or None).
+    terms: tuple[tuple[int, tuple[tuple[int, Optional[str]], ...]], ...]
+
+    def form(self, point: Mapping[str, Any], zero: Mapping[str, float],
+             unit: Mapping[str, float], inputs: Sequence[str]) -> FloorForm:
+        """The step's `FloorForm` at `point` on the card `zero` / `unit`
+        bind with both floors 0 and 1 s: each arm read at the two (it is
+        affine in its one floor), weighted."""
+        at0 = self.program(*({**point, **zero}[n] for n in inputs))
+        at1 = self.program(*({**point, **unit}[n] for n in inputs))
+        base = self.firstOutput
+
+        def read(values: Sequence[Any], index: int) -> float:
+            return float(values[base + index])
+
+        constant = 0.0
+        for weight, value in self.constants:
+            constant += read(at0, weight) * read(at0, value)
+        terms: list[tuple[float, float, float, float]] = []
+        for weightIndex, arms in self.terms:
+            w = read(at0, weightIndex)
+            if w < 0:
+                raise ValueError(
+                    f"a step term is weighted {w}: a max of its arms is not "
+                    "the arms' max weighted")
+            a = b = c = n = 0.0
+            for index, floor in arms:
+                v0, v1 = read(at0, index), read(at1, index)
+                if floor is None:
+                    a = max(a, w * v0)
+                elif floor == "latency":
+                    b, c = w * v0, w * (v1 - v0)
+                else:
+                    if v0 != 0:
+                        raise ValueError(
+                            f"a launch arm is {v0} s with no launch floor")
+                    n = w * v1
+            if c == 0 and n == 0:
+                constant += max(a, b)
+            else:
+                terms.append((a, b, c, n))
+        return FloorForm.collapsed(constant, terms)
+
+
+@memoize(maxsize=1024)
+def _floorTerms(inputs: tuple[str, ...],
+                definitions: tuple[tuple[str, str], ...],
+                output: str) -> _FloorTerms:
+    """`output`'s law split into `_FloorTerms` (its docstring)."""
+    exprs: dict[str, sp.Expr] = {}
+    local: set[str] = set()
+    for name, text in definitions:
+        exprs[name] = _read(text, frozenset(local))
+        local.add(name)
+    floorsOf: dict[str, frozenset[str]] = {}
+
+    def floors(expr: sp.Expr) -> frozenset[str]:
+        out: set[str] = set()
+        for symbol in expr.free_symbols:
+            if symbol.name in exprs:
+                if symbol.name not in floorsOf:
+                    floorsOf[symbol.name] = floors(exprs[symbol.name])
+                out |= floorsOf[symbol.name]
+            else:
+                kind = floor_of(symbol.name)
+                if kind is not None:
+                    out.add(kind)
+        return frozenset(out)
+
+    def affine(expr: sp.Expr) -> bool:
+        """Whether `expr` is affine in the floors it reads: sums, products
+        with one floored factor, cases over floor-free conditions."""
+        if not floors(expr):
+            return True
+        if isinstance(expr, sp.Symbol):
+            return (affine(exprs[expr.name]) if expr.name in exprs
+                    else floor_of(expr.name) is not None)
+        if isinstance(expr, sp.Add):
+            return all(affine(arg) for arg in expr.args)
+        if isinstance(expr, sp.Mul):
+            floored = [arg for arg in expr.args if floors(arg)]
+            return len(floored) == 1 and affine(floored[0])
+        if isinstance(expr, sp.Piecewise):
+            return all(not floors(cond) and affine(value)
+                       for value, cond in expr.args)
+        return False
+
+    outputs: list[str] = []
+
+    def emit(expr: Any) -> int:
+        outputs.append(sp.sstr(expr))
+        return len(outputs) - 1
+
+    constants: list[tuple[int, int]] = []
+    terms: list[tuple[int, tuple[tuple[int, Optional[str]], ...]]] = []
+
+    def arm(expr: sp.Expr) -> tuple[int, Optional[str]]:
+        kinds = floors(expr)
+        if len(kinds) > 1 or not affine(expr):
+            raise ValueError(
+                f"a step term's arm is not affine in one floor: {expr}")
+        return emit(expr), next(iter(kinds), None)
+
+    def split(expr: sp.Expr, weight: tuple[sp.Expr, ...]) -> None:
+        w = sp.Mul(*weight) if weight else sp.Integer(1)
+        if not floors(expr):
+            constants.append((emit(w), emit(expr)))
+        elif isinstance(expr, sp.Symbol) and expr.name in exprs:
+            split(exprs[expr.name], weight)
+        elif isinstance(expr, sp.Add):
+            for term in expr.args:
+                split(term, weight)
+        elif isinstance(expr, sp.Mul):
+            floored = [arg for arg in expr.args if floors(arg)]
+            if len(floored) != 1:
+                raise ValueError(
+                    f"a step term multiplies {len(floored)} floored factors")
+            split(floored[0], (*weight, *(
+                arg for arg in expr.args if arg is not floored[0])))
+        elif isinstance(expr, sp.Max):
+            arms = tuple(arm(a) for a in expr.args)
+            if sum(1 for _i, kind in arms if kind == "latency") > 1 or sum(
+                    1 for _i, kind in arms if kind == "launch_floor") > 1:
+                raise ValueError(
+                    "a step term waits on one collective and one launch")
+            terms.append((emit(w), arms))
+        else:
+            # A term whose max SymPy folded to its one floored arm.
+            terms.append((emit(w), (arm(expr),)))
+
+    split(_read(output, frozenset(local)), ())
+    program = _compiledGraph(
+        inputs, definitions,
+        tuple((f"_floor{i}", text) for i, text in enumerate(outputs)))
+    return _FloorTerms(program, len(definitions), tuple(constants),
+                       tuple(terms))
 
 
 def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
@@ -884,12 +1048,14 @@ def servingLawPhaseView(record: Mapping[str, Any], name: str, *, batch: int,
 
 def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
                      cardValues: Mapping[str, float],
+                     floorCard: "FloorCard",
                      graphs: Mapping[str, LawGraph], context: int,
                      outputTokens: int, decodeBatch: int | None,
                      prefillBatch: int | None, prefixCached: int,
                      verifyWidth: int,
                      draftTokens: int, acceptanceRate: float,
-                     prefillTimes: dict[tuple[int, int, int, int], float]) -> dict:
+                     prefillTimes: dict[tuple[int, int, int, int], float],
+                     floorForms: bool = False) -> dict:
     decodeB = (int(decodeBatch) if decodeBatch is not None
                else int(facts["max_decode_batch"]))
     prefillB = (int(prefillBatch) if prefillBatch is not None
@@ -926,13 +1092,18 @@ def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
                 prefillTimes[key] = t
             t = prefillTimes[key]
         else:
-            t = float(graph.evaluate(point)["t_sol_s"])
+            # The decode step is its floor form at the request's floors:
+            # one road to the time, whichever floors a reader substitutes.
+            form = graph.floorForm(point, floorCard)
+            t = form.at(*floorCard.floors_s)
         phases[name] = servingLawPhaseView(
             record, name, batch=batch, time=t, context=context,
             outputTokens=outputTokens, verifyWidth=verifyWidth,
             prefixCached=int(prefixCached),
             draftTokens=draftTokens, acceptanceRate=acceptanceRate,
             groups=groups, num_gpus=num_gpus)
+        if name == "decode" and floorForms:
+            phases[name]["floors"] = form.to_json()
     return {
         "avg_input_tokens": context,
         "avg_output_tokens": outputTokens,
@@ -978,6 +1149,9 @@ def servingLawPoint(record: Mapping[str, Any], *, card: Card,
         cardValues=cardBinding(
             record, card, comm_latency_us=comm_latency_us,
             launch_floor_us=launch_floor_us),
+        floorCard=FloorCard.of(
+            record, card, comm_latency_us=comm_latency_us,
+            launch_floor_us=launch_floor_us),
         graphs={name: LawGraph.from_json(record["phases"][name]["law"])
                 for name in ("prefill", "decode")},
         context=context, outputTokens=outputTokens, decodeBatch=decodeBatch,
@@ -1011,7 +1185,8 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                      draftTokens: int = 0,
                      acceptanceRate: float = 1.0,
                      comm_latency_us: float, launch_floor_us: float,
-                     servedOnly: bool = False
+                     servedOnly: bool = False,
+                     floorForms: bool = False
                      ) -> list[list[dict | None]]:
     """A context-by-batch projection of one serving-law record.
 
@@ -1021,11 +1196,15 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
     schedule — and binds each context's prefix and verify width. With
     ``servedOnly``, capacity is asked before the law is evaluated; a missing
     capacity fact is an absent point, as a reader of one point already
-    treats its exception as absence.
+    treats its exception as absence. With ``floorForms``, each point's
+    decode phase also publishes its step as a function of the two floors
+    (`floors`, `FloorForm.to_json`), the form its `t_sol_s` is read off.
     """
     cardValues = cardBinding(
         record, card, comm_latency_us=comm_latency_us,
         launch_floor_us=launch_floor_us)
+    floorCard = FloorCard.of(record, card, comm_latency_us=comm_latency_us,
+                             launch_floor_us=launch_floor_us)
     if (not isinstance(prefillBatches, int)
             and len(prefillBatches) != len(decodeBatches)):
         raise ValueError("prefillBatches must name one batch per decode batch")
@@ -1072,15 +1251,40 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                 else prefillBatches[i])
             point = _servingLawPoint(
                 record, facts=facts, cardValues=cardValues,
+                floorCard=floorCard,
                 graphs=graphs, context=int(context), outputTokens=outputTokens,
                 decodeBatch=decodeBatch, prefillBatch=prefillBatch,
                 prefixCached=prefixCached, verifyWidth=verifyWidth,
                 draftTokens=draftTokens,
-                acceptanceRate=acceptanceRate, prefillTimes=prefillTimes)
+                acceptanceRate=acceptanceRate, prefillTimes=prefillTimes,
+                floorForms=floorForms)
             row.append(without_step(point, ())
                        if facts.get("infeasibility_reason") else point)
         out.append(row)
     return out
+
+
+@dataclass(frozen=True)
+class FloorCard:
+    """A card's binding of a law with the two floors apart: the card's
+    values at both floors 0 (`zero`) and at both 1 s (`unit`) — a
+    collective's fixed time is linear in the link latency
+    (`comm_cost.collective_latency`), a launch is `LAUNCH_S` — and the
+    floors a point is read at (`floors_s`: link latency, launch floor)."""
+    zero: Mapping[str, float]
+    unit: Mapping[str, float]
+    floors_s: tuple[float, float]
+
+    @classmethod
+    def of(cls, record: Mapping[str, Any], card: Card, *,
+           comm_latency_us: float, launch_floor_us: float) -> "FloorCard":
+        oneSecondUs = 1e6
+        return cls(
+            cardBinding(record, card, comm_latency_us=0.0,
+                        launch_floor_us=0.0),
+            cardBinding(record, card, comm_latency_us=oneSecondUs,
+                        launch_floor_us=oneSecondUs),
+            (comm_latency_us * 1e-6, launch_floor_us * 1e-6))
 
 
 def cardBinding(record: Mapping[str, Any], card: Card, *,
