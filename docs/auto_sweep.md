@@ -379,6 +379,22 @@ unmeasured collective is `missing`, and so every multi-GPU layout has no
 measured total until its collectives are measured. This is the rule working:
 a step whose collectives are unmeasured has no measured step time.
 
+### 5.5 The partial track (opt-in)
+
+Beside the all-or-nothing total there is one separately named blend,
+`Folded.partial`: the step's SOL total with every fully measured row's SOL
+share replaced by its measured share. Because the SOL total and the measured
+formula are one aggregation (`StepSum.total` over `t_op` and over `n·T`), a
+row's SOL share is its term's weight times its `t_op_s`, so
+
+    t_partial = t_sol − Σ_{measured rows} w·t_op + Σ_{measured rows} share
+
+A row with any term not measured keeps its SOL time whole. The fold states
+`t_partial_s` and `partial_measured_share` (the measured part of it, by time)
+on each phase, and `throughput.partial`; at no coverage it is `t_sol_s`, at
+full coverage `t_measured_s`. It is never called measured: the page shows it
+only behind a "Partial measured" checkbox, always beside its coverage.
+
 `MeasuredTrack.coverage()` also reports `unchecked`: how many measured rows
 rest on a corpus row whose cross-check is not `passed` (typically no fp32
 reference could be built). Those rows are used, because refusing them would
@@ -399,6 +415,11 @@ measured track through that module.
   "N / M ops measured" and the rows per state, with the keys in the hover.
   The page applies the rule itself (`completeTotal`), so a number is never
   drawn under incomplete coverage. Unknown coverage counts as incomplete.
+- **The partial track** (`t_partial_s`, `throughput.partial`, the Gallery's
+  `frontier_partial`) is the one blended number (§5.5). It is drawn only when
+  the reader ticks "Partial measured", under its own name, with
+  `partialCoverageText`: the share of the step's time that is measured and
+  "N / M ops measured".
 - **Per-op rows** show their own `t_measured_s` under any coverage. `0` is a
   value and renders as `0`; an absent or `null` value renders as `—`.
 - **Group rows** (module groups, declaration parents) show the backend's
@@ -441,7 +462,8 @@ list.
 | `/inference/estimate` `phases.<phase>` | `t_measured_s` (null unless complete), `coverage`, and the older `measured_rows` / `total_rows` (the page falls back to these, with no states, when `coverage` is absent) |
 | `/inference/estimate-sweep`, each point's `phases.<phase>` | The same after a measured fold; its SOL projection carries no breakdown row counts |
 | `/inference/estimate-parallel-sweep`, each chart point | `<phase>_tps_per_gpu_measured`, `<phase>_t_measured_s` (null unless complete), `<phase>_measured_coverage` |
-| `/gallery/frontier`, each model | `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
+| `/inference/estimate` and sweep points, `phases.<phase>` | `t_partial_s`, `partial_measured_share`, `throughput.partial` (§5.5; absent until a measured fold reads) |
+| `/gallery/frontier`, each model | `frontier_partial` (every point with a SOL time; each carries `partial_measured_share`), `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
 | Per-op rows (`per_op_timing*`, `phases.<phase>.flops_by_module`) | `t_measured_s` (`0` on zero-cost rows, null where not measured), `measured_state`, `measured_key` |
 
 ## 7. Caching: theory and measured answers

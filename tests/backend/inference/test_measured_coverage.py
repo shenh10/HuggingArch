@@ -192,3 +192,39 @@ def test_parallel_sweep_points_carry_their_coverage():
             assert cov["measured"] < cov["total"] and cov["states"]["missing"]
             assert p[f"{phase}_t_measured_s"] is None
             assert p[f"{phase}_tps_per_gpu_measured"] is None
+
+
+def test_partial_total_is_each_row_measured_or_its_sol():
+    """The partial track (`Folded.partial`): the step with every measured row
+    at its measured time and every other row at its own SOL time. Checked by
+    a second route — adding the per-op rows up directly, which at pp=1 with
+    no draft is the step — against the backend's SOL-total-minus-shares."""
+    with FixtureBench(_policy) as bench:
+        est = _estimate(bench, mode="envelope")
+    for phase, lst in ROWS.items():
+        ph, rows = est["phases"][phase], est[lst]
+        blend = sum(r["t_measured_s"] if r["measured_state"] == MEASURED
+                    else r["t_op_s"] for r in rows)
+        real = sum(r["t_measured_s"] for r in rows
+                   if r["measured_state"] == MEASURED)
+        assert ph["t_measured_s"] is None
+        assert ph["t_partial_s"] == pytest.approx(blend, rel=1e-9)
+        assert 0 < ph["partial_measured_share"] < 1
+        assert ph["partial_measured_share"] == pytest.approx(real / blend, rel=1e-9)
+        assert ph["throughput"]["partial"] is not None
+
+
+def test_partial_total_at_the_ends_is_sol_or_measured():
+    """Nothing measured: the blend is the SOL total, share 0. Everything
+    measured: it is the measured total, share 1."""
+    with FixtureBench(lambda key: "missing") as bench:
+        none = _estimate(bench, mode="envelope")
+    with FixtureBench() as bench:
+        full = _estimate(bench, mode="envelope")
+    for phase in ROWS:
+        ph = none["phases"][phase]
+        assert ph["t_partial_s"] == pytest.approx(ph["t_sol_s"], rel=1e-9)
+        assert ph["partial_measured_share"] == 0
+        ph = full["phases"][phase]
+        assert ph["t_partial_s"] == ph["t_measured_s"]
+        assert ph["partial_measured_share"] == pytest.approx(1.0)

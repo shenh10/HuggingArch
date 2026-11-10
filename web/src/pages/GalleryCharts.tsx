@@ -436,6 +436,12 @@ export type FrontierPt = {
   tok_s_per_user_measured?: number | null;
   tok_s_per_gpu_measured?: number | null;
   tpot_measured_s?: number | null;
+  /** The partial track: measured ops measured, the rest at SOL, and the
+   *  share of the step's time that is measured (0–1). */
+  tok_s_per_user_partial?: number | null;
+  tok_s_per_gpu_partial?: number | null;
+  tpot_partial_s?: number | null;
+  partial_measured_share?: number | null;
 };
 
 export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
@@ -445,6 +451,8 @@ export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
   full?: string;
   points: P[];
   measured?: P[];
+  /** The partial-measured frontier (opt-in), drawn dotted. */
+  partial?: P[];
   /** Line style, for series that share a colour (one card under several
    *  layouts). */
   lineType?: "solid" | "dashed" | "dotted";
@@ -533,8 +541,10 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
     tooltip: {
       trigger: "item",
       formatter: (item: unknown) => {
-        const it = item as { seriesIndex?: number; data?: { pt?: P } };
-        const s = it.seriesIndex != null ? drawn[it.seriesIndex] : undefined;
+        const it = item as { seriesIndex?: number; seriesName?: string; data?: { pt?: P } };
+        // A measured or partial line is named as its model's SOL line.
+        const s = (it.seriesIndex != null ? drawn[it.seriesIndex] : undefined)
+          ?? drawn.find((d) => d.label === it.seriesName);
         const p = it.data?.pt;
         if (!s || !p) return "";
         const lines = [
@@ -545,6 +555,11 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         ];
         if (p.tok_s_per_user_measured != null && p.tok_s_per_gpu_measured != null) {
           lines.push(`measured ${perUser(p.tok_s_per_user_measured)} · ${perGpu(p.tok_s_per_gpu_measured)}`);
+        }
+        if (p.tok_s_per_user_partial != null && p.tok_s_per_gpu_partial != null) {
+          const share = p.partial_measured_share;
+          lines.push(`partial measured ${perUser(p.tok_s_per_user_partial)} · ${perGpu(p.tok_s_per_gpu_partial)}`
+            + (share != null ? ` (${(share * 100).toFixed(0)}% of time measured)` : ""));
         }
         return lines.join("<br/>");
       },
@@ -602,6 +617,27 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
           showSymbol: true,
           symbolSize: 5,
           lineStyle: { width: 1.4, type: "dashed" as const, color: s.color },
+          itemStyle: { color: s.color },
+        }];
+      }),
+      ...drawn.flatMap((s) => {
+        const pts = (s.partial || []).filter(
+          (p) => p.tok_s_per_user_partial != null && p.tok_s_per_gpu_partial != null,
+        );
+        if (!pts.length) return [];
+        return [{
+          type: "line" as const,
+          name: s.label,
+          data: [...pts]
+            .sort((a, b) => (a.tok_s_per_user_partial ?? 0) - (b.tok_s_per_user_partial ?? 0))
+            .map((p) => ({
+              value: [p.tok_s_per_user_partial, p.tok_s_per_gpu_partial],
+              pt: p,
+            })),
+          showSymbol: true,
+          symbol: "triangle",
+          symbolSize: 5,
+          lineStyle: { width: 1.4, type: "dotted" as const, color: s.color },
           itemStyle: { color: s.color },
         }];
       }),

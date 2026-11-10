@@ -438,6 +438,9 @@ def test_measured_rows_fold_onto_the_frontier(monkeypatch):
             dec = it["sol"]["phases"]["decode"]
             dec["throughput"]["measured"] = {
                 "time_per_output_token_s": 0.02, "per_gpu": 50.0}
+            dec["throughput"]["partial"] = {
+                "time_per_output_token_s": 0.025, "per_gpu": 40.0}
+            dec["partial_measured_share"] = 0.75
             dec["coverage"] = {"measured": 3, "total": 3}
 
     monkeypatch.setattr(f, "measure_points", apply)
@@ -459,6 +462,11 @@ def test_measured_rows_fold_onto_the_frontier(monkeypatch):
     assert pt["tok_s_per_gpu_measured"] == 50.0
     meas = out["frontier_measured"][sk][0]
     assert meas["tok_s_per_user_measured"] == 50.0
+    # The partial track rides the same point, with its measured share.
+    part = out["frontier_partial"][sk][0]
+    assert part["tok_s_per_user_partial"] == 40.0
+    assert part["tok_s_per_gpu_partial"] == 40.0
+    assert part["partial_measured_share"] == 0.75
 
 
 def test_the_measured_fold_does_not_walk(monkeypatch):

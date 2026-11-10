@@ -5,7 +5,11 @@
 //   - An end-to-end measured total (a step time, a throughput, a chart
 //     point) is shown only when every op of the step is measured. Otherwise
 //     the page shows coverage — "N / M ops measured" and the keys that are
-//     not — and never a partial or mixed number.
+//     not — and never a partial or mixed number under the measured name.
+//     The one exception is opt-in and separately named: the partial track
+//     (`t_partial_s`, a checkbox on the Inference and Gallery panels), the
+//     step with every measured row at its measured time and every other row
+//     at its SOL time, always shown with how much of it is real.
 //   - A per-op row shows its own measured time whenever it has one, under
 //     any coverage. 0 is a value (a zero-cost row is measured at 0).
 import { fmtTime } from "./format";
@@ -143,4 +147,14 @@ export function stateKeysText(cov: MeasuredCoverage | null | undefined, limit = 
  *  made here. */
 export function groupMeasured(row: { t_measured_s?: number | null; t_measured_agg?: number | null }): number | null {
   return rowMeasured(row.t_measured_agg !== undefined ? row.t_measured_agg : row.t_measured_s);
+}
+
+/** The partial track's real-value coverage: "63% of time measured · 12 / 40
+ *  ops measured" — the time share the backend states (`partial_measured_
+ *  share`) and the row count. */
+export function partialCoverageText(share: number | null | undefined,
+                                    cov: MeasuredCoverage | null | undefined): string {
+  const pct = typeof share === "number" && Number.isFinite(share)
+    ? `${(share * 100).toFixed(share > 0 && share < 0.01 ? 1 : 0)}% of time measured` : "";
+  return [pct, cov ? coverageText(cov) : ""].filter(Boolean).join(" · ");
 }

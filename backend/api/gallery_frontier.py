@@ -167,7 +167,7 @@ pareto_front = _pareto_front
 # drawn view). A drawing's fields change without the entry's, and an entry is
 # priced again only when its own do.
 _FRONTIER_SCHEMA = "gallery-frontier-v12"
-_DRAWING_SCHEMA = "gallery-frontier-drawing-v4"
+_DRAWING_SCHEMA = "gallery-frontier-drawing-v5"
 _GALLERY_SELECTION = "envelope"
 #: The precision profile every frontier is priced under: as shipped.
 _GALLERY_PRECISION = AS_SHIPPED
@@ -723,9 +723,17 @@ def _measured_rates(core: dict,
     for i, item in zip(index, items, strict=True):
         dec = item["sol"]["phases"]["decode"]
         meas = (dec.get("throughput") or {}).get("measured")
+        part = (dec.get("throughput") or {}).get("partial")
+        rate: Dict[str, Any] = {}
         if meas and meas.get("time_per_output_token_s"):
-            rates[str(i)] = {"time_per_output_token_s": meas["time_per_output_token_s"],
-                             "per_gpu": meas["per_gpu"]}
+            rate["measured"] = {"time_per_output_token_s": meas["time_per_output_token_s"],
+                                "per_gpu": meas["per_gpu"]}
+        if part and part.get("time_per_output_token_s"):
+            rate["partial"] = {"time_per_output_token_s": part["time_per_output_token_s"],
+                               "per_gpu": part["per_gpu"]}
+            rate["partial_measured_share"] = dec.get("partial_measured_share")
+        if rate:
+            rates[str(i)] = rate
         if "decode" in item["measures"]:
             coverage.add(i, dec["coverage"])
     timings.update(getattr(measureAt, "timings", {}))
@@ -832,9 +840,13 @@ def _draw(core: dict, view: FrontierView, state: str,
                 token=i))
             continue
         dec = item["sol"]["phases"]["decode"]
-        meas = (rates or {}).get("rates", {}).get(str(i))
-        if meas is not None:
-            dec = {**dec, "throughput": {**dec["throughput"], "measured": meas}}
+        rate = (rates or {}).get("rates", {}).get(str(i))
+        if rate is not None:
+            dec = {**dec,
+                   "throughput": {**dec["throughput"],
+                                  "measured": rate.get("measured"),
+                                  "partial": rate.get("partial")},
+                   "partial_measured_share": rate.get("partial_measured_share")}
         records.append(CloudRecord(
             coordinates=coordinates,
             estimate={"phases": {"decode": dec}},
@@ -854,6 +866,7 @@ def _draw(core: dict, view: FrontierView, state: str,
 
     out["frontier"] = fronts("sol")
     out["frontier_measured"] = fronts("measured")
+    out["frontier_partial"] = fronts("partial")
     if state == "reads":
         cov = rates["coverage"]
         out["measured_track"]["timings"] = rates.get("timings") or {}

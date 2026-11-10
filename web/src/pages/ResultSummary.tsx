@@ -47,6 +47,12 @@ export type PhaseMetrics = {
   /** The measured step time, shown only at complete coverage
    *  (`measured.ts`); never the SOL time. */
   t_measured_s?: number | null;
+  /** The partial track: each measured row at its measured time, every other
+   *  row at its own SOL time (`Folded.partial`). A blend, not a measurement;
+   *  shown only when the reader asks for it, always beside its coverage. */
+  t_partial_s?: number | null;
+  /** The part of `t_partial_s` that is measured, by time (0–1). */
+  partial_measured_share?: number | null;
   /** How many of the step's per-op rows are measured, of how many, and the
    *  keys of the rest by state (docs/auto_sweep.md §6). */
   coverage?: MeasuredCoverage | null;
@@ -93,6 +99,8 @@ export type PhaseMetrics = {
              *  1 + α·K under speculative decoding, the step itself without. */
             time_per_output_token_s?: number };
     measured?: { per_gpu?: number; cluster?: number; formula?: Formula };
+    partial?: { per_gpu?: number; cluster?: number; formula?: Formula;
+                time_per_output_token_s?: number };
   };
   /** The speculative draft's forwards, when the request counted them. Every
    *  total above already includes them; this is the draft's own term. */

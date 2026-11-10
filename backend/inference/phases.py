@@ -117,6 +117,13 @@ class PhaseMetrics:
     #: Kernel Bench has not measured. None otherwise; `coverage` says what is
     #: there. Stated by the measured fold (`batch_sweep.apply_measured`).
     t_measured_s: Optional[float] = None
+    #: The partial track: `t_sol_s` with each fully measured row's SOL share
+    #: replaced by its measured share (`Folded.partial`) — a blend, never
+    #: called measured; `partial_measured_share` is the part of it that is
+    #: measured, by time. None until the measured fold reads (`batch_sweep.
+    #: apply_measured`), and with `t_sol_s`.
+    t_partial_s: Optional[float] = None
+    partial_measured_share: Optional[float] = None
     #: How many of the step's per-op rows carry a measured time, of how many.
     measured_rows: int = 0
     total_rows: int = 0
@@ -1036,7 +1043,8 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
     # A phase that never ran (OOM, infeasible) has no step time and so no
     # rate; one that ran states its tokens and how they were counted.
     timed = any(t is not None and t > 0
-                for t in (phase.get("t_sol_s"), phase.get("t_measured_s")))
+                for t in (phase.get("t_sol_s"), phase.get("t_measured_s"),
+                          phase.get("t_partial_s")))
     binding = phase.get("binding") or {}
     tokens = float(binding["effective_tokens_per_step"]) if timed else None
     # The tokens' own derivation (`B × (1 + α·K)`), written out in place.
@@ -1087,6 +1095,7 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
         "num_gpus": gpus,
         "sol": rates(phase.get("t_sol_s")),
         "measured": rates(phase.get("t_measured_s")),
+        "partial": rates(phase.get("t_partial_s")),
     }
 
 

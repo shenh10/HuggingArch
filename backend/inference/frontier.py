@@ -109,7 +109,8 @@ def parallel_mode(parallel: Any) -> str:
 #: A decode point's two axes, both higher-is-better: tokens/s one request
 #: sees and tokens/s per GPU, on one track (`decode_point`).
 AXES = {"sol": ("tok_s_per_user", "tok_s_per_gpu"),
-        "measured": ("tok_s_per_user_measured", "tok_s_per_gpu_measured")}
+        "measured": ("tok_s_per_user_measured", "tok_s_per_gpu_measured"),
+        "partial": ("tok_s_per_user_partial", "tok_s_per_gpu_partial")}
 
 
 def decode_point(per: dict) -> Optional[dict]:
@@ -136,6 +137,15 @@ def decode_point(per: dict) -> Optional[dict]:
         out["tok_s_per_user_measured"] = 1.0 / mt
         out["tok_s_per_gpu_measured"] = float(meas["per_gpu"])
         out["tpot_measured_s"] = mt
+    # The partial track (`Folded.partial`): measured rows measured, the rest
+    # at SOL, with how much of the step's time is measured.
+    part = (dec.get("throughput") or {}).get("partial")
+    if part and part.get("time_per_output_token_s"):
+        pt = float(part["time_per_output_token_s"])
+        out["tok_s_per_user_partial"] = 1.0 / pt
+        out["tok_s_per_gpu_partial"] = float(part["per_gpu"])
+        out["tpot_partial_s"] = pt
+        out["partial_measured_share"] = dec.get("partial_measured_share")
     return out
 
 

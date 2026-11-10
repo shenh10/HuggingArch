@@ -19,7 +19,7 @@ import {
 } from "./ComputeGraph";
 import { visibleSpan, type DeclarationRow } from "../declarations";
 import { foldDepth, foldKey, hasFoldChildren, visibleFold } from "../moduleFold";
-import { completeTotal, coverageText, fmtMeasured, groupMeasured, phaseCoverage, rowMeasured, stateCounts, stateKeysText } from "../measured";
+import { completeTotal, coverageText, fmtMeasured, groupMeasured, partialCoverageText, phaseCoverage, rowMeasured, stateCounts, stateKeysText } from "../measured";
 import type { AbsorbedOp, Estimate, FusionDelta, ModuleFoldRow, Occurrence, OpTableTotal, PerOpRow, PhaseMetrics, RowBound, SourceBadge, SpeculativeDraftTerm } from "./ResultSummary";
 import { SourceAnchor } from "../SourceAnchor";
 
@@ -76,8 +76,8 @@ function shapeStr(m: PhaseMetrics): string {
   return parts.join(" · ");
 }
 
-function tokPerSec(m: PhaseMetrics): string {
-  const t = m.throughput?.sol;
+function tokPerSec(m: PhaseMetrics, track: "sol" | "partial" = "sol"): string {
+  const t = m.throughput?.[track];
   const v = t?.per_gpu;
   return v != null && Number.isFinite(v) ? `${v.toFixed(0)} tok/s` : "—";
 }
@@ -368,6 +368,7 @@ function LeafOpRow({ row, target, phase, depth = 0, perLayer = 1, totals, measur
 
 export function PhaseTable({ result, target }: { result: Estimate; target: GraphTarget }) {
   const [picked, setTab] = useState<"prefill" | "decode">("decode");
+  const [partial, setPartial] = useState(false);
   // No output token, no decode step (the TPOT card says the same): only the
   // prefill phase has a table.
   const noDecode = result.avg_output_tokens === 0;
@@ -418,12 +419,19 @@ export function PhaseTable({ result, target }: { result: Estimate; target: Graph
       formula: active.formulas?.t_sol,
     },
     measuredMetric(active),
+    ...(partial ? [partialMetric(active)] : []),
     {
       label: "Throughput (per-rank equivalent = cluster_total / n_gpus)",
       value: tokPerSec(active),
       cls: "text-gray-600",
       formula: active.throughput?.sol?.formula,
     },
+    ...(partial ? [{
+      label: "Throughput, partial measured",
+      value: tokPerSec(active, "partial"),
+      cls: "text-teal-700",
+      formula: active.throughput?.partial?.formula,
+    }] : []),
   ];
   const metricCols: ColumnDef<PhaseMetric>[] = [
     { key: "label", wrap: true, header: "", className: "text-gray-600", sortValue: null },
@@ -437,6 +445,7 @@ export function PhaseTable({ result, target }: { result: Estimate; target: Graph
         ...(r.formula ? tipHandlers(formulaHTML(r.formula)) : r.tip ? textTip(r.tip) : {}),
         style: r.formula || r.tip ? { textDecoration: "underline dotted" } : undefined,
         ...(r.label.startsWith("t_measured") ? { "data-measured-total": "" } : {}),
+        ...(r.label.startsWith("t_partial") ? { "data-partial-total": "" } : {}),
       }),
     },
   ];
@@ -462,6 +471,11 @@ export function PhaseTable({ result, target }: { result: Estimate; target: Graph
         <span className="text-xs text-gray-400">
           Prefill B=1 (activation). Decode B=max (KV).
         </span>
+        <label id="infer-partial-toggle" className="flex items-center gap-1.5 text-xs text-gray-600"
+          title="Partial measured: each op Kernel Bench has measured at its measured time, every other op at its SOL time, added up as the step adds them. Shown with how much of the step is real measurement.">
+          <input type="checkbox" checked={partial} onChange={(e) => setPartial(e.target.checked)} />
+          Partial measured
+        </label>
         <div className="flex-1" />
         {/* This step as measurable jobs. One per STEP, not per table: the
          *  draft breakdown below is part of the decode step, and the
@@ -564,6 +578,21 @@ function measuredMetric(active: PhaseMetrics): PhaseMetric {
     value: t != null ? fmtMeasured(t) : `— (${coverageText(cov)}${counts ? `; ${counts}` : ""})`,
     cls: t != null ? "text-green-700 font-semibold" : "text-gray-500",
     tip: t != null ? undefined : stateKeysText(cov) || undefined,
+  };
+}
+
+/** The partial track (opt-in): measured ops measured, the rest at SOL — a
+ *  blend the backend adds up (`t_partial_s`), named as one and shown with
+ *  its real-value coverage, never as `t_measured`. */
+function partialMetric(active: PhaseMetrics): PhaseMetric {
+  const cov = phaseCoverage(active);
+  const t = active.t_partial_s;
+  const coverage = partialCoverageText(active.partial_measured_share, cov);
+  return {
+    label: "t_partial (measured ops measured, the rest at SOL)",
+    value: t == null ? "— (no measured fold)" : `${fmtTime(t)}${coverage ? ` (${coverage})` : ""}`,
+    cls: t == null ? "text-gray-500" : "text-teal-700 font-semibold",
+    tip: t == null ? "No partial total: the estimate did not read Kernel Bench, or the step has no SOL time." : stateKeysText(cov) || undefined,
   };
 }
 

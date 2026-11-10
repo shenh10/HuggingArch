@@ -74,6 +74,8 @@ type FrontierModel = {
   model_id: string;
   frontier?: Record<string, FrontierPt[]>;
   frontier_measured?: Record<string, FrontierPt[]>;
+  /** The partial-measured frontier: measured ops measured, the rest at SOL. */
+  frontier_partial?: Record<string, FrontierPt[]>;
   layouts?: { layout: string; points?: number; refused?: string; error?: string }[];
   error?: string | null;
   /** Why the speculative view draws nothing for this model (no MTP draft). */
@@ -238,6 +240,7 @@ export function Gallery() {
   // entry the warm builds holds every point's step at every K (one walk of
   // each layout, every K read off it), so a K or α is a read of the same
   // cached entry as the plain frontier.
+  const [partialOn, setPartialOn] = useState(false);
   const [specOn, setSpecOn] = useState(inbound.k !== undefined
     && axes.draft_tokens.includes(Number(inbound.k)));
   const [specK, setSpecK] = useState(pickNumber(inbound.k, axes.draft_tokens, axes.draft_tokens[0]));
@@ -534,7 +537,8 @@ export function Gallery() {
     color: modelColor[m.model_id] || "#888",
     points: frontById.get(m.model_id)?.frontier?.[decCtx] || [],
     measured: frontById.get(m.model_id)?.frontier_measured?.[decCtx] || [],
-  })).filter((s) => s.points.length), [perfModels, modelColor, frontById, decCtx, noDraft]);
+    partial: partialOn ? frontById.get(m.model_id)?.frontier_partial?.[decCtx] || [] : [],
+  })).filter((s) => s.points.length), [perfModels, modelColor, frontById, decCtx, noDraft, partialOn]);
 
   // What the page says while a part of it is not there yet, or failed.
   const retryFacts = (
@@ -615,7 +619,8 @@ export function Gallery() {
       title={`Decode Pareto frontier — ${fmtSeqLabel(Number(decCtx))} context · ${front?.gpuSku ?? gpuSku}`}
       subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better. ${frontDraft
         ? ` Speculative decoding with the model's MTP draft, K = ${frontDraft.k} at acceptance α = ${frontDraft.alpha}: each step counts the K draft forwards and the verify over K + 1 positions, and keeps 1 + α·K tokens per request. SOL only — Kernel Bench measures the plain step.`
-        : " Solid is SOL; dashed is measured where Kernel Bench covers the step."}`}
+        : ` Solid is SOL; dashed is measured where Kernel Bench covers the step.${partialOn
+          ? " Dotted is partial measured: measured ops at their measured time, the rest at SOL — hover a point for the share of its time that is measured." : ""}`}`}
       controls={<Tabs options={decodeTabs} value={decCtx} onChange={setDecCtx} idPrefix="g-dec-tab" />}
       series={frontierSeries}
       height={500}
@@ -861,6 +866,10 @@ export function Gallery() {
               onChange={(e) => setFloorDraft((d) => ({ ...d, launch: e.target.value }))}
               onBlur={applyFloors}
               onKeyDown={(e) => { if (e.key === "Enter") applyFloors(); }} />
+          </label>
+          <label className="flex items-center gap-1.5 text-xs pb-2" title="Partial measured: each op Kernel Bench has measured at its measured time, every other op at its SOL time. Drawn dotted; each point says how much of its time is real measurement. Plain decode only.">
+            <input id="g-partial-on" type="checkbox" checked={partialOn} onChange={(e) => setPartialOn(e.target.checked)} />
+            <span className="font-medium text-gray-600">Partial measured</span>
           </label>
           <label className="flex items-center gap-1.5 text-xs pb-2" title="Speculative decoding with the model's own MTP draft: each step runs K one-token draft forwards and one verify over K + 1 positions, and keeps 1 + α·K tokens per request. Only models with an MTP draft are drawn; Kernel Bench's measured track is off.">
             <input id="g-spec-on" type="checkbox" checked={specOn} onChange={(e) => setSpecOn(e.target.checked)} />

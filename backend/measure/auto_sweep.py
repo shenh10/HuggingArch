@@ -538,6 +538,40 @@ class Folded:
             return track
         return track.with_total(self.measure.formula.at(self.measure.launches, self.times))
 
+    def partial(self, rows: Iterable[Tuple[Sequence[int], float]],
+                t_sol: Optional[float]) -> Optional[Dict[str, float]]:
+        """The partial track: the step's SOL total `t_sol` with every fully
+        measured row's SOL share replaced by its measured share — the one
+        formula over each row's terms (`subtotal`) in place of the term's
+        weight × the row's SOL time. `rows` are `(term indices, SOL time of
+        one weighted occurrence)` per row. A row with any term not measured
+        keeps its SOL time whole. `t_s` is the blend, `measured_s` the part
+        of it that is measured, `measured_share` their ratio; at full
+        coverage `t_s` is the measured total. None when the step has no SOL
+        total (nothing to blend into).
+
+        The SOL total and the measured formula are one aggregation
+        (`StepSum.total` over `t_op` and over `n·T`), so each row's SOL
+        share is its term's weight times its SOL time."""
+        if t_sol is None:
+            return None
+        formula, n = self.measure.formula, len(self.rows)
+        ones = [1.0] * n
+        measured = sol = 0.0
+        for terms, t_op in rows:
+            terms = list(terms)
+            share = self.subtotal(terms)
+            if share is None:
+                continue
+            live = [k for k in terms if not formula.zero_cost[k]]
+            measured += share
+            if live:
+                sol += formula.at(ones, ones, live[:1]) * float(t_op or 0.0)
+        track = self.track
+        t_s = track.t_s if track.complete else float(t_sol) - sol + measured
+        return {"t_s": t_s, "measured_s": measured,
+                "measured_share": measured / t_s if t_s > 0 else 0.0}
+
     def subtotal(self, terms: Iterable[int]) -> Optional[float]:
         """The formula's share of `terms` — a draft's forwards, a module's
         subtree — only when every one of them is measured; else None."""

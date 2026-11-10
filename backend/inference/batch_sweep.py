@@ -1174,6 +1174,15 @@ def _measured_table(modules: List[Dict[str, Any]],
     return out
 
 
+def _row_sol(rows: Sequence[Mapping[str, Any]],
+             terms: Mapping[Any, Sequence[int]]
+             ) -> List[Tuple[Sequence[int], float]]:
+    """Each folded row's terms and its SOL time (`t_op_s`), what
+    `Folded.partial` blends."""
+    return [(terms[r["uid"]], float(r.get("t_op_s") or 0.0))
+            for r in rows if r.get("uid") in terms]
+
+
 def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, Any]],
                    select: Any) -> Dict[str, Any]:
     """`point` (its SOL priced, no measurement read) with its measured track.
@@ -1206,7 +1215,12 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
                     parent: folded.subtotal(
                         _terms_of_rows(entry["per_op_timing"], indices, terms))
                 for parent, indices in declaration_terms(entry["per_op_timing"])}
-            entry.update(t_measured=track.t_s, coverage=track.coverage())
+            partial = folded.partial(_row_sol(entry["per_op_timing"], terms),
+                                     entry.get("t_sol"))
+            entry.update(t_measured=track.t_s, coverage=track.coverage(),
+                         t_partial=None if partial is None else partial["t_s"],
+                         partial_measured_share=(None if partial is None
+                                                 else partial["measured_share"]))
             continue
         for name, terms in by_list.items():
             if point.get(name):
@@ -1236,7 +1250,14 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
             draft["t_measured_s"] = draft_share
             draft["per_forward"]["t_measured_s"] = (None if draft_share is None
                                                     else draft_share / forwards)
+        partial = None if withheld else folded.partial(
+            (row for name, terms in by_list.items()
+             for row in _row_sol(point.get(name) or [], terms)),
+            ph.get("t_sol_s"))
         ph.update({"t_measured_s": None if withheld else track.t_s,
+                   "t_partial_s": None if partial is None else partial["t_s"],
+                   "partial_measured_share": (None if partial is None
+                                              else partial["measured_share"]),
                    "measured_rows": track.measured_rows, "total_rows": track.total_rows,
                    "coverage": track.coverage()})
         if "flops_by_module" in ph:
