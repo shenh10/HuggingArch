@@ -2181,6 +2181,37 @@ def test_gallery_draws_each_model_as_it_lands_and_asks_for_the_shown_ones_first(
     s.assert_clean()
 
 
+def test_a_frontier_with_no_model_landed_yet_says_it_is_computing(browser_base):
+    """A cold frontier's first answers carry the view's head and no model:
+    the chart is waiting, not empty — "no model serves this context" is a
+    claim about the whole answer for this view, said only once it landed."""
+    browser, base = browser_base
+    s = Session(browser, base)
+    calls = []
+    head = {k: v for k, v in _FRONTIER.items() if k != "models"}
+
+    def frontier(route):
+        calls.append(1)
+        if len(calls) <= 3:
+            route.fulfill(status=503, content_type="application/json",
+                          body=json.dumps({"reason": "still_computing", "retry_after_s": 1,
+                                           "progress": {"done": 0, "total": 2},
+                                           "partial": {"tag": 3, "count": 0, "head": head,
+                                                       "items": []}}))
+        else:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(_FRONTIER))
+
+    s.page.route("**/gallery/frontier*", frontier)
+    s.goto("/gallery.html")
+    assert s.wait_for(lambda: len(calls) >= 2)
+    s.page.wait_for_selector("#g-front-waiting", timeout=15000)
+    assert "no model serves this context" not in s.page.inner_text("body")
+    s.page.wait_for_selector("#g-dec-tab-1024", timeout=15000)
+    s.errors = [e for e in s.errors if "503" not in e]
+    s.assert_clean()
+
+
 def test_a_request_rides_out_a_kernel_bench_restart(browser_base):
     """While the Kernel Bench service restarts, an estimate answers 503
     `measurements_unavailable` and asks to be sent again; the page sends it

@@ -609,7 +609,8 @@ export function Gallery() {
   const maxGpus = front?.data.config?.max_gpus;
   const decodeChart = (
     <FrontierChart
-      empty={front == null ? (frontFailed ?? frontWaiting ?? undefined) : "no model serves this context on this GPU"}
+      empty={frontFailed ?? frontWaiting
+        ?? (front != null && !frontStale ? "no model serves this context on this GPU" : undefined)}
       stale={frontStale ? <span>Showing {front?.gpuSku} — {frontFailed ?? (frontState.phase === "loading" ? frontWaitingText : null)}</span> : undefined}
       title={`Decode Pareto frontier — ${fmtSeqLabel(Number(decCtx))} context · ${front?.gpuSku ?? gpuSku}`}
       subtitle={`Each point is the best layout${maxGpus ? ` of up to ${maxGpus} GPUs` : ""} (TP / EP / DP / CP) at one batch per GPU, named where it changes (hover a curve for every point); up and to the right is better. ${frontDraft
