@@ -133,7 +133,7 @@ COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 # codex+kimi and codex's release URL are confirmed there (claude honors `-s`).
 ARG CLAUDE_VERSION=2.1.209
 ARG CODEX_VERSION=0.139.0
-ARG KIMI_VERSION=0.39.1
+ARG KIMI_VERSION=2.1.1
 # Each agent installs BEST-EFFORT: the codex/kimi installers fetch release
 # metadata from the GitHub API, which intermittently 403s the CI builder IP
 # (unauthenticated rate limit) and used to fail the whole deploy. So: pass the
