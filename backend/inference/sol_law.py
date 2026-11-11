@@ -264,7 +264,7 @@ def _eachLawInOrder(exprs: Sequence[Any]):
 
 #: EXPERIMENT (exp/float-projection): read once; the exact program stays
 #: the default and the oracle.
-_FLOAT_LAWS = os.environ.get("HA_SOL_LAW_FLOAT", "").strip() == "1"
+_FLOAT_LAWS = os.environ.get("HA_SOL_LAW_FLOAT", "1").strip() != "0"
 
 
 @dataclass(frozen=True)
