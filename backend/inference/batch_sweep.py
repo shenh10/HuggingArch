@@ -75,7 +75,7 @@ from backend.measure.lookup import Key
 from backend.measure.measure_matrix import MeasureMatrix, MatrixFold
 from backend.measure.scope import NONE as NO_MEASUREMENTS
 
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from typing import (Any, Dict, Iterable, Iterator, List, Mapping,
                     Optional, Sequence, Tuple)
 
