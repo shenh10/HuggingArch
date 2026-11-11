@@ -1166,6 +1166,7 @@ def _measured_table(modules: List[Dict[str, Any]],
 
 def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, Any]],
                    folds: Mapping[str, MatrixFold], *,
+                   sols: Optional[Mapping[str, Sequence[Optional[float]]]] = None,
                    blend_terms: bool = False) -> Dict[str, Any]:
     """`point` with its measured track, from the record-level matrix row.
 
@@ -1173,6 +1174,8 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
     point or is one row of a Gallery record; this function only unfolds the
     row into the response shapes that point asks for.
 
+    `sols` are each phase's measure's SOL leaves (`PointMeasure.sol`), what
+    the fold blends the partial track off (none for a record's row).
     `blend_terms` is for a reader that blends the partial track at its own
     floors (a pool point, `FloorForm.terms_at`): each phase also states which
     step terms are measured (`measured_terms`, positions in `StepSum.terms`)
@@ -1198,7 +1201,8 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
                     parent: folded.subtotal(
                         _terms_of_rows(entry["per_op_timing"], indices, terms))
                 for parent, indices in declaration_terms(entry["per_op_timing"])}
-            partial = folded.partial(entry.get("t_sol"))
+            partial = folded.partial(entry.get("t_sol"),
+                                     (sols or {}).get(phase, ()))
             entry.update(t_measured=track.t_s, coverage=track.coverage(),
                          t_partial=None if partial is None else partial["t_s"],
                          partial_measured_share=(None if partial is None
@@ -1228,7 +1232,8 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
             draft["t_measured_s"] = draft_share
             draft["per_forward"]["t_measured_s"] = (None if draft_share is None
                                                     else draft_share / forwards)
-        partial = None if withheld else folded.partial(ph.get("t_sol_s"))
+        partial = None if withheld else folded.partial(
+            ph.get("t_sol_s"), (sols or {}).get(phase, ()))
         ph.update({"t_measured_s": None if withheld else track.t_s,
                    "t_partial_s": None if partial is None else partial["t_s"],
                    "partial_measured_share": (None if partial is None
@@ -1237,7 +1242,7 @@ def apply_measured(point: Dict[str, Any], measures: Mapping[str, Mapping[str, An
                    "coverage": track.coverage()})
         if blend_terms and not withheld:
             ph.update(measured_terms=list(folded.measured_terms),
-                      measured_part_s=folded.measured_s)
+                      measured_part_s=folded.measured_part_s)
         if "flops_by_module" in ph:
             modules = _measured_table(ph["flops_by_module"],
                                       by_list.get(main, {}), folded)
@@ -1363,9 +1368,10 @@ def measure_points(points: List[Dict[str, Any]], *, selection_mode: str,
     started = time.perf_counter()
     folds = matrix.fold(select)
     for pt, phase, m, row, record_matrix in pending:
+        sol = direct[row].sol if record_matrix is None else ()
         if record_matrix is not None:
             row += offsets[id(record_matrix)]
         apply_measured(pt["sol"], {phase: m}, {phase: folds[row]},
-                       blend_terms=blend_terms)
+                       sols={phase: sol}, blend_terms=blend_terms)
     if timings is not None:
         timings["apply_measured_s"] = time.perf_counter() - started

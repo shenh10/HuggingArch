@@ -587,7 +587,8 @@ of the measured terms supplies it:
   term's SOL leaf rides the measure (`PointMeasure.sol`, from the row's
   `t_op_s`; through a chunked prefill's fold with its launches) and the fold
   states `t_partial_s`, `partial_measured_share` (the measured part by time)
-  and `throughput.partial` itself (`MatrixFold.partial`).
+  and `throughput.partial` itself (`MatrixFold.partial`, one reading with `Folded.partial`:
+  `auto_sweep.partial_of`).
   A measure that states no SOL has no partial here.
 - **A pool point** (the Gallery) has its SOL as a function of the two floors
   the reader picks, so the fold leaves `t_partial_s` empty and, asked for
@@ -604,9 +605,18 @@ of the measured terms supplies it:
   weigh 0 at verify width 1). The Gallery's rates keep only these step
   facts per K, so a view's floors and acceptance enter where it draws.
 
-At no coverage the blend is `t_sol_s`, at full coverage `t_measured_s`. It is
-never called measured: the page shows it only behind a "Partial measured"
-checkbox, always beside its coverage.
+At no coverage the blend is `t_sol_s`, and at full coverage it is
+`t_measured_s` by construction — the SOL total is its terms' sum, so
+swapping every term out leaves the measured total (to float rounding; the
+blend is not special-cased to `t_measured_s`). A measure that states no SOL
+leaf (an estimate whose terms are all unkeyed, or a pool point) has no
+partial of its own. It is never called measured: the page shows it only
+behind a "Partial measured" checkbox, always beside its coverage.
+
+The Gallery refuses a point whose step form is not over the measured
+formula's terms (a term past the formula's count): the fold raises
+`MeasurementFoldMismatch`, and the model draws SOL under `engine_error`
+rather than a partial line priced off misaligned terms.
 
 
 ## 6. Response contract for the frontend
@@ -904,7 +914,7 @@ inside it would compete with user requests for the GIL and the sweep pool.
 | `backend/inference/capacity.py` | `CapacitySweepPlan`, `_sweep_cell`, `_point_rows`, `_restamp_gpu`, `_stamp_gpu_on_result`, `PendingEstimate` (`priced_on`, `keyed_at`, `measures`), `finish_estimates` |
 | `backend/inference/card.py` | `Card`, its class and price views, `refuse_unless_one_class` |
 | `backend/inference/parallel_sweep.py` | `ParallelSweepPlan`, `LayoutCell`, `_estimate_layout`, `class_cards`, `PER_POINT_FIELDS`, the decode ladder and frontier views |
-| `backend/inference/batch_sweep.py` | `rows_at`, `phase_at`, `point_measures`, `step_measure`, `measured_selector`, `measure_points`, `apply_measured`, `measures_on_card` |
+| `backend/inference/batch_sweep.py` | `rows_at`, `phase_at`, `point_measures`, `step_measure`, `measured_selector`, `measure_points`, `apply_measured` |
 | `backend/inference/calibration_overlay.py` | `point_keys`, `PointRow`, `zero_cost`, `looks_up` |
 | `backend/inference/row_roofline.py` | Row laws, `LawBook`, `StepSum` (SOL and measured laws), `FloorForm` / `CardForm` |
 | `backend/inference/sol_law.py`, `sol_data.py`, `sol_pool.py` | Canonical law records, their identity, the seekable pool |

@@ -426,20 +426,46 @@ class MeasuredFormula:
         return evaluate(self.text, {**launches, **times})
 
 
-def blend(t_sol: float, sol_measured: float, measured_s: float
+def blend(t_sol: float, sol_measured: float, measured_part_s: float
           ) -> Dict[str, float]:
     """The partial track — its one definition: the step's SOL total
     `t_sol` with the measured terms' SOL (`sol_measured`, the same terms
-    the SOL total weights) swapped for their measured share `measured_s`.
+    the SOL total weights) swapped for their measured share `measured_part_s`.
     The SOL total and the measured formula are one aggregation
     (`StepSum.total` over `t_op` and over `n·T`), so a term's two shares
     are interchangeable. `t_s` is the blend, `measured_share` the part of
     it that is measured. Whoever holds the SOL states `sol_measured`: a
     walk's priced rows (`Folded.partial`), or a pool point's floor form at
     the reader's floors (`row_roofline.FloorForm.terms_at`)."""
-    t_s = float(t_sol) - float(sol_measured) + float(measured_s)
-    return {"t_s": t_s, "measured_s": float(measured_s),
-            "measured_share": float(measured_s) / t_s if t_s > 0 else 0.0}
+    t_s = float(t_sol) - float(sol_measured) + float(measured_part_s)
+    return {"t_s": t_s, "measured_part_s": float(measured_part_s),
+            "measured_share": (float(measured_part_s) / t_s
+                               if t_s > 0 else 0.0)}
+
+
+def partial_of(formula: "MeasuredFormula", measured_terms: Sequence[int],
+               measured_part_s: float, sol: Sequence[Optional[float]],
+               t_sol: Optional[float]) -> Optional[Dict[str, float]]:
+    """The partial track (`blend`) off a measure's own SOL leaves
+    (`PointMeasure.sol`), weighted by `formula` as the SOL total weights
+    them: the one reading both folds (`Folded`, `MatrixFold`) share. None
+    when the step has no SOL total, or the measure states no SOL — a pool
+    point, whose SOL is a function of the floors its reader picks
+    (`row_roofline.FloorForm.terms_at`). At full coverage the blend is the
+    measured total by construction: the SOL total is its terms' sum."""
+    if t_sol is None or not sol:
+        return None
+    live = [k for k in measured_terms if not formula.zero_cost[k]]
+    unpriced = [k for k in live if k >= len(sol) or sol[k] is None]
+    if unpriced:
+        raise ValueError(
+            f"measured terms {unpriced[:5]} have no SOL leaf: a measured "
+            "term is a priced row of this walk")
+    width = len(formula.zero_cost)
+    leaves = [0.0 if v is None else float(v) for v in sol]
+    leaves += [0.0] * (width - len(leaves))
+    return blend(t_sol, formula.at([1.0] * width, leaves, live),
+                 measured_part_s)
 
 
 def key_label(key: Key) -> str:
@@ -606,31 +632,17 @@ class Folded:
         return tuple(k for k, row in enumerate(self.rows) if row[0] == MEASURED)
 
     @property
-    def measured_s(self) -> float:
+    def measured_part_s(self) -> float:
         """The formula's share of the measured terms: what the partial
         track puts in place of their SOL."""
         return self.measure.formula.at(self.measure.launches, self.times,
                                        self.measured_terms)
 
     def partial(self, t_sol: Optional[float]) -> Optional[Dict[str, float]]:
-        """The partial track (`blend`) off the measure's own SOL leaves
-        (`PointMeasure.sol`), weighted by the formula as the SOL total
-        weights them. None when the step has no SOL total, or the measure
-        states no SOL — a pool point, whose SOL is a function of the floors
-        its reader picks (`FloorForm.terms_at`)."""
-        sol = self.measure.sol
-        if t_sol is None or not sol:
-            return None
-        formula = self.measure.formula
-        live = [k for k in self.measured_terms if not formula.zero_cost[k]]
-        unpriced = [k for k in live if sol[k] is None]
-        if unpriced:
-            raise ValueError(
-                f"measured terms {unpriced[:5]} have no SOL leaf: a measured "
-                "term is a priced row of this walk")
-        ones = [1.0] * len(self.rows)
-        leaves = [0.0 if v is None else float(v) for v in sol]
-        return blend(t_sol, formula.at(ones, leaves, live), self.measured_s)
+        """The partial track off the measure's own SOL leaves
+        (`partial_of`)."""
+        return partial_of(self.measure.formula, self.measured_terms,
+                          self.measured_part_s, self.measure.sol, t_sol)
 
     def subtotal(self, terms: Iterable[int]) -> Optional[float]:
         """The formula's share of `terms` — a draft's forwards, a module's

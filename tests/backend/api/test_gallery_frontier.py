@@ -86,7 +86,7 @@ def _inline_measures(monkeypatch):
             (point.get("measures") or {}).get("decode")))
 
 
-def _fold_into(dec, *, t_measured=None, part=0.0, terms=()):
+def _fold_into(dec, *, t_measured=None, part=0.0, terms=(), width=1):
     """What the measured fold states of a point's step
     (`batch_sweep.apply_measured(blend_terms=True)`): its measured total
     (None unless every term is measured — then the one term of `_one_term`
@@ -94,7 +94,7 @@ def _fold_into(dec, *, t_measured=None, part=0.0, terms=()):
     if t_measured is not None:
         terms, part = (0,), t_measured
     dec.update(t_measured_s=t_measured, measured_terms=list(terms),
-               measured_part_s=part)
+               measured_part_s=part, total_rows=width)
 
 
 def _fold_nothing(items, **_kw):
@@ -510,7 +510,7 @@ def test_the_partial_track_swaps_measured_terms_at_the_view_s_floors(
     def apply(items, **_kw):
         for it in items:
             dec = it["sol"]["phases"]["decode"]
-            _fold_into(dec, part=0.009, terms=(0,))
+            _fold_into(dec, part=0.004, terms=(1,), width=2)
             dec["coverage"] = {"measured": 1, "total": 2,
                                "states": {"missing": ["k"]}}
 
@@ -518,20 +518,59 @@ def test_the_partial_track_swaps_measured_terms_at_the_view_s_floors(
     _inline_measures(monkeypatch)
     sk = str(GALLERY_SEQ_LENS[0])
     item = _timed_item(sk, batch=1)
-    # Term 0 compute-bound (6 ms), term 1 launch-bound: 2 launches.
+    # Term 0 launch-bound (2 launches), term 1 compute-bound (6 ms): the
+    # fold measured term 1 at 4 ms, so the floors move only term 0.
     item["floors"] = FloorForm.termwise(
-        [(0, (0.006, 0.0, 0.0, 0.0)), (1, (0.001, 0.0, 0.0, 2.0))], 2).to_json()
+        [(0, (0.001, 0.0, 0.0, 2.0)), (1, (0.006, 0.0, 0.0, 0.0))], 2).to_json()
     entry = {"model_id": "m", "frontier": {}, "layouts": [], "error": None,
              "_theory": [{**item, "measures": {"decode": {}}}]}
     for launch_us, sol_s in ((1.0, 0.007), (3000.0, 0.012)):
         out = f._read_entry(entry, f.FrontierView(
             "B200", launch_floor_us=launch_us))
         pt = out["frontier_partial"][sk][0]
-        partial_s = 0.009 + (sol_s - 0.006)
+        partial_s = 0.004 + (sol_s - 0.006)
         assert out["frontier"][sk][0]["tpot_s"] == pytest.approx(sol_s)
         assert pt["tpot_partial_s"] == pytest.approx(partial_s)
-        assert pt["partial_measured_share"] == pytest.approx(0.009 / partial_s)
+        assert pt["partial_measured_share"] == pytest.approx(0.004 / partial_s)
         assert out["frontier_measured"][sk] == []
+
+
+def test_the_term_mask_keeps_every_step_term():
+    """The rates keep a point's measured step terms as a bit mask; reading
+    it back names exactly those terms, high and sparse ones included."""
+    for terms in ([], [0], [1], [0, 2, 5], list(range(3, 130, 7))):
+        assert f._terms(f._termMask(terms)) == terms
+
+
+def test_a_form_not_over_the_formula_s_terms_is_an_engine_error(monkeypatch):
+    """A point whose step form has a term past the measured formula's is
+    another step: the fold refuses it (`MeasurementFoldMismatch`), so the
+    model draws its SOL frontier under `engine_error` rather than a partial
+    line priced off misaligned terms."""
+    from backend.measure.scope import MeasurementScope
+    monkeypatch.setattr(f, "_frontier_scope",
+                        lambda: (MeasurementScope(None, "lake", 1, 1, "r"), "reads"))
+
+    def apply(items, **_kw):
+        for it in items:
+            dec = it["sol"]["phases"]["decode"]
+            _fold_into(dec, part=0.004, terms=(0,), width=1)
+            dec["coverage"] = {"measured": 1, "total": 1}
+
+    monkeypatch.setattr(f, "measure_points", apply)
+    _inline_measures(monkeypatch)
+    sk = str(GALLERY_SEQ_LENS[0])
+    item = _timed_item(sk, batch=1)
+    item["floors"] = FloorForm.termwise(
+        [(0, (0.001, 0.0, 0.0, 0.0)), (1, (0.006, 0.0, 0.0, 0.0))], 2).to_json()
+    stored = f._Stored("m", None)
+    out = stored.drawn(f.FrontierView("B200"), {
+        "model_id": "m", "frontier": {}, "layouts": [], "error": None,
+        "_theory": [{**item, "measures": {"decode": {}}}]})
+    assert out["measured_track"]["state"] == "engine_error"
+    assert "measured formula" in out["measured_track"]["error"]
+    assert out["frontier"][sk]
+    assert out["frontier_partial"][sk] == []
 
 
 def test_the_measured_fold_does_not_walk(monkeypatch):
@@ -922,6 +961,7 @@ def _covered_item(seq, *, batch, tpot, coverage):
              "sol": {"time_per_output_token_s": tpot, "per_gpu": batch / tpot}}
     return {"seq": seq, "label": f"b{batch}", "num_gpus": 1,
             "sol": {"phases": {"decode": {"batch": batch, "throughput": rates}}},
+            "floors": _one_term(tpot),
             "measures": {"decode": {"coverage": coverage}}}
 
 

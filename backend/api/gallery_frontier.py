@@ -592,20 +592,9 @@ def _at_view(item: dict, view: FrontierView,
     k = int(view.draft_tokens)
     sol = item["sol"]
     dec = dict(sol["phases"]["decode"])
-    if not k and _stepDraftTokens(dec):
+    stepForm = _stepForm(item, k)
+    if stepForm is None:
         return None
-    if k:
-        form = (item.get("draft") or {}).get(str(k))
-        if form is None:
-            return None
-    else:
-        form = item.get("floors")
-        if form is None:
-            raise ValueError(
-                f"frontier point {item.get('label')} at {item.get('seq')} "
-                "carries no step form: not a "
-                f"{_FRONTIER_SCHEMA} entry")
-    stepForm = FloorForm.from_json(form)
     dec["t_sol_s"] = stepForm.at(*view.floors_s())
     if fold is not None:
         dec["t_measured_s"] = fold["t_measured_s"]
@@ -631,6 +620,26 @@ def _at_view(item: dict, view: FrontierView,
         dec, unique_tokens_multiplier=dec["throughput"]["groups"],
         num_gpus=dec["throughput"]["num_gpus"])
     return {**item, "sol": {**sol, "phases": {**sol["phases"], "decode": dec}}}
+
+
+def _stepForm(item: Mapping[str, Any], k: int) -> Optional[FloorForm]:
+    """The stored point's step at K = `k` as a function of the floors: the
+    plain step's form at 0, its K's otherwise. None when the point has no
+    step at `k` (a K whose projection failed; under plain decode, a point
+    stored from a K-step). A plain point stored without its form is not an
+    entry of this schema."""
+    if not k:
+        if _stepDraftTokens(item["sol"]["phases"]["decode"]):
+            return None
+        form = item.get("floors")
+        if form is None:
+            raise ValueError(
+                f"frontier point {item.get('label')} at {item.get('seq')} "
+                "carries no step form: not a "
+                f"{_FRONTIER_SCHEMA} entry")
+        return FloorForm.from_json(form)
+    form = (item.get("draft") or {}).get(str(k))
+    return None if form is None else FloorForm.from_json(form)
 
 
 def _termMask(terms: Sequence[int]) -> str:
@@ -797,6 +806,18 @@ def _measured_rates(core: dict,
         if "measured_terms" not in dec:
             raise MeasurementFoldMismatch(
                 f"the fold stated no measured terms for point {i}")
+        # The form's terms are the measured formula's, by index: the step's
+        # (or, at plain decode of a record that carries a draft, its terms
+        # past the plain step's weigh 0 and are not stored). A form with a
+        # term past the formula's is another step — refused here, where a
+        # mismatch is an engine error the drawing survives, not at draw.
+        terms = int(dec["total_rows"])
+        stepForm = _stepForm(core["_theory"][i], int(view.draft_tokens))
+        if (stepForm is None or stepForm.width < terms
+                or any(k >= terms for k in stepForm.index)):
+            raise MeasurementFoldMismatch(
+                f"frontier point {i}: its step form is not over the "
+                f"measured formula's {terms} terms")
         rates[str(i)] = {"t_measured_s": dec.get("t_measured_s"),
                          "measured_terms": _termMask(dec["measured_terms"]),
                          "measured_part_s": dec["measured_part_s"]}

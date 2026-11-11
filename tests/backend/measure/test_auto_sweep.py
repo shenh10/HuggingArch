@@ -246,8 +246,8 @@ def test_the_partial_swaps_each_measured_term_s_sol_for_its_measurement():
     t_sol = 0.010 + 3 * 0.004
     got = folded.partial(t_sol)
     assert got["t_s"] == pytest.approx(0.012 + 3 * 0.004)
-    assert got["measured_s"] == pytest.approx(0.012)
+    assert got["measured_part_s"] == pytest.approx(0.012)
     assert folded.measured_terms == (0,)
     pool = Folded(replace(measure, sol=()), folded.rows, folded.times)
     assert pool.partial(t_sol) is None
-    assert pool.measured_s == pytest.approx(0.012)
+    assert pool.measured_part_s == pytest.approx(0.012)

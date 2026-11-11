@@ -19,8 +19,8 @@ from backend.measure.auto_sweep import (
     STATES,
     UNPLACED,
     UNPLACED_REASONS,
-    blend,
     key_label,
+    partial_of,
 )
 from backend.measure.lookup import Key
 
@@ -79,11 +79,6 @@ class MeasureMatrix:
     row_groups: tuple[_RowGroup, ...]
     group_of: np.ndarray
     point_rows: dict[tuple[int, int, int], int]
-    #: Each term's SOL leaf (`PointMeasure.sol`), NaN where its row states
-    #: none — every term of a record's row: a pool point's SOL is a function
-    #: of the floors its reader picks (`FloorForm.terms_at`). None: no row
-    #: states any.
-    sol: Optional[np.ndarray] = None
 
     @classmethod
     def empty(cls) -> "MeasureMatrix":
@@ -109,13 +104,9 @@ class MeasureMatrix:
         row_groups: list[_RowGroup] = []
         group_of = np.empty(rows, dtype=np.int32)
 
-        sol = np.full((rows, width), np.nan, dtype=float)
         for row, measure in enumerate(measures):
             count = len(measure.formula.zero_cost)
             zero[row, :count] = measure.formula.zero_cost
-            if measure.sol:
-                sol[row, :count] = [np.nan if v is None else float(v)
-                                    for v in measure.sol]
             launches[row, :count] = measure.launches
             group = _RowGroup(
                 tuple(measure.labels), tuple(measure.reasons),
@@ -145,8 +136,7 @@ class MeasureMatrix:
         return cls(
             tuple(measure.formula.text for measure in measures), zero,
             launches, slots, tuple(keys), tuple(contexts), tuple(labels),
-            tuple(inputs), tuple(row_groups), group_of, {},
-            sol if np.any(~np.isnan(sol)) else None)
+            tuple(inputs), tuple(row_groups), group_of, {})
 
     @classmethod
     def of_record(cls, table: Mapping[str, Any], *, card: Any,
@@ -279,11 +269,7 @@ class MeasureMatrix:
         left_questions = _cached_questions(self)
         right_questions = _cached_questions(other)
 
-        stated = self.sol is not None or other.sol is not None
-
         def padded(matrix: MeasureMatrix) -> MeasureMatrix:
-            sol = (matrix.sol if matrix.sol is not None
-                   else np.full(matrix.zero.shape, np.nan))
             return matrix.__class__(
                 matrix.formulas,
                 np.pad(matrix.zero, ((0, 0), (0, width - matrix.zero.shape[1]))),
@@ -292,9 +278,7 @@ class MeasureMatrix:
                 np.pad(matrix.slots,
                        ((0, 0), (0, width - matrix.slots.shape[1]))),
                 matrix.keys, matrix.contexts, matrix.labels, matrix.inputs,
-                matrix.row_groups, matrix.group_of, matrix.point_rows,
-                np.pad(sol, ((0, 0), (0, width - sol.shape[1])),
-                       constant_values=np.nan))
+                matrix.row_groups, matrix.group_of, matrix.point_rows)
 
         left, right = padded(self), padded(other)
         keys = list(left.keys)
@@ -326,8 +310,7 @@ class MeasureMatrix:
             tuple(keys), tuple(contexts), tuple(labels), tuple(inputs),
             (*left.row_groups, *other.row_groups),
             np.concatenate((left.group_of, right.group_of + group_offset)),
-            {**left.point_rows, **other.point_rows},
-            np.vstack((left.sol, right.sol)) if stated else None)
+            {**left.point_rows, **other.point_rows})
         result._questionKeys = tuple(questions)
         return result
 
@@ -400,8 +383,7 @@ class MeasureMatrix:
                 self.slots[row], self.keys, self.row_groups[
                     int(self.group_of[row])], state_matrix[row],
                 launch_times[row], float(totals[row]), tracks[row],
-                selected_details,
-                None if self.sol is None else self.sol[row])
+                selected_details)
             for row in range(len(self.formulas))
         ]
 
@@ -481,8 +463,6 @@ class MatrixFold:
     total: float
     track: MeasuredTrack
     details: tuple[Any, ...]
-    #: The row's SOL leaves (`MeasureMatrix.sol`), or None.
-    sol: Optional[np.ndarray] = None
 
     @property
     def rows(self) -> tuple[tuple[str, Optional[float], str, Any], ...]:
@@ -531,7 +511,7 @@ class MatrixFold:
         return tuple(int(k) for k in np.flatnonzero(self.states == 0))
 
     @property
-    def measured_s(self) -> float:
+    def measured_part_s(self) -> float:
         """The formula's share of the measured terms: what the partial
         track puts in place of their SOL (`auto_sweep.blend`)."""
         return MeasuredFormula(
@@ -540,22 +520,11 @@ class MatrixFold:
             tuple(0.0 if v is None else v for v in self.times),
             self.measured_terms)
 
-    def partial(self, t_sol: Optional[float]) -> Optional[dict[str, float]]:
-        """`Folded.partial` on the matrix row: the partial track
-        (`auto_sweep.blend`) off the row's own SOL leaves, weighted by the
-        formula as the SOL total weights them. None when the step has no
-        SOL total or the row states no SOL — a record's row, whose SOL its
-        reader holds as a function of the floors (`FloorForm.terms_at`)."""
-        if t_sol is None or self.sol is None or np.all(np.isnan(self.sol)):
-            return None
-        live = [k for k in self.measured_terms if not self.zero[k]]
-        unpriced = [k for k in live if np.isnan(self.sol[k])]
-        if unpriced:
-            raise ValueError(
-                f"measured terms {unpriced[:5]} have no SOL leaf: a measured "
-                "term is a priced row of this walk")
-        formula = MeasuredFormula(
-            self.formula_text, tuple(bool(v) for v in self.zero))
-        ones = [1.0] * len(self.states)
-        leaves = [0.0 if np.isnan(v) else float(v) for v in self.sol]
-        return blend(t_sol, formula.at(ones, leaves, live), self.measured_s)
+    def partial(self, t_sol: Optional[float],
+                sol: Sequence[Optional[float]]) -> Optional[dict[str, float]]:
+        """The partial track off the measure's own SOL leaves
+        (`PointMeasure.sol`, `auto_sweep.partial_of`)."""
+        return partial_of(
+            MeasuredFormula(self.formula_text,
+                            tuple(bool(v) for v in self.zero)),
+            self.measured_terms, self.measured_part_s, sol, t_sol)
