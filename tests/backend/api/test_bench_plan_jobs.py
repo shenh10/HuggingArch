@@ -94,11 +94,15 @@ class TestSameBuilderAsTheCli:
 
     def test_the_workload_reaches_the_builder(self):
         """Prompt, cached prefix and verify width are the point's fields: a
-        step exported at another one is a measurement of another step."""
+        step exported at another one is a measurement of another step.
+        The speculative step needs a model with an MTP draft stack (the
+        planner refuses speculative tokens on one without)."""
+        MTP_MODEL = "Qwen/Qwen3.5-35B-A3B"
         snapshot_config(TEXT_MODEL)
-        plain = _export(model_id=TEXT_MODEL, phase="decode", batch_size=8,
+        snapshot_config(MTP_MODEL)
+        plain = _export(model_id=MTP_MODEL, phase="decode", batch_size=8,
                         avg_input_tokens=2048, avg_output_tokens=128)
-        verify = _export(model_id=TEXT_MODEL, phase="decode", batch_size=8,
+        verify = _export(model_id=MTP_MODEL, phase="decode", batch_size=8,
                          avg_input_tokens=2048, avg_output_tokens=128,
                          speculative_draft_tokens=3)
         # K drafted tokens are verified in one forward over K + 1 positions.
