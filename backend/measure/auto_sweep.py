@@ -351,6 +351,40 @@ def compile_law_float(exprs: Sequence[Any], names: Tuple[str, ...]
                        cse=_eachLawInOrder)
 
 
+class _VectorPrinter(_FloatPrinter):
+    """The same law graph, printed for numpy: `Cases` becomes `np.where`
+    (both arms evaluate, the unselected one's inf/nan is discarded),
+    `Quotient` the same, and `Max`/`Min`/`floor` come from numpy's
+    broadcasting implementations."""
+
+    def _print_Cases(self, expr: Any) -> str:
+        condition, then, otherwise = expr.args
+        return (f"np.where({self._print(condition)}, {self._print(then)}, "
+                f"{self._print(otherwise)})")
+
+    def _print_Quotient(self, expr: Any) -> str:
+        condition, empty, part, whole = expr.args
+        return (f"np.where({self._print(condition)}, {self._print(empty)}, "
+                f"({self._print(part)}) / ({self._print(whole)}))")
+
+
+def compile_law_vector(exprs: Sequence[Any], names: Tuple[str, ...]
+                       ) -> Callable[..., Any]:
+    """A law compiled for numpy arrays: the same graph, but every input
+    may be an array and every output is an array of the broadcast shape.
+    Both arms of a `Cases` evaluate (the unselected one's inf/nan is
+    discarded by `np.where`); callers suppress the divide warnings."""
+    import numpy as np
+    by_name = {sym.name: sym for expr in exprs for sym in expr.free_symbols}
+    return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
+                       list(exprs),
+                       modules=[{"np": np, "_law_div": lambda a, b: a / b,
+                                 "floor": np.floor, "Max": np.maximum,
+                                 "Min": np.minimum}],
+                       printer=_VectorPrinter,
+                       cse=_eachLawInOrder)
+
+
 def exact_div(part: Any, whole: Any) -> Any:
     """A quotient of two whole numbers stays exact in compiled law text.
 

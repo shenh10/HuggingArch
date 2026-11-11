@@ -20,7 +20,8 @@ import sympy as sp
 from backend.arch.law_text import read_walk_law
 from backend.arch.eval.analysis import Point
 from backend.measure.auto_sweep import (
-    _ExactPrinter, compile_law_float, exact_div, MeasuredFormula, PointMeasure,
+    _ExactPrinter, compile_law_float, compile_law_vector, exact_div,
+    MeasuredFormula, PointMeasure,
 )
 from backend.measure.lookup import Key
 
@@ -207,6 +208,28 @@ def _compiledGraphFloat(inputs: tuple[str, ...],
 
 
 @memoize(maxsize=1024)
+def _compiledGraphVector(inputs, definitions, outputs):
+    """`_compiledGraph`'s numpy twin: every input may be an array, every
+    output an array of the broadcast shape. For the whole-grid projection."""
+    localNames = set()
+    byDefinition = {}
+    exprs = []
+    internalNames = set()
+    for index, (name, text) in enumerate(definitions):
+        expr = _replaceKeepingShape(
+            _read(text, frozenset(localNames)), byDefinition)
+        variable = sp.Symbol(f"_law{index}")
+        byDefinition[sp.Symbol(name)] = variable
+        internalNames.add(variable.name)
+        localNames.add(name)
+        exprs.append(expr)
+    for _name, text in outputs:
+        exprs.append(_replaceKeepingShape(
+            _read(text, frozenset(localNames)), byDefinition))
+    return compile_law_vector(exprs, inputs)
+
+
+@memoize(maxsize=1024)
 def _compiledGraph(inputs: tuple[str, ...],
                    definitions: tuple[tuple[str, str], ...],
                    outputs: tuple[tuple[str, str], ...]):
@@ -323,6 +346,13 @@ class LawGraph:
                            self.termOutputs()).form(
             point, floorCard.zero, floorCard.unit, self.inputs)
 
+    def floorForm_batch(self, points: Sequence[Mapping[str, Any]],
+                        floorCard: "FloorCard") -> list["FloorForm"]:
+        """Every point's floor form in one numpy call pair."""
+        return _floorTerms(self.inputs, self.definitions,
+                           self.termOutputs()).form_batch(
+            points, floorCard.zero, floorCard.unit, self.inputs)
+
     def evaluate(self, binding: Mapping[str, Any]) -> dict[str, Any]:
         # EXPERIMENT: HA_SOL_LAW_FLOAT=1 prices a point in machine floats
         # (the exact program stays the oracle).
@@ -354,6 +384,8 @@ class _FloorTerms:
     of the law: a term whose floors sit anywhere but an affine arm of one
     max is refused."""
     program: Any
+    #: The same graph compiled for numpy arrays (whole-grid projection).
+    program_v: Any
     firstOutput: int
     #: How many step terms the law names (`term_<k>` outputs).
     width: int
@@ -409,6 +441,73 @@ class _FloorTerms:
         return FloorForm.termwise(
             ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
              for k in sorted({*fixed, *maxed})), self.width)
+
+    def form_batch(self, points: Sequence[Mapping[str, Any]],
+                   zero: Mapping[str, float],
+                   unit: Mapping[str, float],
+                   inputs: Sequence[str]) -> list["FloorForm"]:
+        """Every point's form in two numpy calls (one per floor setting).
+
+        The same term structure as `form`, but the program is the vector
+        twin: every input a column array, every output an array of the
+        broadcast shape. The unselected arm of a `Cases` may produce
+        inf/nan on some points; `np.where` discards them element-wise."""
+        import numpy as np
+        n = len(points)
+        base = self.firstOutput
+        # Column arrays: floor-free inputs from the points, floored inputs
+        # from the zero/unit bindings (scalars broadcast across the batch).
+        at0_args = [np.full(n, {**points[0], **zero}.get(name, 0))
+                    if name in zero
+                    else np.array([p.get(name, 0) for p in points])
+                    for name in inputs]
+        at1_args = [np.full(n, {**points[0], **unit}.get(name, 0))
+                    if name in unit
+                    else at0_args[i]  # share the non-floored columns
+                    for i, name in enumerate(inputs)]
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            at0 = self.program_v(*at0_args)
+            at1 = self.program_v(*at1_args)
+        forms = []
+        for i in range(n):
+            fixed: dict[int, float] = {}
+            maxed: dict[int, tuple[float, float, float, float]] = {}
+            for k, weight, value in self.constants:
+                w = float(at0[base + weight][i])
+                v = float(at0[base + value][i])
+                fixed[k] = fixed.get(k, 0.0) + w * v
+            for k, weightIndex, arms in self.terms:
+                w = float(at0[base + weightIndex][i])
+                a = b = c = n_ = 0.0
+                for index, floor in arms:
+                    v0 = float(at0[base + index][i])
+                    v1 = float(at1[base + index][i])
+                    if floor is None:
+                        if v0 != 0:
+                            raise ValueError(
+                                f"a floor-free arm is {v0} s: not floor-free")
+                        a += w * v1
+                    elif floor == "latency":
+                        if v0 != 0:
+                            raise ValueError(
+                                f"a latency arm is {v0} s with no latency floor")
+                        c += w * v1
+                    else:  # launch_floor
+                        if v0 != 0:
+                            raise ValueError(
+                                f"a launch arm is {v0} s with no launch floor")
+                        n_ += w * v1
+                if k in maxed:
+                    raise ValueError(f"step term {k} adds two maxima")
+                maxed[k] = (a, b, c, n_)
+            for k, value in fixed.items():
+                if value and k in maxed:
+                    raise ValueError(
+                        f"step term {k} adds a floor-free part to a max")
+            forms.append(FloorForm.termwise(
+                ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
+                 for k in sorted({*fixed, *maxed})), self.width))
+        return forms
 
 
 @memoize(maxsize=1024)
@@ -501,10 +600,10 @@ def _floorTerms(inputs: tuple[str, ...],
     for k, output in enumerate(outputs):
         step[0] = k
         split(_read(output, frozenset(local)), ())
-    program = _compiledGraph(
-        inputs, definitions,
-        tuple((f"_floor{i}", text) for i, text in enumerate(emitted)))
-    return _FloorTerms(program, len(definitions), len(outputs),
+    floor_outputs = tuple((f"_floor{i}", text) for i, text in enumerate(emitted))
+    program = _compiledGraph(inputs, definitions, floor_outputs)
+    program_v = _compiledGraphVector(inputs, definitions, floor_outputs)
+    return _FloorTerms(program, program_v, len(definitions), len(outputs),
                        tuple(constants), tuple(terms))
 
 
