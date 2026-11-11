@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
@@ -19,7 +20,7 @@ import sympy as sp
 from backend.arch.law_text import read_walk_law
 from backend.arch.eval.analysis import Point
 from backend.measure.auto_sweep import (
-    _ExactPrinter, exact_div, MeasuredFormula, PointMeasure,
+    _ExactPrinter, compile_law_float, exact_div, MeasuredFormula, PointMeasure,
 )
 from backend.measure.lookup import Key
 
@@ -178,6 +179,34 @@ def _read(text: str, local: frozenset[str]) -> sp.Expr:
 
 
 @memoize(maxsize=1024)
+def _compiledGraphFloat(inputs: tuple[str, ...],
+                        definitions: tuple[tuple[str, str], ...],
+                        outputs: tuple[tuple[str, str], ...]):
+    """EXPERIMENT (exp/float-projection): `_compiledGraph`'s float twin —
+    the same parse and CSE discipline, compiled for machine floats."""
+    localNames: set[str] = set()
+    byDefinition: dict[sp.Expr, sp.Expr] = {}
+    exprs: list[sp.Expr] = []
+    internalNames: set[str] = set()
+    for index, (name, text) in enumerate(definitions):
+        expr = _replaceKeepingShape(
+            _read(text, frozenset(localNames)), byDefinition)
+        variable = sp.Symbol(f"_law{index}")
+        byDefinition[sp.Symbol(name)] = variable
+        internalNames.add(variable.name)
+        localNames.add(name)
+        exprs.append(expr)
+    for _name, text in outputs:
+        exprs.append(_replaceKeepingShape(
+            _read(text, frozenset(localNames)), byDefinition))
+    by_name = {symbol.name: symbol for expr in exprs
+               for symbol in expr.free_symbols}
+    return compile_law_float(
+        [by_name.get(name, sp.Symbol(name)) for name in inputs]
+        and exprs, inputs)
+
+
+@memoize(maxsize=1024)
 def _compiledGraph(inputs: tuple[str, ...],
                    definitions: tuple[tuple[str, str], ...],
                    outputs: tuple[tuple[str, str], ...]):
@@ -231,6 +260,11 @@ def _eachLawInOrder(exprs: Sequence[Any]):
         assigned.append((variable, expr))
         out.append(variable)
     return assigned, out
+
+
+#: EXPERIMENT (exp/float-projection): read once; the exact program stays
+#: the default and the oracle.
+_FLOAT_LAWS = os.environ.get("HA_SOL_LAW_FLOAT", "").strip() == "1"
 
 
 @dataclass(frozen=True)
@@ -290,7 +324,9 @@ class LawGraph:
             point, floorCard.zero, floorCard.unit, self.inputs)
 
     def evaluate(self, binding: Mapping[str, Any]) -> dict[str, Any]:
-        program = _compiledGraph(
+        # EXPERIMENT: HA_SOL_LAW_FLOAT=1 prices a point in machine floats
+        # (the exact program stays the oracle).
+        program = (_compiledGraphFloat if _FLOAT_LAWS else _compiledGraph)(
             self.inputs, self.definitions, tuple(self.outputs.items()))
         values = program(*(binding[name] for name in self.inputs))
         firstOutput = len(self.definitions)

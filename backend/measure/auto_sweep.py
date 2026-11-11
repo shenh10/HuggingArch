@@ -314,6 +314,43 @@ def compile_law(exprs: Sequence[Any], names: Tuple[str, ...]
                        cse=_each_law_once)
 
 
+class _FloatPrinter(_ExactPrinter):
+    """EXPERIMENT (exp/float-projection): the same law graph, evaluated in
+    machine floats — a rational prints as one division, `_law_div` is the
+    plain `/`. Only `_print_Rational` changes: `Cases`/`Quotient` keep their
+    select-only-the-taken-arm shape (that is semantics, not precision)."""
+
+    def _print_Rational(self, expr: sp.Rational) -> str:
+        return f"({expr.p}/{expr.q})"
+
+
+def _eachLawInOrder(exprs: Sequence[Any]
+                    ) -> Tuple[List[Tuple[sp.Symbol, Any]], List[Any]]:
+    """Like `_each_law_once`, but every expression is assigned (even a repeat
+    or an atom), because a CSE graph's later expressions read the variables
+    the earlier ones define."""
+    assigned: List[Tuple[sp.Symbol, Any]] = []
+    out: List[Any] = []
+    for index, expr in enumerate(exprs):
+        variable = sp.Symbol(f"_law{index}")
+        assigned.append((variable, expr))
+        out.append(variable)
+    return assigned, out
+
+
+def compile_law_float(exprs: Sequence[Any], names: Tuple[str, ...]
+                      ) -> Callable[..., Any]:
+    """EXPERIMENT: `compile_law`'s float twin — same graph, same names,
+    float arithmetic. For measuring the projection's exact-arithmetic cost,
+    not for shipping."""
+    by_name = {sym.name: sym for expr in exprs for sym in expr.free_symbols}
+    return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
+                       list(exprs),
+                       modules=[{"math": math, "_law_div": lambda a, b: a / b}],
+                       printer=_FloatPrinter,
+                       cse=_eachLawInOrder)
+
+
 def exact_div(part: Any, whole: Any) -> Any:
     """A quotient of two whole numbers stays exact in compiled law text.
 
