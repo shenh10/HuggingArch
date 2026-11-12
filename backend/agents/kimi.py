@@ -41,6 +41,10 @@ class KimiBackend(AgentBackend):
     # failed to bring the context under the model window after N attempts.`,
     # `Compaction limit exceeded (N)`); a provider's own refusal of it can
     # surface as `provider.api_error: 400 context length exceeded`.
+    #: One prompt part file. Below Read's ~100K-character cap with room for
+    #: the line-number prefix it adds to every line.
+    PROMPT_PART_CHARS = 60_000
+
     context_exhausted_errors = (
         re.compile(r"\bcontext\.overflow:|context[ _-]?length exceeded", re.I),
     )
@@ -48,9 +52,9 @@ class KimiBackend(AgentBackend):
     def _launch(self, argv: list, prompt: str, env: Optional[dict],
                 workspace: Optional[str]) -> subprocess.Popen:
         run_cwd, child_env = self._run_cwd_and_env(env, workspace)
-        prompt_path = self._write_prompt_file(prompt)
+        part_paths = self._write_prompt_parts(prompt)
         proc = subprocess.Popen(
-            self._argv_with_prompt(argv, prompt_path),
+            self._argv_with_prompt(argv, self._reading_order(part_paths)),
             cwd=run_cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -59,18 +63,18 @@ class KimiBackend(AgentBackend):
             env=child_env,
             **self._priv_kwargs(env),
         )
-        # The file must outlive the agent's first-turn Read, and spawn() has
+        # The files must outlive the agent's first-turn Reads, and spawn() has
         # no completion hook (the runner owns the process lifetime), so a
-        # daemon reaper unlinks it once the process exits. Worst case after a
-        # backend crash is one small file left in the temp dir.
+        # daemon reaper unlinks them once the process exits. Worst case after
+        # a backend crash is a few small files left in the temp dir.
         threading.Thread(
-            target=self._reap_prompt_file, args=(proc, prompt_path), daemon=True,
+            target=self._reap_prompt_files, args=(proc, part_paths), daemon=True,
         ).start()
         return proc
 
     @staticmethod
-    def _argv_with_prompt(argv: list, prompt_path: str) -> list:
-        return [arg if arg != "@PROMPT" else f"@{prompt_path}" for arg in argv]
+    def _argv_with_prompt(argv: list, reading_order: str) -> list:
+        return [arg if arg != "@PROMPT" else reading_order for arg in argv]
 
     def spawn(self, prompt: str, env: Optional[dict] = None,
               workspace: Optional[str] = None) -> subprocess.Popen:
@@ -81,8 +85,9 @@ class KimiBackend(AgentBackend):
         # codex solve this by reading the prompt from stdin, but kimi has no
         # stdin prompt path: bare `-p` errors with "argument missing" and
         # piped stdin is ignored in prompt mode. The only out-of-band channel
-        # kimi supports is its `@path` file reference: the agent's first turn
-        # Reads the file and follows its content as the prompt.
+        # kimi supports is a file the agent Reads: `-p` carries only the list
+        # of part files (`_write_prompt_parts`), and the agent's first turn
+        # Reads them and follows their content as the prompt.
         #
         # Flags verified against kimi-code 2.1.1: `-p` alone is already
         # non-interactive with the auto permission policy (no approvals), and
@@ -122,6 +127,37 @@ class KimiBackend(AgentBackend):
             return str(sid) if sid else None
         return None
 
+    @classmethod
+    def _write_prompt_parts(cls, prompt: str) -> List[str]:
+        """The prompt, split on line boundaries into files that one Read
+        returns whole. Kimi Code's Read stops at ~100K characters (2.1.1)
+        and continues only if the model asks for the next offset; a model
+        that re-reads without one never reaches the end of a long prompt,
+        where the task and the output contract sit (Kimi-K3.1-pro review,
+        2026-11-12). Parts the size of one Read leave nothing to page."""
+        parts: List[str] = []
+        current = ""
+        for line in prompt.splitlines(keepends=True):
+            if current and len(current) + len(line) > cls.PROMPT_PART_CHARS:
+                parts.append(current)
+                current = ""
+            current += line
+        parts.append(current)
+        return [cls._write_prompt_file(part) for part in parts]
+
+    @staticmethod
+    def _reading_order(part_paths: List[str]) -> str:
+        """The `-p` text: the part files, in order. Short enough for argv
+        whatever the prompt's size."""
+        listing = "\n".join(part_paths)
+        return (
+            f"Your complete instructions for this run are one document split "
+            f"into {len(part_paths)} file(s). Read every file in full, in "
+            f"this order, before you do anything else; each file is short "
+            f"enough that one Read with just its path returns all of it. "
+            f"The task and the required output format are at the end of the "
+            f"last file.\n{listing}")
+
     @staticmethod
     def _write_prompt_file(prompt: str) -> str:
         # Mode 0o644, not NamedTemporaryFile's 0o600: the agent runs as the
@@ -136,14 +172,15 @@ class KimiBackend(AgentBackend):
         return fh.name
 
     @staticmethod
-    def _reap_prompt_file(proc: subprocess.Popen, prompt_path: str) -> None:
+    def _reap_prompt_files(proc: subprocess.Popen, part_paths: List[str]) -> None:
         try:
             proc.wait()
         finally:
-            try:
-                os.unlink(prompt_path)
-            except OSError:
-                pass
+            for path in part_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def parse_event(self, evt: dict) -> List[dict]:
         """Each line is {role: assistant|tool, content: [...], tool_calls?: [...]}.
