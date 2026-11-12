@@ -69,6 +69,10 @@ primary_region = 'nrt'
   # The code-trace bodies the cached entries above name: an entry is served
   # only while its trace can be read, so they persist beside the entries.
   HA_CODE_TRACE_DIR = '/app/.cache/huggingarch/code-traces'
+  # The functions trace provider: cache keys name data, not code — a
+  # code edit no longer invalidates walks or entries. The SOL store is
+  # excluded from traces; one cold refill at the switch.
+  HA_CODE_TRACE = 'functions' 
   # Kernel Bench: on an empty volume, restore the lake from the backup's
   # latest snapshot before serving (docs/measured_calibration.md §4.7);
   # with a lake already on the volume it does nothing.
