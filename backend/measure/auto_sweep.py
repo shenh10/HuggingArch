@@ -38,7 +38,9 @@ missing.
 from __future__ import annotations
 
 from collections.abc import Mapping as ABCMapping
+import inspect
 import math
+import re
 from functools import lru_cache
 from dataclasses import dataclass, field, replace
 from typing import (Any, Callable, ClassVar, Dict, Iterable,
@@ -352,10 +354,12 @@ def compile_law_float(exprs: Sequence[Any], names: Tuple[str, ...]
 
 
 class _VectorPrinter(_FloatPrinter):
-    """The same law graph, printed for numpy: `Cases` becomes `np.where`
-    (both arms evaluate, the unselected one's inf/nan is discarded),
-    `Quotient` the same, and `Max`/`Min`/`floor` come from numpy's
-    broadcasting implementations."""
+    """The same law graph, printed for numpy: every input may be an array.
+    `Cases` becomes `np.where` (both arms evaluate, the unselected one's
+    inf/nan is discarded), `Quotient` the same; `Max`/`Min`, `Piecewise` and
+    the logic connectives print as numpy's element-wise forms, since Python's
+    `max`/`and` ask an array for one truth value; `math.*` resolves to
+    numpy's functions of the same names (`compile_law_vector`)."""
 
     def _print_Cases(self, expr: Any) -> str:
         condition, then, otherwise = expr.args
@@ -367,6 +371,42 @@ class _VectorPrinter(_FloatPrinter):
         return (f"np.where({self._print(condition)}, {self._print(empty)}, "
                 f"({self._print(part)}) / ({self._print(whole)}))")
 
+    def _print_Piecewise(self, expr: Any) -> str:
+        # The pieces in order, the first true one taken: a fold of
+        # `np.where` from the last piece in. A final piece is its own
+        # default; with no `True` piece the uncovered points are nan.
+        pieces = list(expr.args)
+        last_value, last_condition = pieces[-1]
+        out = (self._print(last_value) if last_condition == sp.true
+               else f"np.where({self._print(last_condition)}, "
+                    f"{self._print(last_value)}, np.nan)")
+        for value, condition in reversed(pieces[:-1]):
+            out = (f"np.where({self._print(condition)}, "
+                   f"{self._print(value)}, {out})")
+        return out
+
+    def _elementwise(self, func: str, args: Sequence[Any]) -> str:
+        printed = [self._print(arg) for arg in args]
+        out = printed[0]
+        for arg in printed[1:]:
+            out = f"{func}({out}, {arg})"
+        return out
+
+    def _print_Max(self, expr: Any) -> str:
+        return self._elementwise("np.maximum", expr.args)
+
+    def _print_Min(self, expr: Any) -> str:
+        return self._elementwise("np.minimum", expr.args)
+
+    def _print_And(self, expr: Any) -> str:
+        return self._elementwise("np.logical_and", expr.args)
+
+    def _print_Or(self, expr: Any) -> str:
+        return self._elementwise("np.logical_or", expr.args)
+
+    def _print_Not(self, expr: Any) -> str:
+        return f"np.logical_not({self._print(expr.args[0])})"
+
 
 def compile_law_vector(exprs: Sequence[Any], names: Tuple[str, ...]
                        ) -> Callable[..., Any]:
@@ -376,13 +416,24 @@ def compile_law_vector(exprs: Sequence[Any], names: Tuple[str, ...]
     discarded by `np.where`); callers suppress the divide warnings."""
     import numpy as np
     by_name = {sym.name: sym for expr in exprs for sym in expr.free_symbols}
-    return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
-                       list(exprs),
-                       modules=[{"np": np, "_law_div": lambda a, b: a / b,
-                                 "floor": np.floor, "Max": np.maximum,
-                                 "Min": np.minimum}],
-                       printer=_VectorPrinter,
-                       cse=_eachLawInOrder)
+    program = sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
+                          list(exprs),
+                          modules=[{"np": np, "math": np,
+                                    "_law_div": lambda a, b: a / b}],
+                          printer=_VectorPrinter,
+                          cse=_eachLawInOrder)
+    # A construct `_VectorPrinter` does not print element-wise falls back to
+    # Python's, which asks a whole array for one truth value: refused here,
+    # where the law is compiled, not where a batch first reaches it.
+    scalar = _SCALAR_ONLY.search(inspect.getsource(program))
+    if scalar:
+        raise ValueError(f"a law prints {scalar.group(0)!r}, which is not "
+                         "element-wise: `_VectorPrinter` needs its numpy form")
+    return program
+
+
+#: Python constructs that read one truth value or compare whole operands.
+_SCALAR_ONLY = re.compile(r"\b(?:if|else|and|or|not)\b|\b(?:max|min)\(")
 
 
 def exact_div(part: Any, whole: Any) -> Any:

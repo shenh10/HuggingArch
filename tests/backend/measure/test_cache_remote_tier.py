@@ -129,19 +129,20 @@ def test_get_put_remote_ok_roundtrip(tmp_path):
     assert cache.get("k4") == {"v": 4}          # promoted into local
 
 
-def test_service_import_injects_the_durable_remote():
-    """The service layer wires the Supabase remote into the core sweep + gallery
-    caches — they are built remote-less so `backend.api` stays service-clean
-    (see backend/service/__init__.py). If that injection is dropped, prod
-    silently loses the durable cross-VM tier, so pin it here."""
-    import backend.api  # noqa: F401  — imports backend.service, running the injection
+def test_service_import_leaves_the_core_caches_local_only():
+    """The service layer binds NO remote tier to the core sweep + gallery
+    caches: a cold rebuild is seconds (float projection + matrix fold), so
+    each machine warms its own local disk cache (5841a9f81). The caches are
+    built remote-less so `backend.api` stays service-clean, and the service
+    import is the one place a remote could be bound — so pin that it binds
+    none: a re-added Supabase tier would bring back the timing-out
+    `sweep_cache` RPCs on every request."""
+    import backend.api  # noqa: F401  — imports backend.service, running its wiring
     from backend.api.sweep_runtime import _SWEEP
     from backend.api.gallery_overview import _FRONTIER, _GALLERY
-    from backend.measure.cache import WriteBehindBackend
-    # Write-behind: a request never blocks on the remote upsert.
-    assert isinstance(_SWEEP._remote, WriteBehindBackend)
-    assert isinstance(_GALLERY._remote, WriteBehindBackend)
-    assert isinstance(_FRONTIER._remote, WriteBehindBackend)
+    assert _SWEEP._remote is None
+    assert _GALLERY._remote is None
+    assert _FRONTIER._remote is None
 
 
 def test_an_entry_from_before_traces_is_a_miss(tmp_path):

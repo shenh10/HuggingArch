@@ -138,6 +138,13 @@ for _phase in ("prefill", "decode"):
             "leaf, so a re-read can key the row by the output it walks")
 for _phase in ("prefill", "decode"):
     ADDED[f"phases.{_phase}.binding.s_pairs"] = _PAIRS
+for _phase in ("prefill", "decode"):
+    for _field in ("t_partial_s", "partial_measured_share", "throughput.partial"):
+        ADDED[f"phases.{_phase}.{_field}"] = (
+            "08b29819b: the partial-measured blend (`Folded.partial`), each "
+            "measured op at its Kernel Bench time and the rest at SOL, with "
+            "the share of the step's time it measured, shown behind the "
+            "Partial measured checkbox")
     ADDED[f"phases.{_phase}.flops_by_module[*].flops_formula.defs[*]"
           f".definition"] = _DEFINED
 

@@ -13,7 +13,7 @@ import math
 import os
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import sympy as sp
 
@@ -289,6 +289,12 @@ def _eachLawInOrder(exprs: Sequence[Any]):
 #: the default and the oracle.
 _FLOAT_LAWS = os.environ.get("HA_SOL_LAW_FLOAT", "1").strip() != "0"
 
+#: The one compiler a scalar law program is built with — exact or float,
+#: chosen by `_FLOAT_LAWS` here and nowhere else. A point's evaluation
+#: (`LawGraph.evaluate`) and a step's floor terms (`_floorTerms`) both read
+#: it, so the knob governs the whole serving path, not half of it.
+_compiledLaw = _compiledGraphFloat if _FLOAT_LAWS else _compiledGraph
+
 
 @dataclass(frozen=True)
 class LawGraph:
@@ -356,7 +362,7 @@ class LawGraph:
     def evaluate(self, binding: Mapping[str, Any]) -> dict[str, Any]:
         # EXPERIMENT: HA_SOL_LAW_FLOAT=1 prices a point in machine floats
         # (the exact program stays the oracle).
-        program = (_compiledGraphFloat if _FLOAT_LAWS else _compiledGraph)(
+        program = _compiledLaw(
             self.inputs, self.definitions, tuple(self.outputs.items()))
         values = program(*(binding[name] for name in self.inputs))
         firstOutput = len(self.definitions)
@@ -404,23 +410,52 @@ class _FloorTerms:
         at0 = self.program(*({**point, **zero}[n] for n in inputs))
         at1 = self.program(*({**point, **unit}[n] for n in inputs))
         base = self.firstOutput
+        return self._formOf(lambda index: float(at0[base + index]),
+                            lambda index: float(at1[base + index]))
 
-        def read(values: Sequence[Any], index: int) -> float:
-            return float(values[base + index])
+    def form_batch(self, points: Sequence[Mapping[str, Any]],
+                   zero: Mapping[str, float],
+                   unit: Mapping[str, float],
+                   inputs: Sequence[str]) -> list[FloorForm]:
+        """`form` at every point, the program run twice for the whole batch
+        (`program_v`, each input a column across the points) and each
+        point's outputs read as `form` reads them. Both arms of a `Cases`
+        evaluate; the unselected one's inf/nan is discarded by `np.where`."""
+        import numpy as np
+        n = len(points)
 
+        def column(name: str, floors: Mapping[str, float]):
+            if name in floors:
+                return floors[name]
+            return np.array([point[name] for point in points])
+
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            at0 = [np.broadcast_to(v, (n,)) for v in
+                   self.program_v(*(column(name, zero) for name in inputs))]
+            at1 = [np.broadcast_to(v, (n,)) for v in
+                   self.program_v(*(column(name, unit) for name in inputs))]
+        base = self.firstOutput
+        return [self._formOf(lambda index, i=i: float(at0[base + index][i]),
+                             lambda index, i=i: float(at1[base + index][i]))
+                for i in range(n)]
+
+    def _formOf(self, at0: Callable[[int], float],
+              at1: Callable[[int], float]) -> FloorForm:
+        """The form off one point's outputs, `at0(k)` / `at1(k)` being
+        output `k` with both floors 0 and 1 s."""
         fixed: dict[int, float] = {}
         for k, weight, value in self.constants:
-            fixed[k] = fixed.get(k, 0.0) + read(at0, weight) * read(at0, value)
+            fixed[k] = fixed.get(k, 0.0) + at0(weight) * at0(value)
         maxed: dict[int, tuple[float, float, float, float]] = {}
         for k, weightIndex, arms in self.terms:
-            w = read(at0, weightIndex)
+            w = at0(weightIndex)
             if w < 0:
                 raise ValueError(
                     f"a step term is weighted {w}: a max of its arms is not "
                     "the arms' max weighted")
             a = b = c = n = 0.0
             for index, floor in arms:
-                v0, v1 = read(at0, index), read(at1, index)
+                v0, v1 = at0(index), at1(index)
                 if floor is None:
                     a = max(a, w * v0)
                 elif floor == "latency":
@@ -441,73 +476,6 @@ class _FloorTerms:
         return FloorForm.termwise(
             ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
              for k in sorted({*fixed, *maxed})), self.width)
-
-    def form_batch(self, points: Sequence[Mapping[str, Any]],
-                   zero: Mapping[str, float],
-                   unit: Mapping[str, float],
-                   inputs: Sequence[str]) -> list["FloorForm"]:
-        """Every point's form in two numpy calls (one per floor setting).
-
-        The same term structure as `form`, but the program is the vector
-        twin: every input a column array, every output an array of the
-        broadcast shape. The unselected arm of a `Cases` may produce
-        inf/nan on some points; `np.where` discards them element-wise."""
-        import numpy as np
-        n = len(points)
-        base = self.firstOutput
-        # Column arrays: floor-free inputs from the points, floored inputs
-        # from the zero/unit bindings (scalars broadcast across the batch).
-        at0_args = [np.full(n, {**points[0], **zero}.get(name, 0))
-                    if name in zero
-                    else np.array([p.get(name, 0) for p in points])
-                    for name in inputs]
-        at1_args = [np.full(n, {**points[0], **unit}.get(name, 0))
-                    if name in unit
-                    else at0_args[i]  # share the non-floored columns
-                    for i, name in enumerate(inputs)]
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            at0 = self.program_v(*at0_args)
-            at1 = self.program_v(*at1_args)
-        forms = []
-        for i in range(n):
-            fixed: dict[int, float] = {}
-            maxed: dict[int, tuple[float, float, float, float]] = {}
-            for k, weight, value in self.constants:
-                w = float(at0[base + weight][i])
-                v = float(at0[base + value][i])
-                fixed[k] = fixed.get(k, 0.0) + w * v
-            for k, weightIndex, arms in self.terms:
-                w = float(at0[base + weightIndex][i])
-                a = b = c = n_ = 0.0
-                for index, floor in arms:
-                    v0 = float(at0[base + index][i])
-                    v1 = float(at1[base + index][i])
-                    if floor is None:
-                        if v0 != 0:
-                            raise ValueError(
-                                f"a floor-free arm is {v0} s: not floor-free")
-                        a += w * v1
-                    elif floor == "latency":
-                        if v0 != 0:
-                            raise ValueError(
-                                f"a latency arm is {v0} s with no latency floor")
-                        c += w * v1
-                    else:  # launch_floor
-                        if v0 != 0:
-                            raise ValueError(
-                                f"a launch arm is {v0} s with no launch floor")
-                        n_ += w * v1
-                if k in maxed:
-                    raise ValueError(f"step term {k} adds two maxima")
-                maxed[k] = (a, b, c, n_)
-            for k, value in fixed.items():
-                if value and k in maxed:
-                    raise ValueError(
-                        f"step term {k} adds a floor-free part to a max")
-            forms.append(FloorForm.termwise(
-                ((k, maxed.get(k) or (fixed.get(k, 0.0), 0.0, 0.0, 0.0))
-                 for k in sorted({*fixed, *maxed})), self.width))
-        return forms
 
 
 @memoize(maxsize=1024)
@@ -601,7 +569,7 @@ def _floorTerms(inputs: tuple[str, ...],
         step[0] = k
         split(_read(output, frozenset(local)), ())
     floor_outputs = tuple((f"_floor{i}", text) for i, text in enumerate(emitted))
-    program = _compiledGraph(inputs, definitions, floor_outputs)
+    program = _compiledLaw(inputs, definitions, floor_outputs)
     program_v = _compiledGraphVector(inputs, definitions, floor_outputs)
     return _FloorTerms(program, program_v, len(definitions), len(outputs),
                        tuple(constants), tuple(terms))
@@ -1213,6 +1181,18 @@ def servingLawPhaseView(record: Mapping[str, Any], name: str, *, batch: int,
     return phase
 
 
+def _lawPoint(cardValues: Mapping[str, float], *, batch: int, context: int,
+              outputTokens: int, prefixCached: int, verifyWidth: int) -> dict:
+    """The binding a phase's law is evaluated at: the card, then the
+    request's batch, context, output length, prefix and verify width."""
+    return {
+        **cardValues, "B": max(1, batch), "s_input": context,
+        "s_output": outputTokens, "s_prefix": int(prefixCached),
+        "s_verify": verifyWidth,
+        "rho": 1,
+    }
+
+
 def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
                      cardValues: Mapping[str, float],
                      floorCard: "FloorCard",
@@ -1234,12 +1214,9 @@ def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
     num_gpus = parallel.cluster_size
     for name, batch in (("prefill", prefillB), ("decode", decodeB)):
         graph = graphs[name]
-        point = {
-            **cardValues, "B": max(1, batch), "s_input": context,
-            "s_output": outputTokens, "s_prefix": int(prefixCached),
-            "s_verify": verifyWidth,
-            "rho": 1,
-        }
+        point = _lawPoint(cardValues, batch=batch, context=context,
+                          outputTokens=outputTokens,
+                          prefixCached=prefixCached, verifyWidth=verifyWidth)
         if name == "prefill":
             key = (int(context), int(prefixCached), prefillB,
                    int(verifyWidth))
@@ -1395,53 +1372,38 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
               for name in ("prefill", "decode")}
     prefillTimes: dict[tuple[int, int, int, int], float] = {}
     out: list[list[dict | None]] = []
-    # Vectorized decode: every point's floor form in one numpy call pair,
-    # when the graph has term outputs (the new walk's records). The scalar
-    # path remains for records that don't (backward compatible).
-    decodeForms: Optional[list] = None
-    try:
-        graphs["decode"].termOutputs()
-        decodePoints: list[dict] = []
-        for context_index, context in enumerate(contexts):
-            try:
-                facts = _capacityAt(
-                    {"capacity": record["draft_capacity"]} if draftTokens
-                    and "draft_capacity" in record else record,
-                    card, int(context))
-            except KeyError:
-                decodePoints.extend(None for _ in decodeBatches)
+    # Every decode point's floor form, the program run once per floor
+    # setting for the whole grid (`floorForm_batch`), keyed by the point's
+    # (context, batch) indices; the per-point loop reads it there.
+    decodeKeys: list[tuple[int, int]] = []
+    decodePoints: list[dict] = []
+    for context_index, context in enumerate(contexts):
+        try:
+            facts = _capacityAt(
+                {"capacity": record["draft_capacity"]} if draftTokens
+                and "draft_capacity" in record else record,
+                card, int(context))
+        except KeyError:
+            continue    # the loop below answers a missing capacity fact
+        for batch_index, decodeBatch in enumerate(decodeBatches):
+            if servedOnly and not point_served(
+                    max_batch_per_gpu=facts["max_decode_batch"],
+                    beyond_max_context=bool(facts["beyond_max_context"]),
+                    requests=(int(decodeBatch) if decodeBatch is not None
+                              else 1)):
                 continue
-            prefixCached_i = int(prefixes[context_index])
-            verifyWidth_i = int(widths[context_index])
-            for decodeBatch in decodeBatches:
-                requests = int(decodeBatch) if decodeBatch is not None else 1
-                if servedOnly and not point_served(
-                        max_batch_per_gpu=facts.get("max_decode_batch", 0),
-                        beyond_max_context=bool(facts.get("beyond_max_context")),
-                        requests=requests):
-                    decodePoints.append(None)
-                    continue
-                decodeB = (int(decodeBatch) if decodeBatch is not None
-                           else int(facts.get("max_decode_batch", 1)))
-                decodePoints.append({
-                    **cardValues, "B": max(1, decodeB),
-                    "s_input": int(context), "s_output": outputTokens,
-                    "s_prefix": prefixCached_i, "s_verify": verifyWidth_i,
-                    "rho": 1,
-                })
-        served = [p for p in decodePoints if p is not None]
-        if served:
-            import warnings as _w
-            with _w.catch_warnings():
-                _w.simplefilter("ignore")
-                servedForms = graphs["decode"].floorForm_batch(
-                    served, floorCard)
-            it = iter(servedForms)
-            decodeForms = [next(it) if p is not None else None
-                           for p in decodePoints]
-    except (ValueError, Exception):
-        decodeForms = None  # scalar fallback
-    formIndex = 0
+            decodeKeys.append((context_index, batch_index))
+            decodePoints.append(_lawPoint(
+                cardValues,
+                batch=(int(decodeBatch) if decodeBatch is not None
+                       else int(facts["max_decode_batch"])),
+                context=int(context), outputTokens=outputTokens,
+                prefixCached=int(prefixes[context_index]),
+                verifyWidth=int(widths[context_index])))
+    decodeForms = dict(zip(
+        decodeKeys,
+        graphs["decode"].floorForm_batch(decodePoints, floorCard)
+        if decodePoints else (), strict=True))
     for context_index, context in enumerate(contexts):
         capacityRecord = (
             {"capacity": record["draft_capacity"]} if draftTokens
@@ -1467,10 +1429,6 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
             prefillBatch = (
                 prefillBatches if isinstance(prefillBatches, int)
                 else prefillBatches[i])
-            precomputedForm = None
-            if decodeForms is not None:
-                precomputedForm = decodeForms[formIndex]
-                formIndex += 1
             point = _servingLawPoint(
                 record, facts=facts, cardValues=cardValues,
                 floorCard=floorCard,
@@ -1479,7 +1437,8 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                 prefixCached=prefixCached, verifyWidth=verifyWidth,
                 draftTokens=draftTokens,
                 acceptanceRate=acceptanceRate, prefillTimes=prefillTimes,
-                floorForms=floorForms, precomputedForm=precomputedForm)
+                floorForms=floorForms,
+                precomputedForm=decodeForms[(context_index, i)])
             row.append(without_step(point, ())
                        if facts.get("infeasibility_reason") else point)
         out.append(row)

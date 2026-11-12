@@ -104,6 +104,7 @@ import contextvars
 import functools
 import hashlib
 import importlib
+import importlib.machinery
 import json
 import logging
 import os
@@ -744,17 +745,25 @@ class TracedFunctions:
         return self._canonical_child
 
     def _resolve_excludes(self) -> None:
-        """Map each excluded module name to its file, once at start."""
+        """Map each excluded module name to its file, once at start —
+        found, not imported: the provider is the first thing a process
+        installs, and importing a module here would run repo code (and
+        bind `memo` to a provider) before this one exists and records."""
         files = set()
         for name in TRACED_EXCLUDE:
-            try:
-                mod = importlib.import_module(name)
-                if hasattr(mod, "__file__") and mod.__file__:
-                    files.add(os.path.abspath(mod.__file__))
-            except ImportError:
-                pass
-        if files:
-            self._excluded_files = frozenset(files)
+            path: Optional[List[str]] = None
+            spec = None
+            for depth in range(1, name.count(".") + 2):
+                spec = importlib.machinery.PathFinder.find_spec(
+                    ".".join(name.split(".")[:depth]), path)
+                if spec is None:
+                    break
+                path = spec.submodule_search_locations
+            if spec is None or not spec.origin:
+                raise ValueError(f"TRACED_EXCLUDE names {name!r}, which has "
+                                 f"no source file on sys.path")
+            files.add(os.path.abspath(spec.origin))
+        self._excluded_files = frozenset(files)
 
     def _import_trees(self) -> List[str]:
         names: List[str] = []
