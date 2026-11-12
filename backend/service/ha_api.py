@@ -38,13 +38,11 @@ from typing import Optional
 from backend.api._access import set_admin_access_gate, set_owner_resolver
 from backend.api._app import app, health_detail
 from backend.api.offload import set_start_hook
-from backend.measure.cache import WriteBehindBackend
 from backend.api.gallery_overview import set_gallery_remote
 from backend.api.sweep_runtime import set_sweep_remote
 from backend.service import auth as _svc_auth
 from backend.service import bench_proxy, rate_limit
 from backend.service import routes  # noqa: F401  (registers the service's routes)
-from backend.service.sweep_cache import SupabaseBackend
 
 
 def owner_of(authorization: Optional[str], cookie: Optional[str]) -> Optional[str]:
@@ -58,5 +56,10 @@ set_start_hook(rate_limit.starts_work)
 bench_proxy.install(app, health_detail)
 set_admin_access_gate(_svc_auth.require_admin_if_enabled)
 set_owner_resolver(owner_of)
-set_sweep_remote(WriteBehindBackend(SupabaseBackend()))
-set_gallery_remote(WriteBehindBackend(SupabaseBackend()))
+# The gallery and sweep caches no longer share a remote tier: a cold
+# rebuild is seconds (float projection + matrix fold), so each machine
+# warms its own local cache instead of reading and writing through a
+# remote store whose writes were the pipeline's least reliable part.
+# The SOL pool's artifact (the walks, hours to recompute) remains.
+set_sweep_remote(None)
+set_gallery_remote(None)

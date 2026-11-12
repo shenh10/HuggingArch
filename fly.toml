@@ -61,13 +61,11 @@ primary_region = 'nrt'
   # machine-level values left by earlier Fly configurations.
   HA_SOL_POOL_ARTIFACT = ''
   HA_ARTIFACT_BUCKET = 'sol-pool'
-  HA_GALLERY_CACHE_ARTIFACT = ''
   # The Scaling sweep's answers: on the volume (nothing is baked into the
   # image for them — the builder's warm runs with HA_SOL_POOL_ONLY, which
   # stores no sweep answer), merged at start from the engine's published
   # artifact (backend.sweep_cache_artifact) and extended by requests.
   HA_SWEEP_CACHE_DIR = '/app/.cache/huggingarch/sweep-cache'
-  HA_SWEEP_CACHE_ARTIFACT = ''
   # The code-trace bodies the cached entries above name: an entry is served
   # only while its trace can be read, so they persist beside the entries.
   HA_CODE_TRACE_DIR = '/app/.cache/huggingarch/code-traces'
