@@ -136,6 +136,14 @@ _SELF = os.path.dirname(os.path.abspath(__file__)) + os.sep
 TRACED_TREES = ("backend.arch", "backend.inference", "backend.measure",
                 "backend.hf")
 
+#: Storage infrastructure inside the traced trees: their code runs when a
+#: result is READ through them, but it does not compute the result. A trace
+#: that includes them means every storage edit invalidates every record —
+#: the exact coarse-granularity `functions` mode exists to avoid.
+TRACED_EXCLUDE = frozenset({
+    "backend.inference.sol_pool",      # the SOL record store
+})
+
 #: The fresh interpreter `_canonical_import_time` runs: it records importing
 #: the traced trees and nothing else, and writes the trace.
 _CANONICAL_CHILD = """
@@ -318,6 +326,10 @@ class TracedFunctions:
         #: import-time trace (`_canonical_import_time`).
         self._canonical = canonical
         self._trees = trees
+        #: Files of the excluded modules, resolved once; the event callback
+        #: checks co_filename against this set.
+        self._excluded_files: frozenset = frozenset()
+        self._resolve_excludes()
         #: Code under `root` is what traces name, by path relative to it.
         self._root = os.path.abspath(root)
         self._prefix = self._root + os.sep
@@ -386,10 +398,13 @@ class TracedFunctions:
         still see it the first time it runs there."""
         prefix, own, disable = self._prefix, _SELF, sys.monitoring.DISABLE
         provider, thread = self, self._thread
+        excluded = self._excluded_files
 
         def on_event(code: Any, _offset: int) -> Any:
             name = code.co_filename
             if not name.startswith(prefix) or name.startswith(own):
+                return disable
+            if excluded and os.path.abspath(name) in excluded:
                 return disable
             window = getattr(thread, "window", None)
             if window is not None:
@@ -728,12 +743,26 @@ class TracedFunctions:
         self._canonical_child = (child, errors)
         return self._canonical_child
 
+    def _resolve_excludes(self) -> None:
+        """Map each excluded module name to its file, once at start."""
+        files = set()
+        for name in TRACED_EXCLUDE:
+            try:
+                mod = importlib.import_module(name)
+                if hasattr(mod, "__file__") and mod.__file__:
+                    files.add(os.path.abspath(mod.__file__))
+            except ImportError:
+                pass
+        if files:
+            self._excluded_files = frozenset(files)
+
     def _import_trees(self) -> List[str]:
         names: List[str] = []
         for tree in self._trees:
             package = importlib.import_module(tree)
             names.extend(info.name for info in pkgutil.walk_packages(
                 package.__path__, tree + ".", onerror=lambda _name: None))
+        names = [n for n in names if n not in TRACED_EXCLUDE]
         failed = names
         # A module that fails first can be an import cycle that resolves
         # once its partner is in (the order a run would import them in).
