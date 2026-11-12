@@ -1216,6 +1216,7 @@ def servingLawPhaseView(record: Mapping[str, Any], name: str, *, batch: int,
 def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
                      cardValues: Mapping[str, float],
                      floorCard: "FloorCard",
+                     precomputedForm: Optional[Any] = None,
                      graphs: Mapping[str, LawGraph], context: int,
                      outputTokens: int, decodeBatch: int | None,
                      prefillBatch: int | None, prefixCached: int,
@@ -1261,7 +1262,10 @@ def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
         else:
             # The decode step is its floor form at the request's floors:
             # one road to the time, whichever floors a reader substitutes.
-            form = graph.floorForm(point, floorCard)
+            if precomputedForm is not None:
+                form = precomputedForm
+            else:
+                form = graph.floorForm(point, floorCard)
             t = form.at(*floorCard.floors_s)
         phases[name] = servingLawPhaseView(
             record, name, batch=batch, time=t, context=context,
@@ -1391,6 +1395,53 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
               for name in ("prefill", "decode")}
     prefillTimes: dict[tuple[int, int, int, int], float] = {}
     out: list[list[dict | None]] = []
+    # Vectorized decode: every point's floor form in one numpy call pair,
+    # when the graph has term outputs (the new walk's records). The scalar
+    # path remains for records that don't (backward compatible).
+    decodeForms: Optional[list] = None
+    try:
+        graphs["decode"].termOutputs()
+        decodePoints: list[dict] = []
+        for context_index, context in enumerate(contexts):
+            try:
+                facts = _capacityAt(
+                    {"capacity": record["draft_capacity"]} if draftTokens
+                    and "draft_capacity" in record else record,
+                    card, int(context))
+            except KeyError:
+                decodePoints.extend(None for _ in decodeBatches)
+                continue
+            prefixCached_i = int(prefixes[context_index])
+            verifyWidth_i = int(widths[context_index])
+            for decodeBatch in decodeBatches:
+                requests = int(decodeBatch) if decodeBatch is not None else 1
+                if servedOnly and not point_served(
+                        max_batch_per_gpu=facts.get("max_decode_batch", 0),
+                        beyond_max_context=bool(facts.get("beyond_max_context")),
+                        requests=requests):
+                    decodePoints.append(None)
+                    continue
+                decodeB = (int(decodeBatch) if decodeBatch is not None
+                           else int(facts.get("max_decode_batch", 1)))
+                decodePoints.append({
+                    **cardValues, "B": max(1, decodeB),
+                    "s_input": int(context), "s_output": outputTokens,
+                    "s_prefix": prefixCached_i, "s_verify": verifyWidth_i,
+                    "rho": 1,
+                })
+        served = [p for p in decodePoints if p is not None]
+        if served:
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                servedForms = graphs["decode"].floorForm_batch(
+                    served, floorCard)
+            it = iter(servedForms)
+            decodeForms = [next(it) if p is not None else None
+                           for p in decodePoints]
+    except (ValueError, Exception):
+        decodeForms = None  # scalar fallback
+    formIndex = 0
     for context_index, context in enumerate(contexts):
         capacityRecord = (
             {"capacity": record["draft_capacity"]} if draftTokens
@@ -1416,6 +1467,10 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
             prefillBatch = (
                 prefillBatches if isinstance(prefillBatches, int)
                 else prefillBatches[i])
+            precomputedForm = None
+            if decodeForms is not None:
+                precomputedForm = decodeForms[formIndex]
+                formIndex += 1
             point = _servingLawPoint(
                 record, facts=facts, cardValues=cardValues,
                 floorCard=floorCard,
@@ -1424,7 +1479,7 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                 prefixCached=prefixCached, verifyWidth=verifyWidth,
                 draftTokens=draftTokens,
                 acceptanceRate=acceptanceRate, prefillTimes=prefillTimes,
-                floorForms=floorForms)
+                floorForms=floorForms, precomputedForm=precomputedForm)
             row.append(without_step(point, ())
                        if facts.get("infeasibility_reason") else point)
         out.append(row)
