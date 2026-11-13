@@ -116,6 +116,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Tuple
 
+from . import import_state
 from .source import FileIdentity, digest
 
 logger = logging.getLogger(__name__)
@@ -342,10 +343,9 @@ class TracedFunctions:
         #: the callback iterates a stable tuple without taking it.
         self._active: Tuple[Recording, ...] = (self._import,)
         self._sealed = False
-        #: The traced trees' static import graph (`_import_edges`, built
-        #: at `seal`): which module's import-time state a module's code
-        #: can reach.
-        self._import_edges: Dict[str, FrozenSet[str]] = {}
+        #: The traced trees' static import graph (`import_state`), built
+        #: at `seal`: the import-time state a trace's named code reaches.
+        self._imports: Optional[import_state.ImportGraph] = None
         #: Moves whenever the set of active recordings does: a memo hit
         #: whose trace was merged in the same epoch was merged into every
         #: one of them already (`merged`).
@@ -567,7 +567,7 @@ class TracedFunctions:
         """A trace's items: of the code objects, of every trace and
         fragment merged (a fragment's own merges included, each once), of
         the foreign closure; then the import-time state of the traced
-        trees the named code can reach (`_state_items`)."""
+        trees the named code reaches (`import_state`)."""
         reached, items = self._reach(traces)
         codes |= reached
         # The foreign closure, whatever this computation ran: a third-party
@@ -576,119 +576,13 @@ class TracedFunctions:
         items = {**dict(self._items(codes)), **items}
         if self._sealed:
             self._check_modules()
-            items = {**items, **self._state_items(items)}
+            # The import-time state the named code reaches, module by
+            # module (`import_state.ImportGraph.state_items`).
+            items = {**items,
+                     **self._imports.state_items(items, self._lock_file)}
         # Unsealed: a memo miss while the trees import. Its code is in the
         # import-time trace too, which every later trace names.
         return Trace(tuple(sorted(items.items())))
-
-    def _state_items(self, items: Dict[str, str]) -> Dict[str, str]:
-        """The traced trees' import-time state the code `items` names can
-        reach: the top-level bindings (`FileIdentity`'s `<binding>:`
-        items) of every module of the trees in those modules' static
-        import closure, and the lock file.
-
-        The one aggregate item over the whole import-time trace this
-        replaces (`IMPORT_ITEM`, kept only for traces recorded before it)
-        moved on any edit to any module of the trees — a skeleton hash
-        counts an addition — and so took every record of a warm corpus
-        with it, whichever of those modules the record had actually run.
-        The closure here is static and narrow: code that reads a module's
-        import-time state (a registry its import builds) imports that
-        module, and state nothing the computation names imports or runs
-        cannot reach its result. The stores excluded from traces
-        (`TRACED_EXCLUDE`) are excluded here too, for the reason they are
-        excluded there."""
-        seeds = {item.split("::", 1)[0] for item in items
-                 if "::" in item
-                 and item.split("::", 1)[0] in self._tree_rels()}
-        state: Dict[str, str] = {}
-        pending, reached = list(seeds), set()
-        while pending:
-            rel = pending.pop()
-            if rel in reached:
-                continue
-            reached.add(rel)
-            path = os.path.abspath(os.path.join(self._root, rel))
-            if os.path.exists(path):
-                state.update(
-                    (item, held) for item, held in
-                    self._identity(path).items().items()
-                    if "<binding>:" in item)
-            pending.extend(self._import_edges.get(rel, ()))
-        if self._lock_file and os.path.exists(self._lock_file):
-            with open(self._lock_file, encoding="utf-8", errors="replace") as f:
-                state[LOCK_ITEM] = digest(f.read())
-        return state
-
-    def _tree_rels(self) -> FrozenSet[str]:
-        """The traced trees' files, as items name them (relative to the
-        backend root), the excluded stores aside."""
-        prefix = os.path.basename(self._root)
-        rels: set = set()
-        for tree in self._trees:
-            parts = tree.split(".")
-            if len(parts) < 2 or parts[0] != prefix:
-                continue
-            base = "/".join(parts[1:])
-            directory = os.path.join(self._root, base)
-            if os.path.isdir(directory):
-                for found, _dirs, files in os.walk(directory):
-                    for name in files:
-                        if name.endswith(".py"):
-                            rels.add(os.path.relpath(
-                                os.path.join(found, name),
-                                self._root).replace(os.sep, "/"))
-        excluded = {os.path.relpath(path, self._root).replace(os.sep, "/")
-                    for path in self._excluded_files}
-        return frozenset(rels - excluded)
-
-    def _import_graph(self) -> Dict[str, FrozenSet[str]]:
-        """The traced trees' static import edges, file to file.
-
-        `FileIdentity` keeps each file's imports as written; here each is
-        resolved against the trees' module names (an edge for the module
-        imported and for the name imported from it, whichever is a file of
-        the trees)."""
-        rels = self._tree_rels()
-        prefix = os.path.basename(self._root)
-        name_to_rel = {}
-        for rel in rels:
-            module = prefix + "." + rel[:-3].replace("/", ".")
-            if module.endswith(".__init__"):
-                module = module[: -len(".__init__")]
-            name_to_rel[module] = rel
-        edges: Dict[str, set] = {}
-        for rel in rels:
-            identity = self._identity(
-                os.path.abspath(os.path.join(self._root, rel)))
-            here = prefix + "." + rel[:-3].replace("/", ".")
-            here = here.removesuffix(".__init__")
-            for level, module, aliases in identity._imports:
-                for target in self._import_targets(
-                        here, level, module, aliases, name_to_rel):
-                    if target != rel:
-                        edges.setdefault(rel, set()).add(target)
-        return {rel: frozenset(targets) for rel, targets in edges.items()}
-
-    @staticmethod
-    def _import_targets(here: str, level: int, module, aliases: list,
-                        name_to_rel: Dict[str, str]) -> list:
-        """The files of the trees an import statement can reach."""
-        base = module or ""
-        if level:
-            package = here
-            for _cut in range(level):
-                package = package.rsplit(".", 1)[0]
-            base = (package + ("." + module if module else "")).strip(".")
-        out = []
-        if base in name_to_rel:
-            out.append(name_to_rel[base])
-        for alias in aliases:
-            name = f"{base}.{alias}" if base else alias
-            for candidate in (name, name.rsplit(".", 1)[0]):
-                if candidate in name_to_rel:
-                    out.append(name_to_rel[candidate])
-        return out
 
     def merge(self, trace: Optional[Trace],
               into: Optional[Tuple[Recording, ...]] = None) -> None:
@@ -754,7 +648,11 @@ class TracedFunctions:
             self._modules = self._repo_modules()
             for path in self._module_files():
                 self._identity(path)
-            self._import_edges = self._import_graph()
+            self._imports = import_state.ImportGraph(
+                self._root, self._trees, self._identity,
+                frozenset(
+                    os.path.relpath(path, self._root).replace(os.sep, "/")
+                    for path in self._excluded_files))
             if self._canonical:
                 self.global_trace, self.foreign_methods = self._import_time()
             else:
@@ -1068,10 +966,8 @@ class TracedFunctions:
         for code in list(codes):
             yield self._item_for(code)
             identity = self._identity(code.co_filename)
-            for item, held in identity.items().items():
-                if "<binding>:" in item:
-                    yield item, held
-            if not identity._bindings:
+            yield from identity.bindings().items()
+            if not identity.bindings():
                 # Unparsable source: the raw skeleton is all it has.
                 yield identity.module_item()
 
@@ -1085,11 +981,7 @@ class TracedFunctions:
         if item == ENGINE_ITEM:
             return None
         if item == LOCK_ITEM:
-            if not (self._lock_file and os.path.exists(self._lock_file)):
-                return None
-            with open(self._lock_file, encoding="utf-8",
-                      errors="replace") as f:
-                return digest(f.read())
+            return import_state.lock_hash(self._lock_file)
         rel, _, _qual = item.partition("::")
         identity = self._by_rel.get(rel, _UNSEEN)
         if identity is _UNSEEN:
