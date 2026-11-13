@@ -209,9 +209,9 @@ class ImportGraph:
                 out.append(self._by_name[base])
             for alias in aliases:
                 name = f"{base}.{alias}" if base else alias
-                for candidate in (name, name.rsplit(".", 1)[0]):
-                    if candidate in self._by_name:
-                        out.append(self._by_name[candidate])
+                out.extend(self._by_name[candidate]
+                           for candidate in (name, name.rsplit(".", 1)[0])
+                           if candidate in self._by_name)
         return [target for target in out if target != rel]
 
     def identity(self, rel: str) -> Optional[FileIdentity]:
