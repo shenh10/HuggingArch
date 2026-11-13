@@ -586,6 +586,7 @@ class SpecIRNode:
     kv_states: Tuple[Any, ...] = ()
     kv_label: Optional[str] = None
     attn_variant: Optional[str] = None
+    sparse_dcp: Any = None
     # The call's own `params:` as the spec writes them — a component call's
     # slot bindings (`compressor: csa2_shared_latent`), nested templates
     # already synthesized to their names at load. The walk consumes them

@@ -1,0 +1,120 @@
+{
+  "coverage": "6/6 exact physical keys consumable by merge_validated_rows + physical_time_for",
+  "timing_method": "l2_drain CUDA events, standard driver; not CUPTI warm-resident serving",
+  "deployment": {
+    "tp_attention": 8,
+    "dcp": 8,
+    "ep_moe": 2,
+    "tp_moe_expert": 4
+  },
+  "checks": [
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 256,
+        "s_query": 1
+      },
+      "training_us": 10.016,
+      "holdout_us": 9.12,
+      "holdout_relative_error": 0.0982456140350878,
+      "overlay_seconds": 1.0016e-05,
+      "input_seed_training": "10320929690908962080",
+      "input_seed_holdout": "10320929692658248806"
+    },
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 257,
+        "s_query": 1
+      },
+      "training_us": 7.904,
+      "holdout_us": 8.704,
+      "holdout_relative_error": -0.09191176470588247,
+      "overlay_seconds": 7.904e-06,
+      "input_seed_training": "8513918945644409192",
+      "input_seed_holdout": "8513918946580000814"
+    },
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 288,
+        "s_query": 1
+      },
+      "training_us": 8.992,
+      "holdout_us": 8.672,
+      "holdout_relative_error": 0.03690036900368998,
+      "overlay_seconds": 8.992000000000001e-06,
+      "input_seed_training": "11133379118008761156",
+      "input_seed_holdout": "11133379119481223682"
+    },
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 2048,
+        "s_query": 1
+      },
+      "training_us": 9.856,
+      "holdout_us": 9.504,
+      "holdout_relative_error": 0.03703703703703698,
+      "overlay_seconds": 9.856e-06,
+      "input_seed_training": "14540447493249048296",
+      "input_seed_holdout": "14540447492313456558"
+    },
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 2049,
+        "s_query": 1
+      },
+      "training_us": 9.984,
+      "holdout_us": 8.768,
+      "holdout_relative_error": 0.13868613138686126,
+      "overlay_seconds": 9.984e-06,
+      "input_seed_training": "13515399730885698843",
+      "input_seed_holdout": "13515399732349772893"
+    },
+    {
+      "shape": {
+        "B": 1,
+        "d_indexer_head": 128,
+        "kv_block_size": 64,
+        "n_indexer_heads": 32,
+        "s_kv": 2080,
+        "s_query": 1
+      },
+      "training_us": 9.792,
+      "holdout_us": 8.832,
+      "holdout_relative_error": 0.10869565217391286,
+      "overlay_seconds": 9.791999999999999e-06,
+      "input_seed_training": "9228854270009844116",
+      "input_seed_holdout": "9228854269057999058"
+    }
+  ],
+  "mean_absolute_holdout_error": 0.08524609472374522,
+  "scope": "heldout input seeds/runs at identical shapes, no unseen-shape or full-model validation",
+  "source_commit_sglang": "1b2870d33de7b5f31844fd74e97eea6d7896c53a",
+  "runtime": "DeepGEMM0.2.8, Torch2.14.1+cu130, GPU7 B300SM103; package source commit unreported by wheel",
+  "shared_host": "Parent pytest on GPU0/CPU; only CUDA events used for latency",
+  "setup_excluded": [
+    "FP8 quantization",
+    "cache packing",
+    "page metadata",
+    "topk",
+    "DCP communication"
+  ]
+}

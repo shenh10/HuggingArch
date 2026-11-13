@@ -85,6 +85,8 @@ def rewrite_serving_graph(
         analysis,
         stage=stage,
         timing_scope=timing_scope,
+        sm_count=(framework_binding.deployment.sm_count
+                  if framework_binding is not None else None),
     )
     casts = materialize_casts(analysis, materialized)
     # The graft can change what a collective moves (the exchange after a
@@ -351,10 +353,17 @@ def build_serving_layers(cell: Any, *,
     run under the walk's conditions (`Analysis.assumed`): a condition one of
     them states on the point joins the ones the point is checked against."""
     analysis = cell.built_walk()
-    launches = (framework_binding.precision_launches_for()
+    required_framework = (analysis.program.required_runtime_framework
+                          if analysis.rule.sparse_dcp.storage_plans else None)
+    if (required_framework is not None
+            and getattr(framework_binding, "framework", None) != required_framework):
+        raise NotImplementedError(
+            f"Sparse DCP runtime plans require the {required_framework} framework profile; "
+            "reference and other framework profiles cannot reuse SGLang allocation and communication contracts")
+    launches = (framework_binding.precision_launches_for(analysis.program, analysis)
                 if framework_binding is not None else ())
     unavailable_launches = (
-        framework_binding.unavailable_precision_launches_for()
+        framework_binding.unavailable_precision_launches_for(analysis.program, analysis)
         if framework_binding is not None else ())
     # The output widths the kernels this framework dispatches to require of
     # a declared role (`FrameworkBinding.edge_dtypes_for`), with both halves

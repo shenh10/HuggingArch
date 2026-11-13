@@ -1,0 +1,30 @@
+[
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-0-EP-0-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-1-EP-0-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-3-EP-0-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-4-EP-1-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-5-EP-1-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-6-EP-1-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  },
+  {
+    "path": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/profiles/1794594690.1182737/target-only-in2048bs-1-il-2048-1794594690.1385405-TP-7-EP-1-DECODE.trace.json.gz",
+    "error": "Compressed file ended before the end-of-stream marker was reached"
+  }
+]

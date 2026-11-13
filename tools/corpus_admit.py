@@ -13,7 +13,9 @@ before the pinned run it stages the sources that decide the split
 (`--framework-source`, one directory per source) — vLLM's files for the
 model (`backend.hf.vllm_source`), and the model's own reference
 implementation where the publisher ships one (`backend.hf.forward_source`,
-the code the spec was written from). A stack whose every node the leading
+the code the spec was written from). A snapshot explicitly recorded from
+SGLang instead stages that frozen SGLang source offline, with its exact revision,
+and never probes vLLM. A stack whose every node the leading
 source splits as measured is recorded with that source's revision and each
 node's cited assignment (`tools/corpus_pins/decisions/framework_split.py`);
 any other stack, and every other decision, stays a person's.
@@ -64,7 +66,8 @@ from tools.corpus_pins.decision import DecisionState, Verdict
 from tools.corpus_pins.decisions import tp_split
 from tools.corpus_pins.decisions.tp_split import TP_SPLIT
 from tools.corpus_pins.decisions.framework_split import (
-    MANIFEST, SOURCE_KINDS, FrameworkSplit, Oracle, ReferenceSplit, VllmSplit)
+    MANIFEST, SOURCE_KINDS, FrameworkSplit, Oracle, ReferenceSplit, SglangSplit,
+    VllmSplit)
 from tools.corpus_pins.env import Environment, lock_sha256_at
 from tools.corpus_pins.pin import Pin, PinBase, Scope, canonical
 from tools.corpus_pins.pins.encoder_weight import ENCODER_WEIGHT
@@ -552,8 +555,15 @@ def stage_sources(argv: Sequence[str]) -> List[Path]:
     model = CorpusModel(args.model_id.replace("/", "__", 1))
     if not model.path.exists():
         return []
-    staged = {VllmSplit.kind: stage_vllm(model, args.cache_dir),
-              ReferenceSplit.kind: stage_reference(model, args.cache_dir)}
+    source = model.payload.get("forward_source") or {}
+    if source.get("source") == SglangSplit.kind:
+        # This snapshot explicitly names its serving framework. Its frozen
+        # source is sufficient offline; probing another framework could fetch
+        # unrelated code and cannot establish this deployment's split.
+        staged = {SglangSplit.kind: stage_sglang(model, args.cache_dir)}
+    else:
+        staged = {VllmSplit.kind: stage_vllm(model, args.cache_dir),
+                  ReferenceSplit.kind: stage_reference(model, args.cache_dir)}
     return [staged[kind] for kind in SOURCE_KINDS if staged.get(kind) is not None]
 
 
@@ -570,6 +580,34 @@ def stage_vllm(model: CorpusModel, cache_dir: Path) -> Optional[Path]:
         {"kind": VllmSplit.kind, "revision": source.commit,
          "architectures": list(source.architectures),
          "imported": list(source.imported)})
+
+
+def stage_sglang(model: CorpusModel, cache_dir: Path) -> Optional[Path]:
+    """Stage explicitly recorded SGLang Python sources without any fetch.
+
+    Paths and revision stay exactly as recorded. Native kernel evidence
+    remains in the snapshot; the split oracle consumes only Python ASTs.
+    Hashing the snapshot for the staging directory keeps different frozen
+    file sets at the same upstream commit from sharing stale staged files.
+    """
+    source = model.payload.get("forward_source") or {}
+    if source.get("source") != SglangSplit.kind:
+        return None
+    files = [(f["path"], f["text"]) for f in source.get("files", ())
+             if f.get("text") and f.get("path", "").endswith(".py")]
+    if not files:
+        return None
+    revision = source.get("revision")
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValueError(f"{model.model_id}: recorded SGLang source needs its revision")
+    return stage_files(
+        cache_dir / SglangSplit.kind / sha256_bytes(model.path.read_bytes()) / model.stem,
+        files,
+        {"kind": SglangSplit.kind, "revision": revision,
+         "model_id": model.model_id,
+         "architectures": model.config.get("architectures", []),
+         "imported": list(source.get("imported") or ()),
+         "read_from": [path for path, _text in files]})
 
 
 def stage_reference(model: CorpusModel, cache_dir: Path) -> Optional[Path]:

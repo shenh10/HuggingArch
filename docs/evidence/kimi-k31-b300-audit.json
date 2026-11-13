@@ -1,0 +1,85 @@
+{
+  "canonical_runs": 40,
+  "measured_requests": 640,
+  "additional_confirmation_requests": 24,
+  "audits": {
+    "ep2-breakable": {
+      "variant": "ep2-breakable",
+      "runs": 10,
+      "completed_requests": 160,
+      "errors": 0,
+      "cached_tokens": 0,
+      "ready_to_measurement_end": [
+        "2026-11-13 16:17:07",
+        "2026-11-13 16:23:11"
+      ],
+      "compilation_log_lines_in_interval": [],
+      "final_bookkeeping_error": "In-place shell modification caused unexpected EOF after all 10 measurements and 5 metrics captures; final server-info absent. ready-server-info retained.",
+      "compiler_process_monitor": "Not active for this baseline shell; server log audit only. Future variants use per-run monitor."
+    },
+    "ep2-disabled": {
+      "runs": 10,
+      "completed_requests": 160,
+      "cached_tokens": 0,
+      "errors": 0,
+      "post_warmup_compiler_samples": 0,
+      "confirmation_runs": 2,
+      "initial_128_drift": "First run TTFT645.65ms TPOT3.85ms; second408.21/3.26; two post-workload confirmations406.78/3.263 and430.58/3.257. Warmup ptxas detected before first measurement only. No proven measured compilation cause; retain originals and report confirmation separately."
+    },
+    "ep1-breakable": {
+      "runs": 10,
+      "completed_requests": 160,
+      "cached_tokens": 0,
+      "errors": 0,
+      "compiler_samples": 0,
+      "measurement_markers_present": true,
+      "final_server_info_present": true
+    },
+    "ep1-disabled": {
+      "runs": 10,
+      "completed_requests": 160,
+      "cached_tokens": 0,
+      "errors": 0,
+      "compiler_samples": 0,
+      "post_warmup_compiler_samples": 0,
+      "measurement_markers_present": true,
+      "final_server_info_present": true
+    }
+  },
+  "confirmations": [
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/ep2-disabled/confirmation/in128-out256-c1-r1.jsonl",
+      "completed": 12,
+      "output_throughput": 206.2449471661391,
+      "mean_ttft_ms": 406.77850041538477,
+      "mean_tpot_ms": 3.2629422949980085,
+      "accept_length": 3.925,
+      "cache_report": {
+        "total_prompt_tokens": 1536,
+        "total_cached_tokens": 0,
+        "cache_hit_rate_pct": 0.0,
+        "device_cached_tokens": null,
+        "host_cached_tokens": null,
+        "storage_cached_tokens": null,
+        "storage_backend": null
+      }
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/ep2-disabled/confirmation/in128-out256-c1-r2.jsonl",
+      "completed": 12,
+      "output_throughput": 202.63514580499648,
+      "mean_ttft_ms": 430.5805235635489,
+      "mean_tpot_ms": 3.257331265185296,
+      "accept_length": 3.925,
+      "cache_report": {
+        "total_prompt_tokens": 1536,
+        "total_cached_tokens": 0,
+        "cache_hit_rate_pct": 0.0,
+        "device_cached_tokens": null,
+        "host_cached_tokens": null,
+        "storage_cached_tokens": null,
+        "storage_backend": null
+      }
+    }
+  ]
+}

@@ -96,6 +96,7 @@ from backend.inference.defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.phases import phase_binding
 from backend.inference.phase_formulas import STEP_SOL_BOUND_NOTE, STEP_SOL_LAW
+from backend.arch.runtime_profile import RuntimeProfile
 from backend.inference.step_eval import StepCells, evaluate_step
 from backend.inference.pipeline import AnalysisResult, NoPeakForDtype, analyze as serving_analyze
 from backend.inference.calibration_overlay import (
@@ -698,7 +699,7 @@ def serving_step(
     step = evaluate_step(
         isolated, parallel, phase=phase, batch=batch,
         input_tokens=input_tokens, output_tokens=0, precision=precision,
-        cells=cells)
+        cells=cells if cells is not None else StepCells(RuntimeProfile.ARCHITECTURE))
     return serving_analyze(
         isolated,
         parallel=parallel,
@@ -773,7 +774,7 @@ def phase_roofline(
     step = evaluate_step(
         resolved, parallel, phase=phase, batch=batch,
         input_tokens=input_tokens, output_tokens=0, precision=precision,
-        cells=cells)
+        cells=cells if cells is not None else StepCells(RuntimeProfile.ARCHITECTURE))
     model_dtype = step.analysis.resolved_precision.model_dtype
     binding = _UNION_BINDING.deployed(ServingDeployment.at(
         gpu_sku=gpu_sku, activation_dtype=model_dtype,
@@ -2551,7 +2552,7 @@ host, name, dim_overrides, site,
     # the runtime table, its rows before it the naive view, and its walk the
     # one the timing reads (`cells`).
     spec = isolate_resolved(host, name, dim_overrides, site)
-    cells = StepCells()
+    cells = StepCells(RuntimeProfile.ARCHITECTURE)
     served = {
         phase: serving_step(
             spec, batch=batch, input_tokens=input_tokens, phase=phase,
@@ -2977,7 +2978,7 @@ def _isolated_walk(host: Any, name: str, dim_overrides: Dict[str, Any],
     """The walk of `name` isolated at `site` (`isolate_resolved`), one
     request of two tokens, that `_dependency_dims` reads its dims from."""
     isolated = isolate_resolved(host, name, dim_overrides, site)
-    return Deployment(Program.of(isolated)).at(
+    return Deployment(Program.of(isolated), runtime_profile=RuntimeProfile.ARCHITECTURE).at(
         batch=1, input_tokens=2).analyze()
 
 

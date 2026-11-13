@@ -71,6 +71,14 @@ def physical_axis_partition_audit(
         if same_law(extent, 0):
             # An axis the model leaves empty partitions nothing.
             continue
+        plans = getattr(sharding, "sparse_dcp", None)
+        if world.label == "dcp" and plans is not None and plans.plans:
+            # Striped ownership permits a final partial shard. This audit
+            # reports the owner count, not an equal contiguous partition.
+            out.append(AxisPartitionAudit(
+                symbol=symbol, extent=extent, requested=family.group_size,
+                applied=family.group_size, degree=world.label))
+            continue
         layout = layout_for_symbol(
             symbol,
             extent,
@@ -757,6 +765,14 @@ def pairs_share(op: Optional[str], global_shape: Shape,
     the keys, Ulysses neither (it cuts heads), and a DSA indexer's rows
     follow the sequence cut under either prefill scheme. None for a node
     whose matrix has no query and key axis: nothing to scale."""
+    if local_shape.pair_share is not None:
+        return local_shape.pair_share
+    if op == "dsa_topk_mask" and global_shape.ins and local_shape.ins:
+        # A selector scans its input logits, not the padded K-slot output.
+        # Sparse DCP narrows the scan even though K remains unchanged.
+        before, after = global_shape.ins[0], local_shape.ins[0]
+        return sp.cancel(exact(after[-2] * after[-1]) /
+                         exact(before[-2] * before[-1]))
     kernel = attention_kernel(op)
     global_pairs = global_shape.pairs(kernel)
     local_pairs = local_shape.pairs(kernel)
@@ -822,8 +838,11 @@ def local_definitions(definitions: Optional[Mapping[str, Any]], *,
     out: Dict[str, Any] = {}
     for name, definition in definitions.items():
         if share is not None and _counts_score_pairs(name):
+            # Physical ownership ratios can read workload symbols (rounded
+            # local scans / skewed selection), not only constant cuts.
+            extra = {s.name: s for s in exact(share).free_symbols}
             out[name] = Definition(definition.law * share,
-                                   definition.bindings,
+                                   {**extra, **definition.bindings},
                                    definition.value * share)
             continue
         definition = at_rank.get(name, definition)
@@ -831,6 +850,16 @@ def local_definitions(definitions: Optional[Mapping[str, Any]], *,
                 and not same_law(definition.value, 0)):
             factor = sp.cancel(exact(carried[name]) / exact(definition.value))
             if varies(factor):
+                # Explicit runtime geometry may be a bounded, nonuniform
+                # ownership law rather than a constant tensor partition.
+                # Publish that law in workload names, not a fake fixed cut.
+                plans = getattr(analysis.rule, "sparse_dcp", None)
+                plan = plans.for_node(node) if plans is not None else None
+                if plan is not None and plan.decode:
+                    law = exact(carried[name])
+                    out[name] = Definition(
+                        law, {s.name: s for s in law.free_symbols}, law)
+                    continue
                 raise ValueError(
                     f"{node.display_path}: `{name}` = {definition.law} comes "
                     f"to {definition.value}, and the rank's axis holds "

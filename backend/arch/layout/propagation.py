@@ -1,5 +1,6 @@
 """Layout rule the evaluator asks at each node: required vs produced `EdgeState`."""
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
 
 from ..ops import is_identity_source
 from .zone import COMBINE_OP, DISPATCH_OP
@@ -226,6 +227,8 @@ class LayoutPropagation(Rule):
     #: symbols, a number at a point. Dispatch reads it into the routed
     #: rows' evidence (`ExpectedRoutedLoad`).
     expert_load: Any = 1
+    dcp_selected_load_factor: Any = 1
+    dcp_failed_owners: Any = 0
     #: uid -> the kernel's cut output for a producer published whole.
     _producer_gathers: Dict[int, EdgeState] = field(default_factory=dict)
     #: uid -> the op declaration the walk handed this rule for the node. A
@@ -242,6 +245,8 @@ class LayoutPropagation(Rule):
     #: asks of it (`Program.output_leaf`: which child a component's port
     #: names). Handed in by the composition root (`Deployment.analyze`).
     program: Any = None
+    sparse_dcp: Any = None
+    runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED
 
     def world_degree(self, world: str) -> int:
         """The deployment's degree of `world` in this walk's phase
@@ -252,6 +257,10 @@ class LayoutPropagation(Rule):
         return self.parallel.degree_of_world(world, phase=self.phase)
 
     def __post_init__(self) -> None:
+        if self.sparse_dcp is None:
+            from .sparse_dcp import SparseDcpPlans
+            object.__setattr__(self, "sparse_dcp", SparseDcpPlans.of(
+                self.program, self.parallel, self.phase, self.runtime_profile))
         if self.attention is None:
             object.__setattr__(
                 self, "attention", AttentionPlan.from_rule(self))
@@ -262,7 +271,10 @@ class LayoutPropagation(Rule):
            encoder_nodes: Mapping[int, str] = MappingProxyType({}),
            replicated_encoders: FrozenSet[str] = frozenset(),
            expert_load: Any = 1,
+           dcp_selected_load_factor: Any = 1,
+           dcp_failed_owners: Any = 0,
            program: Any = None,
+           runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED,
            ) -> "LayoutPropagation":
         """Build a rule whose node facts are filled by the one evaluator walk."""
         families = families_for(parallel, phase)
@@ -310,8 +322,10 @@ class LayoutPropagation(Rule):
                    encoder_nodes=dict(encoder_nodes),
                    replicated_encoders=replicated_encoders,
                    expert_load=expert_load,
+                   dcp_selected_load_factor=dcp_selected_load_factor,
+                   dcp_failed_owners=dcp_failed_owners,
                    pipeline_family=pipeline_family_for(parallel),
-                   program=program)
+                   program=program, runtime_profile=runtime_profile)
 
     @memo_property
     def encoder_view(self) -> "LayoutPropagation":
@@ -528,6 +542,8 @@ class LayoutPropagation(Rule):
                 )
             )
             _require_supported_axis(node, slot, runtime)
+            runtime = self.sparse_dcp.runtime_axis(
+                node, slot, runtime, self.replicated)
             ordered.append(runtime)
             checkpoint_axes.append(checkpoint)
             segments.append(terms)
@@ -604,7 +620,9 @@ class LayoutPropagation(Rule):
             if state is not None and state.workload is not None:
                 self._validate_routed_state(node, state, shape)
         effective = self._settle_arrivals(op_name, node, list(arrived))
-        requirements, produced = handler(self, node, effective, in_shapes)
+        from .sparse_dcp import transition as sparse_transition
+        sparse = sparse_transition(self, node, effective, in_shapes)
+        requirements, produced = sparse if sparse is not None else handler(self, node, effective, in_shapes)
         return self._finalize_cached_producer(
             node, requirements, produced, in_shapes, out_shape)
 
@@ -696,6 +714,11 @@ class LayoutPropagation(Rule):
         """
         pending = [s is not None and s.carries_partial() for s in states]
         if not any(pending):
+            return states
+        sparse_plan = self.sparse_dcp.for_node(node)
+        if sparse_plan is not None and sparse_plan.decode and sparse_plan.role(node) == "value_projection":
+            # Linear V projection commutes with the LSE-weighted merge. The
+            # explicit runtime plan owns the projected-width collective.
             return states
         residual = self._residual_sequence_add(op_name, states, pending)
         if residual is not None:

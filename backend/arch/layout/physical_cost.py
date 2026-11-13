@@ -230,6 +230,8 @@ def physical_traffic_geometry(
     frame_divisors = _cache_view_frame_divisors(
         analysis, program=analysis.program, rewrite=analysis.rewrite,
         whole_shapes=analysis.shapes, invocation_shapes=proj.access_shapes)
+    from .runtime_weights import runtime_read_aliases
+    aliases = runtime_read_aliases(analysis, rows) if analysis.rule.sparse_dcp.plans else None
     return traffic_mod.TrafficGeometry(
         shapes=proj.access_shapes,
         storage=Layer(analysis.program, storage),
@@ -237,6 +239,7 @@ def physical_traffic_geometry(
         cache=cache,
         whole_shapes=analysis.shapes,
         cache_view_frame_divisor=frame_divisors,
+        read_aliases=aliases,
     )
 
 
@@ -257,6 +260,9 @@ def _invocation_local_cache(analysis: Analysis,
     edge in the program being priced.
     """
     layer = cache_mod.derive(analysis, geometry=geometry)
+    if analysis.rule.sparse_dcp.plans:
+        from .runtime_weights import sparse_dcp_cache_reads
+        layer = sparse_dcp_cache_reads(analysis, layer)
     views = analysis.rule.head_repartition_kv_views
     if not views:
         return layer

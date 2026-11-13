@@ -214,6 +214,7 @@ def test_layersplit_occupancy_is_global_and_capped():
             self.is_growing = True
             self.elements = 1
             self.stored = stored
+            self.storage_law = stored
             self.positions_over = 1
             self.position_bytes = 2
             self.resolved_format = "bf16"

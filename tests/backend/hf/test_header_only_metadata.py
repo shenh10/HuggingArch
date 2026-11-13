@@ -96,6 +96,22 @@ class TestHeadersAreEnough(unittest.TestCase):
         self.assertEqual(meta["total_params"], 128 * 128)
         self.assertEqual(meta["quantization_metadata_params"], 1)
 
+    def test_mixed_mxfp4_plain_and_packed_weights_keep_bf16_unpacked(self):
+        # Both U8 naming variants are real packed weights; the same .weight
+        # suffix on BF16 attention/norm tensors is not evidence of packing.
+        meta = _scan({
+            "experts.0.w1.weight_packed": ("U8", [8, 16], 128),
+            "experts.0.w2.weight": ("U8", [8, 16], 128),
+            "experts.0.w1.weight_scale": ("U8", [8, 1], 8),
+            "experts.0.w2.weight_scale": ("U8", [8, 1], 8),
+            "attention.weight": ("BF16", [8, 32], 512),
+            "norm.weight": ("BF16", [8], 16),
+        }, {"quantization_config": {"quant_method": "mxfp4-pack-quantized"}})
+        self.assertEqual(meta["total_params"], 2 * 128 * 2 + 256 + 8)
+        self.assertEqual(meta["quantization_metadata_params"], 16)
+        self.assertEqual(meta["checkpoint_storage_bytes"], 800)
+        self.assertEqual(meta["index_total_size"], 800)
+
     def test_the_hub_fetcher_takes_no_config(self):
         params = inspect.signature(_fetch_metadata_hf).parameters
         self.assertNotIn("config", params)

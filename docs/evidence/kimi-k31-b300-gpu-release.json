@@ -1,0 +1,32 @@
+{
+  "state": "released",
+  "owner_task": "b300_benchmark",
+  "gpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "matrix_pids": [],
+  "server_pid": null,
+  "phase": "matrix_complete",
+  "external_microbench_allowed": true,
+  "temporary_window": false,
+  "gpu_processes_at_release": "",
+  "updated_utc": "2026-11-13T17:50:47Z",
+  "completion_signal_paths": [
+    "/tmp/scratch-space/k3-performance/benchmark/ep-microbench/microbench-handoff.json",
+    "/tmp/scratch-space/k3-performance/benchmark/microbench-handoff.json"
+  ],
+  "completion_states": [
+    "complete",
+    "completed",
+    "done",
+    "finished",
+    "released"
+  ]
+}

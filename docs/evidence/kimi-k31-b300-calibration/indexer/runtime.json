@@ -1,0 +1,36 @@
+{
+  "torch": {
+    "version": "2.14.1+cu130",
+    "direct_url": null
+  },
+  "sgl-flash-mla": {
+    "version": "1.0.5",
+    "direct_url": null
+  },
+  "flashinfer-python": {
+    "version": "0.7.4",
+    "direct_url": null
+  },
+  "flashinfer-cubin": {
+    "version": "0.7.2",
+    "direct_url": null
+  },
+  "flashinfer-jit-cache": {
+    "version": "0.7.2+cu130",
+    "direct_url": null
+  },
+  "triton": {
+    "version": "3.8.0",
+    "direct_url": null
+  },
+  "sglang_commit": "1b2870d33de7b5f31844fd74e97eea6d7896c53a",
+  "visible_physical_gpu": 7,
+  "sources": {
+    "/opt/sglang/lib/python3.12/site-packages/deep_gemm/__init__.py": {
+      "sha256": "90b8b0bf2919efbdc3468315f8f050f7d86fc2be479837ad9214ee5ae41d47c9"
+    },
+    "sglang/python/sglang/srt/layers/attention/dsa/dsa_indexer.py": {
+      "sha256": "6cacc66adcd2fdabbb00d3817f6e0961103fdc3c694a698d76f1b156d5dfbf65"
+    }
+  }
+}

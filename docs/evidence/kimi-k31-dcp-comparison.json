@@ -1,0 +1,81 @@
+{
+  "scope": "Analytical target-step lower bound versus target-only HTTP serving. No fitted multiplier; no DFLASH acceptance conversion.",
+  "measurements": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/results.json",
+  "baseline_assumptions": {
+    "dcp_selected_load_factor": 1,
+    "dcp_failed_owners": 0,
+    "ep_load_factor": 1
+  },
+  "validation": [
+    {
+      "input_tokens": 2048,
+      "output_tokens": 512,
+      "concurrency": 1,
+      "context_midpoint": 2304.0,
+      "requests": 36,
+      "theory_ms_per_target_step": 7.095662499555556,
+      "mean_http_tpot_ms": 9.944849842898087,
+      "repeat_range_http_tpot_ms": [
+        9.943661011909777,
+        9.946411287664775
+      ],
+      "theory_minus_http_percent": -28.64987796047238,
+      "mean_http_ttft_ms": 154.36277127203843
+    },
+    {
+      "input_tokens": 16384,
+      "output_tokens": 512,
+      "concurrency": 1,
+      "context_midpoint": 16640.0,
+      "requests": 24,
+      "theory_ms_per_target_step": 7.095662499555556,
+      "mean_http_tpot_ms": 10.081021355912187,
+      "repeat_range_http_tpot_ms": [
+        10.080866170946852,
+        10.081230901289228
+      ],
+      "theory_minus_http_percent": -29.61365471769203,
+      "mean_http_ttft_ms": 772.787727920028
+    }
+  ],
+  "context_delta_http_tpot_ms": 0.1361715130140997,
+  "context_delta_theory_ms": 0.0,
+  "scenarios_not_observed_distributions": [
+    {
+      "input_tokens": 16384,
+      "rho": 1,
+      "failed_owners": 0,
+      "target_step_ms": 7.095662499555556,
+      "flops_per_step": 40022363756,
+      "read_bytes_per_step": 29415582004,
+      "communication_ms": 0.6874813155555555
+    },
+    {
+      "input_tokens": 16384,
+      "rho": 8,
+      "failed_owners": 0,
+      "target_step_ms": 7.095662499555556,
+      "flops_per_step": 49093654124,
+      "read_bytes_per_step": 29576173876,
+      "communication_ms": 0.6874813155555555
+    },
+    {
+      "input_tokens": 16384,
+      "rho": 1,
+      "failed_owners": 8,
+      "target_step_ms": 7.146720846222222,
+      "flops_per_step": 40022363756,
+      "read_bytes_per_step": 29428164916,
+      "communication_ms": 0.7385396622222222
+    },
+    {
+      "input_tokens": 16384,
+      "rho": 8,
+      "failed_owners": 8,
+      "target_step_ms": 7.146720846222222,
+      "flops_per_step": 49093654124,
+      "read_bytes_per_step": 29588756788,
+      "communication_ms": 0.7385396622222222
+    }
+  ]
+}

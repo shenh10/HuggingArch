@@ -1,0 +1,304 @@
+# SGLang-only serving reference: commit 1b2870d33de7b5f31844fd74e97eea6d7896c53a.
+# Absorbed-MLA serving profile in both phases, NoPE with sigmoid output gate.
+# DCP1 short eager prefill may use MHA_ONE_SHOT; see docs/kimi-k31-sglang.md.
+# The 64-wide unrotated key tail remains BF16; 69 KDA + 24 DSA.
+# Kimi-K3.1 Pro (moonshotai/Kimi-K3.1-Pro) — native-multimodal MoE, ~2.8T params.
+#
+# Text backbone (language_model.model, 93 layers), a KimiLinear decoder with:
+#   - Hybrid attention (config.linear_attn_config): 69 KDA (Kimi Delta
+#     Attention, linear-attn) layers + 24 Gated-DSA full-attention layers.
+#     full_attn_layers (1-indexed) = 4,8,...,92,93 -> 0-indexed layer idx
+#     3,7,...,91,92 are MLA; the rest are KDA. (is_kda_layer(i) = (i+1) in
+#     kda_layers.)
+#   - "Attention Residuals" (SGLang layers/attn_residual.py and
+#     layers/layer_boundary/residual/attn_bank.py). Each layer carries
+#     two things: `hidden` (the source's
+#     `prefix_sum`) and the history `block_residual`, which starts empty.
+#     Every attn_res_block_size = 12 layers (0, 12, …, 84) a layer appends
+#     its ENTRY to the history and restarts the prefix sum. Before attention
+#     (when the history is non-empty) and before the MLP, the sub-layer input
+#     is `attn_res_combine(prefix, history)`: a softmax over the history
+#     entries and the prefix, scored by that call's own `*_res_norm` gain and
+#     `*_res_proj` row — scoring weights, not a gate. After the last layer
+#     `output_attn_res_norm/proj` score one more combine, then `norm`.
+#     The history is the stack's `read: all` stream; a layer sees the
+#     entries appended before its entry, ceil(l / 12) at layer l.
+#   - FFN: layer 0 (first_k_dense_replace=1) is dense SiTU-gated FFN (d_ffn=33792); layers
+#     1-92 are "Stable LatentMoE" (block_sparse_moe): 896 routed experts
+#     (top-16) in a 3584-d latent space + 2 fused shared experts.
+#
+# Vision path: MoonViT-3D tower (27 RMSNorm bias-free ViT blocks, separate
+# qkv_hidden 1536) + PatchMergerMLPV2 projector, wrapped as a singleton
+# aux_block.
+#
+# Quantization: only the routed MoE experts (block_sparse_moe.experts.X.w1/w3/w2)
+# are MXFP4 (compressed-tensors "mxfp4-pack-quantized": U8-packed FP4 2/byte +
+# per-32 UE8M0 scales). Everything else — attention, shared/latent MoE
+# projections, dense FFN, embeddings, lm_head, vision — is BF16 (config.ignore).
+match:
+  model_type: [kimi_k31]
+
+components:
+  norm: rmsnorm
+
+dims:
+  # --- text backbone ---
+  d_model:    config.text_config.hidden_size                 # 7168
+  n_heads:    config.text_config.num_attention_heads         # 96
+  n_kv_heads:   config.text_config.num_key_value_heads
+  d_qk_nope:    config.text_config.qk_nope_head_dim            # 128
+  d_qk_rope:    config.text_config.qk_rope_head_dim            # 64
+  d_v_head:   config.text_config.v_head_dim                  # 128
+  d_kv_lora:    config.text_config.kv_lora_rank                # 512
+  d_q_lora:   config.text_config.q_lora_rank                 # 1536
+  d_ffn:    config.text_config.intermediate_size           # 33792 (dense FFN, layer 0)
+  n_vocab:    config.text_config.vocab_size                  # 163840
+  n_layers:    config.text_config.num_hidden_layers           # 93
+  n_dense_layers:   config.text_config.first_k_dense_replace       # 1
+  Kar:  config.text_config.attn_res_block_size         # 12 (AttnRes history stride)
+  # The history length a layer sees, `Sar`, is not a model dim: the walk
+  # binds it per group of layers that see the same number of entries.
+  # SGLang configs/kimi_linear.py _init_dsa: one independent indexer per DSA layer.
+  n_topk_keys: config.text_config.dsa_config.index_topk
+  n_indexer_heads: config.text_config.dsa_config.index_num_heads
+  d_indexer_head: config.text_config.dsa_config.index_head_dim
+  # --- MoE ---
+  n_experts:    config.text_config.num_experts                 # 896
+  n_experts_active:    config.text_config.num_experts_per_token       # 16
+  n_shared_experts:   config.text_config.num_shared_experts          # 2
+  d_ffn_expert:   config.text_config.moe_intermediate_size       # 3072 (routed expert intermediate)
+  d_moe_latent: config.text_config.routed_expert_hidden_size   # 3584 (latent expert space)
+  d_ffn_shared:   "n_shared_experts * d_ffn_expert"                                       # 6144 (fused shared-expert intermediate)
+  n_expert_groups:   config.text_config.num_expert_group            # 1
+  n_groups_active:   config.text_config.topk_group                  # 1
+  # --- KDA linear attention (config.linear_attn_config) ---
+  n_lin_k_heads:  config.text_config.linear_attn_config.num_heads             # 96
+  n_lin_v_heads:  config.text_config.linear_attn_config.num_heads             # 96
+  d_lin_k_head:  config.text_config.linear_attn_config.head_dim              # 128
+  d_lin_v_head:  config.text_config.linear_attn_config.head_dim              # 128
+  s_conv_kernel:   config.text_config.linear_attn_config.short_conv_kernel_size  # 4
+  s_conv_history: "s_conv_kernel - 1"  # SGLang KimiLinearStateShape.create.
+  d_gate_lowrank:  config.text_config.linear_attn_config.head_dim              # 128 (full-rank-gate low-rank == head_dim)
+  # Decay-gate form: lower-bounded sigmoid when the config sets
+  # gate_lower_bound (-5.0 here), softplus otherwise (SGLang
+  # models/kimi_k3.py:2080-2081 sets attn.lower_bound from the config).
+  n_gate_lower_bound: present(config.text_config.linear_attn_config.gate_lower_bound) ?? "0"   # 1
+  # --- vision tower (config.vision_config) ---
+  d_vis_model:   config.vision_config.vt_hidden_size            # 1024
+  n_vis_heads:   config.vision_config.vt_num_attention_heads    # 12
+  d_vis_qkv: config.vision_config.qkv_hidden_size           # 1536
+  d_vis_head:  "d_vis_qkv // n_vis_heads"                                    # 128
+  d_vis_ffn:   config.vision_config.vt_intermediate_size      # 4096
+  n_vis_layers:   config.vision_config.vt_num_hidden_layers      # 27
+  n_vis_channels:   "3"                                             # RGB patch channels
+  s_patch:   config.vision_config.patch_size                # 14
+  n_spatial_merge:   "2"                                             # merge_kernel_size (2x2)
+  d_proj_in:   "d_vis_model * n_spatial_merge * n_spatial_merge"                                 # 4096 projector input
+  PeH:  config.vision_config.init_pos_emb_height       # 64
+  PeW:  config.vision_config.init_pos_emb_width        # 64
+  s_max: config.text_config.max_position_embeddings
+  # SiTU gate betas (SituAndMul(beta, linear_beta)): the gate's, and the soft
+  # clip of the up branch in the same launch.
+  situ_beta:        config.text_config.activation_situ_beta          # 4.0
+  situ_linear_beta: config.text_config.activation_situ_linear_beta   # 25.0
+
+view:
+  hidden_act: config.text_config.hidden_act
+  norm.eps: config.text_config.rms_norm_eps
+
+# --- AttnRes decoder blocks ---
+# `x` is the layer's entry (`prefix_sum` on entry), `block_residual` the
+# history it sees. Each `attn_res_combine` scores with its own
+# `*_res_norm` gain [d_model] and `*_res_proj` row [1, d_model]. Both are
+# modules (SGLang RMSNorm / ReplicatedLinear; kimi_k3.py and
+# layer_boundary/residual/attn_bank.py) whose weight the combine reads, so each node is the
+# module's `.weight` tensor and carries that checkpoint name.
+#   normal layer:        a_in = combine(x, H); p1 = x + attn(norm1(a_in));
+#                        out = p1 + mlp(norm2(combine(p1, H)))
+#   segment start (l % 12 == 0, l > 0): the entry joins the history and the
+#                        prefix sum restarts, so p1 = attn and out = mlp
+#                        (AttnBankState writes_block resets the running residual)
+#   layer 0:             the history is empty — no first combine
+#                        (attn_residual.py:507-513); its history is the one entry `x`.
+blocks:
+  block_kda_dense_first:
+    graph:
+      # Layer 0: `block_residual` is empty, so attention reads `x` directly;
+      # the layer's self_attention_res_* weights are stored and never read
+      # (sglang loads them and returns before scoring: attn_residual.py:507-513).
+      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "sglang layers/attn_residual.py:507-513 (nvb == 0 returns before the score weights)" } }
+      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "sglang layers/attn_residual.py:507-513 (nvb == 0 returns before the score weights)" } }
+      input_layernorm:           { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attn:                 { op: kimi_k3_kda_attention, in: input_layernorm }
+      # The initial bank snapshot is the history the MLP combine reads.
+      block_residual_init:       { op: stack_init, in: x }
+      mlp_res_norm.weight:              { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      mlp_res_proj.weight:              { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      mlp_res:                   { op: attn_res_combine, in: [self_attn, block_residual_init, mlp_res_norm.weight, mlp_res_proj.weight] }
+      post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      mlp:                       { op: gated_ffn, params: { act: situ }, in: post_attention_layernorm, dims: { d_model: d_model, d_ffn: d_ffn } }
+    outputs: [mlp]
+
+  block_kda_moe_start:
+    reads: [block_residual]
+    graph:
+      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      attn_res:                  { op: attn_res_combine, in: [x, block_residual, self_attention_res_norm.weight, self_attention_res_proj.weight] }
+      input_layernorm:           { op: rmsnorm, in: attn_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attn:                 { op: kimi_k3_kda_attention, in: input_layernorm }
+      # The entry joins the history before the MLP combine reads it.
+      block_residual_append:     { op: stack_append, in: [block_residual, x] }
+      mlp_res_norm.weight:              { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      mlp_res_proj.weight:              { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      mlp_res:                   { op: attn_res_combine, in: [self_attn, block_residual_append, mlp_res_norm.weight, mlp_res_proj.weight] }
+      post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      block_sparse_moe:          { op: kimi_k3_latent_moe, in: post_attention_layernorm }
+    outputs: [block_sparse_moe]
+
+  block_kda_moe:
+    reads: [block_residual]
+    graph:
+      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      attn_res:                  { op: attn_res_combine, in: [x, block_residual, self_attention_res_norm.weight, self_attention_res_proj.weight] }
+      input_layernorm:           { op: rmsnorm, in: attn_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attn:                 { op: kimi_k3_kda_attention, in: input_layernorm }
+      attn_residual:             { op: add, in: [x, self_attn], dim: d_model }
+      mlp_res_norm.weight:              { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      mlp_res_proj.weight:              { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      mlp_res:                   { op: attn_res_combine, in: [attn_residual, block_residual, mlp_res_norm.weight, mlp_res_proj.weight] }
+      post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      block_sparse_moe:          { op: kimi_k3_latent_moe, in: post_attention_layernorm }
+      mlp_residual:              { op: add, in: [attn_residual, block_sparse_moe], dim: d_model }
+    outputs: [mlp_residual]
+
+  block_dsa_moe:
+    reads: [block_residual]
+    graph:
+      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      attn_res:                  { op: attn_res_combine, in: [x, block_residual, self_attention_res_norm.weight, self_attention_res_proj.weight] }
+      input_layernorm:           { op: rmsnorm, in: attn_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      self_attn:                 { op: kimi_k31_dsa_attention, in: input_layernorm }
+      attn_residual:             { op: add, in: [x, self_attn], dim: d_model }
+      mlp_res_norm.weight:              { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      mlp_res_proj.weight:              { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+      mlp_res:                   { op: attn_res_combine, in: [attn_residual, block_residual, mlp_res_norm.weight, mlp_res_proj.weight] }
+      post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
+      block_sparse_moe:          { op: kimi_k3_latent_moe, in: post_attention_layernorm }
+      mlp_residual:              { op: add, in: [attn_residual, block_sparse_moe], dim: d_model }
+    outputs: [mlp_residual]
+
+model_inputs:
+  input_ids: { kind: tokens }
+  # Images per request, then each image's size as the processor hands it to
+  # the tower (after its resize to a multiple of 28).
+  pixel_values: { kind: image, axes: [n_img, img_h, img_w] }
+
+model:
+  - { name: language_model.model.embed_tokens, inputs: [input_ids], op: embedding, boundary_role: input_embedding, dims: { n_vocab: n_vocab, d_model: d_model }, weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }] }
+  # Vision tower — singleton wrapper; its projected output mixes into the embed
+  # stream at image-token positions before the decoder consumes it.
+  - name: vision
+    group: true
+    aux_kind: vision
+    layers:
+      # Kimi-K3 runs Kimi-K2.5's MoonViT processor: each image resized to a
+      # multiple of merge_kernel_size * patch_size = 2 * 14 = 28, cut into
+      # 14x14 patches of 3 channels, one row each; one attention segment
+      # per image.
+      - name: vision.patchify
+        op: patchify
+        inputs: [pixel_values]
+        dims: { patch: s_patch, temporal: "1", channels: n_vis_channels, align: "n_spatial_merge * s_patch" }
+        segment: item
+        source_anchor: "transformers 5.17 kimi_k25/image_processing_kimi_k25.py:78-80 factor = merge_kernel_size * patch_size; :124-150 [grid_h*grid_w, 3, 14, 14] patches; modeling_kimi_k25.py:537-539 cu_seqlens one segment per item"
+      - { name: vision, inputs: [vision.patchify], template: kimi_k3_vision_tower }
+  # Image rows overwrite the image-token rows of the embedding stream
+  # before the decoder runs: kimi_k3.py:4384 general_mm_embed_routine
+  # -> managers/mm_utils.py:436-451 _scatter_mm_embedding uses index_copy_.
+  # The decoder reads only the merge.
+  - name: language_model.model.embed_merge
+    op: scatter_rows_replace
+    inputs: [language_model.model.embed_tokens, vision]
+    prompt_slots: { domain: pixel_values, defines: true, source_anchor: "sglang managers/mm_utils.py:436-451 _scatter_mm_embedding / dest.index_copy_ via models/kimi_k3.py:4384 general_mm_embed_routine" }
+  - name: language_model.model.layers
+    repeat: n_layers
+    streams:
+      hidden: { carries: true }
+      # The AttnRes history: the entry of layers 0, Kar, 2·Kar, …, read by
+      # the layers after each (`read: all`) and by `output_attn_res`.
+      block_residual:
+        from: hidden
+        before: { every: Kar }
+        read: all
+        src: "bank[:, self.num_valid_blocks, :].copy_(prefix_sum)"
+    inputs: [language_model.model.embed_merge]
+    per_layer:
+      assign:
+        # Layer 0: the history is empty. It is also the one dense layer
+        # (first_k_dense_replace = 1): KDA + dense SiTU-gated FFN.
+        - { type: kda_dense_first, layers: ["0"] }
+        # Gated-DSA full-attention layers (full_attn_layers, 0-indexed) + MoE.
+        - { type: dsa_moe, layers: ["3", "7", "11", "15", "19", "23", "27", "31", "35", "39", "43", "47", "51", "55", "59", "63", "67", "71", "75", "79", "83", "87", "91", "92"] }
+        # Layers 12, 24, …, 84: the entry joins the history and the prefix
+        # sum restarts. All are KDA layers.
+        - { type: kda_moe_start, stride: Kar, offset: Kar }
+        # Remaining layers: KDA + LatentMoE.
+        - { type: kda_moe, rest: true }
+      map:
+        kda_dense_first: { template: block_kda_dense_first }
+        dsa_moe:         { template: block_dsa_moe }
+        kda_moe_start:   { template: block_kda_moe_start }
+        kda_moe:         { template: block_kda_moe }
+  # After the last layer: one more combine over the whole history
+  # (layer_boundary/residual/attn_bank.py:298 AttnBankOutputRead), then norm.
+  - { name: language_model.model.output_attn_res_norm.weight, op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+  - { name: language_model.model.output_attn_res_proj.weight, op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: language_model.model.output_attn_res, op: attn_res_combine, inputs: [language_model.model.layers, block_residual, language_model.model.output_attn_res_norm.weight, language_model.model.output_attn_res_proj.weight] }
+  - { name: language_model.model.norm, op: rmsnorm, dim: d_model, weight_axes: [{ replicated: true }], inputs: [language_model.model.output_attn_res] }
+  - { name: language_model.lm_head, op: linear, boundary_role: output_head, dims: { in: d_model, out: n_vocab }, weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }], in: language_model.model.norm }
+
+# Only the routed MoE experts are quantized (compressed-tensors
+# "mxfp4-pack-quantized"). The scheme lives in
+# quant_schemes/mxfp4-pack-quantized.yaml (U8-packed FP4 2/byte, factor 2 —
+# NOT the compressed-tensors I32/factor-8 pack layout, which would 4x-overcount).
+# Everything in config.quantization_config.ignore stays BF16/F32:
+#   - self_attn.* (attention), shared_experts.*, dense mlp.*_proj, lm_head,
+#     vision_tower.*, mm_projector.*
+#   - the latent bottleneck (routed_expert_up/down_proj) is BF16 too.
+quant_context:
+  # SGLang 1b2870d3, default flashmla_kv: 656 B MLA + 132 B index key/token/layer.
+  # Main latent scales are power-of-two F32; the CUDA fused index-key writer uses ordinary F32 scales.
+  cache_formats:
+    latent: fp8_pow2_group128
+    index_key: fp8_group128
+  per_role:
+    # Only the routed MoE experts (block_sparse_moe.experts.X.w1/w3/w2) ship
+    # MXFP4; they carry role ffn_moe. The shared expert (`ffn_moe_shared`),
+    # the latent bottleneck (`ffn_moe_latent`) and the router stay BF16.
+    # `input_activations: none` states what this checkpoint's own config
+    # says: `config_groups.group_0.input_activations` is null. SGLang's
+    # Blackwell flashinfer_mxfp4 launch quantizes activations to MXFP8;
+    # framework_bindings/sglang.yaml owns that runtime precision choice.
+    ffn_moe: { method: mxfp4-pack-quantized, group_size: 32,
+               input_activations: none }
+    ffn_moe_shared: { method: none }
+    ffn_moe_latent: { method: none }
+    router: { method: none }
+    # KDA's short-convolution kernels are stored F32 on disk.
+    attention_short_conv: { method: none, dtype: F32 }
+    default: { method: none }
+  overrides:
+    - tensors_re: 'block_sparse_moe\.gate\.e_score_correction_bias$'
+      dtype: F32
+    # KDA linear-attention buffers stored F32 on disk (the A_log decay/dt_bias
+    # gate params and the o_norm gain).
+    - tensors_re: 'self_attn\.A_log$'
+      dtype: F32
+    - tensors_re: 'self_attn\.dt_bias$'
+      dtype: F32
+    - tensors_re: 'self_attn\.o_norm\.weight$'
+      dtype: F32
+  default_dtype: BF16

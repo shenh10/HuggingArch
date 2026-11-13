@@ -2629,6 +2629,19 @@ class Program:
         return frozenset(stack.name for stack in self.walk_stacks)
 
     @memo_property
+    def sparse_dcp_components(self) -> Tuple[SpecIRNode, ...]:
+        """Components declaring a sparse DCP runtime contract on this graph."""
+        return tuple(node for node in self.walked_nodes() if node.sparse_dcp is not None)
+
+    @memo_property
+    def required_runtime_framework(self) -> Optional[str]:
+        """Framework required by the runtime contracts this graph declares."""
+        frameworks = {node.sparse_dcp.framework for node in self.sparse_dcp_components}
+        if len(frameworks) > 1:
+            raise ValueError(f"conflicting declared runtime frameworks: {sorted(frameworks)}")
+        return next(iter(frameworks), None)
+
+    @memo_property
     def walked_components(self) -> FrozenSet[str]:
         """The components this program's walk invokes, at any depth."""
         out: set = set()

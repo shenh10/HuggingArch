@@ -242,11 +242,28 @@ def _phase(
     }, normalized
 
 
+def runtime_framework_inputs(resolved: Any) -> dict[str, str]:
+    """Preserve the corpus default unless its declared runtime requires another.
+
+    A runtime-specific graph must be measured under its owning framework;
+    choosing by model name or silently switching to THEORY would test a
+    different execution contract. Ordinary corpus entries retain their input.
+    """
+    from backend.arch.eval.program import Program
+    framework = Program.of(resolved).required_runtime_framework
+    return {"framework": framework} if framework is not None else {}
+
+
 def measure_case(config: dict[str, Any], deployment: dict[str, Any],
                  resolved: Any = None) -> dict[str, Any]:
     from backend.inference.capacity import estimate_pending
     from backend.inference.parallel_config import ParallelConfig
     from backend.inference.sol_closure import check_closure
+
+    if resolved is None:
+        from backend.arch.loader import get_default_loader
+        resolved = get_default_loader().match(config)
+    runtime_inputs = runtime_framework_inputs(resolved) if resolved is not None else {}
 
     # The walk, not the published estimate: a deployment that cannot hold
     # the weights publishes no step (`capacity.without_step`), and half the
@@ -260,6 +277,7 @@ def measure_case(config: dict[str, Any], deployment: dict[str, Any],
         num_gpus=deployment["num_gpus"],
         parallel=ParallelConfig(**deployment["parallel"]),
         **FIXED_INPUTS,
+        **runtime_inputs,
     ).finish()
     check_closure(result)
 

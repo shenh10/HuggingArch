@@ -1,0 +1,144 @@
+{
+  "scope": "target-only serving; excludes profile runs; TPOT includes scheduler/streaming overhead, not an isolated GPU kernel",
+  "runs": [
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in16384-out512-c1-r1.jsonl",
+      "input": 16384,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 1,
+      "completed": 8,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 774.5216570328921,
+      "mean_tpot_ms": 10.081230901289228,
+      "mean_itl_ms": 10.081055112786359,
+      "output_throughput": 86.35287668443172,
+      "approx_mean_decode_context": 16640,
+      "errors": 0
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in16384-out512-c1-r2.jsonl",
+      "input": 16384,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 2,
+      "completed": 8,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 770.9579562069848,
+      "mean_tpot_ms": 10.080966995500479,
+      "mean_itl_ms": 10.080758464675753,
+      "output_throughput": 86.40975308317876,
+      "approx_mean_decode_context": 16640,
+      "errors": 0
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in16384-out512-c1-r3.jsonl",
+      "input": 16384,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 3,
+      "completed": 8,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 772.8835705202073,
+      "mean_tpot_ms": 10.080866170946852,
+      "mean_itl_ms": 10.08043982956099,
+      "output_throughput": 86.38774173947544,
+      "approx_mean_decode_context": 16640,
+      "errors": 0
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in2048-out512-c1-r1.jsonl",
+      "input": 2048,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 1,
+      "completed": 12,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 153.38388450133303,
+      "mean_tpot_ms": 9.943661011909777,
+      "mean_itl_ms": 9.943575399034138,
+      "output_throughput": 97.77483089827155,
+      "approx_mean_decode_context": 2304,
+      "errors": 0
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in2048-out512-c1-r2.jsonl",
+      "input": 2048,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 2,
+      "completed": 12,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 155.31479458635053,
+      "mean_tpot_ms": 9.946411287664775,
+      "mean_itl_ms": 9.94624037022805,
+      "output_throughput": 97.70640137853465,
+      "approx_mean_decode_context": 2304,
+      "errors": 0
+    },
+    {
+      "file": "/tmp/scratch-space/k3-performance/benchmark/dcp-validation/in2048-out512-c1-r3.jsonl",
+      "input": 2048,
+      "output": 512,
+      "concurrency": 1,
+      "repeat": 3,
+      "completed": 12,
+      "cached_tokens": 0,
+      "mean_ttft_ms": 154.3896347284317,
+      "mean_tpot_ms": 9.944477229119707,
+      "mean_itl_ms": 9.944261959495735,
+      "output_throughput": 97.74440677433005,
+      "approx_mean_decode_context": 2304,
+      "errors": 0
+    }
+  ],
+  "all_lengths_exact": true,
+  "total_requests": 60,
+  "post_warmup_compiler_samples": 0,
+  "by_input": {
+    "2048": {
+      "mean_ttft_ms": {
+        "mean": 154.36277127203843,
+        "min": 153.38388450133303,
+        "max": 155.31479458635053
+      },
+      "mean_tpot_ms": {
+        "mean": 9.944849842898087,
+        "min": 9.943661011909777,
+        "max": 9.946411287664775
+      },
+      "mean_itl_ms": {
+        "mean": 9.944692576252642,
+        "min": 9.943575399034138,
+        "max": 9.94624037022805
+      },
+      "output_throughput": {
+        "mean": 97.74187968371209,
+        "min": 97.70640137853465,
+        "max": 97.77483089827155
+      }
+    },
+    "16384": {
+      "mean_ttft_ms": {
+        "mean": 772.787727920028,
+        "min": 770.9579562069848,
+        "max": 774.5216570328921
+      },
+      "mean_tpot_ms": {
+        "mean": 10.081021355912187,
+        "min": 10.080866170946852,
+        "max": 10.081230901289228
+      },
+      "mean_itl_ms": {
+        "mean": 10.080751135674367,
+        "min": 10.08043982956099,
+        "max": 10.081055112786359
+      },
+      "output_throughput": {
+        "mean": 86.38345716902865,
+        "min": 86.35287668443172,
+        "max": 86.40975308317876
+      }
+    }
+  }
+}

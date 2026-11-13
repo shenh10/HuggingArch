@@ -5,13 +5,16 @@ a model brings, the external fact the measured placement is held to. A
 framework loads a checkpoint by module attribute name, so a node's leaf name
 is the attribute that framework's model assigns it (`self.o_proj =
 RowParallelLinear(...)`), and the assignment says whether a TP rank holds a
-slice or the whole tensor. Two sources can say it, and this module reads both
-the same way; they differ only in how an assigned class becomes a split:
+slice or the whole tensor. Three source kinds can say it; they differ in
+how an assigned class becomes a split:
 
   * **vLLM** — the deployment target the rest of the corpus is held to. Its
     layer classes live in vLLM, not in the files the admitter stages, so a
     class name is resolved through `VllmSplit.CLASSES`: the one place those
     classes' TP behaviour is written down for the corpus.
+  * **SGLang** — an explicitly SGLang-sourced snapshot stages its frozen
+    Python files without probing vLLM. `SglangSplit.CLASSES` describes its
+    audited TP layer classes; custom parallel groups remain unsettled.
   * **the model's own reference implementation** — what a publisher ships
     beside the checkpoint, and what the spec was written from (DeepSeek, Kimi
     and StepFun all ship one; `backend/hf/forward_source.py` is where
@@ -31,9 +34,10 @@ write.
 
 Which source answers when: `SOURCE_KINDS` lists the kinds in the order they
 answer, and is the one place they are defined. vLLM comes first, because it
-is the deployment target the corpus is held to; the publisher's own
-implementation comes after it. A node's answer is the first source in that
-order that settles it, and `decided_by` records which one did. That keeps
+is the default deployment target; explicitly staged SGLang is next, and the
+publisher's own implementation comes after it. Only staged sources participate:
+an explicitly SGLang-sourced snapshot does not stage vLLM at all. A node's answer
+is the first source in that order that settles it, and `decided_by` records which one did. That keeps
 vLLM's precedence where vLLM speaks: a node it does not settle has no vLLM
 answer at all, so asking the publisher's implementation — evidence about the
 same model — only adds evidence and overrides nothing. A node two sources
@@ -268,6 +272,39 @@ class VllmSplit(FrameworkSplit):
             return SPLIT if ("local" in args or "tp_size" in args) else REPLICATED
         if cls_name.startswith(self._EXPERT_BANKS):
             return SPLIT
+        return self.CLASSES.get(cls_name)
+
+
+class SglangSplit(FrameworkSplit):
+    """SGLang's explicitly named TP layers (default parallel group only).
+
+    Audited at 1b2870d33de7b5f31844fd74e97eea6d7896c53a:
+    python/sglang/srt/layers/linear.py, vocab_parallel_embedding.py,
+    layernorm.py. Unknown factories and custom groups remain unsettled;
+    a class name alone cannot determine their rank-local ownership.
+    """
+
+    kind = "sglang"
+    CLASSES: ClassVar[Dict[str, str]] = {
+        "ColumnParallelLinear": SPLIT, "RowParallelLinear": SPLIT,
+        "MergedColumnParallelLinear": SPLIT, "QKVParallelLinear": SPLIT,
+        "VocabParallelEmbedding": SPLIT, "ParallelLMHead": SPLIT,
+        "ReplicatedLinear": REPLICATED, "RMSNorm": REPLICATED,
+        "LayerNorm": REPLICATED,
+    }
+
+    @property
+    def provenance(self) -> str:
+        return f"SGLang {self.revision}"
+
+    def unsettled(self, classes: Sequence[str]) -> str:
+        return "whose SGLang TP split is not declared for the default group"
+
+    def placement(self, cls_name: str, call: ast.Call,
+                  owner: Optional[ast.ClassDef]) -> Optional[str]:
+        if any(k.arg in ("parallel_group", "tp_size", "tp_rank")
+               for k in call.keywords):
+            return None
         return self.CLASSES.get(cls_name)
 
 
@@ -551,7 +588,8 @@ class ReferenceSplit(FrameworkSplit):
 #: This is the one place the kinds are defined — a staged manifest's `kind`,
 #: a written entry's `decided_by`, and the staging in `tools/corpus_admit.py`
 #: all name them from here.
-SOURCE_KINDS: Dict[str, type] = {kind.kind: kind for kind in (VllmSplit, ReferenceSplit)}
+SOURCE_KINDS: Dict[str, type] = {
+    kind.kind: kind for kind in (VllmSplit, SglangSplit, ReferenceSplit)}
 
 
 class Oracle:

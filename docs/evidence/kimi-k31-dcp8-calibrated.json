@@ -1,0 +1,126 @@
+{
+  "scope": "Theoretical target-only absorbed MLA, TP8/DCP8; not measured DFLASH serving.",
+  "dcp_selected_load_factor": 1,
+  "dcp_failed_owners": 0,
+  "calibration_rows": "docs/evidence/kimi-k31-b300-calibration/calibration_rows.json",
+  "selection_mode": "envelope",
+  "model_id": "moonshotai/Kimi-K3.1-Pro",
+  "gpu": "B300",
+  "parallel": {
+    "pp": 1,
+    "tp_attention": 8,
+    "tp_dense_ffn": 8,
+    "tp_moe_expert": 4,
+    "ep_moe": 2,
+    "cp": 1,
+    "dp_attention": 1,
+    "dp_replicas": 1,
+    "dcp": 8
+  },
+  "input_tokens": 16384,
+  "output_tokens": 512,
+  "batch": 1,
+  "memory": {
+    "total_bytes": 288836550656.0,
+    "usable_bytes": 245511068057.6,
+    "weight_bytes_total": 1577687077888.0,
+    "weight_bytes_per_gpu": 207584218112.0,
+    "host_offload_bytes_per_gpu": 0.0,
+    "host_offload": true,
+    "kv_budget_bytes": 37926849945.600006,
+    "weight_deficit_bytes": 0.0,
+    "static_scale_bytes": 0.0,
+    "fits": true,
+    "pp_stage": null,
+    "weight_bytes_per_gpu_heaviest_stage": 207584218112.0
+  },
+  "kv_cache": {
+    "num_layers": 93,
+    "per_token_bytes": 2364.0,
+    "constant_bytes": 56171520.0,
+    "per_request_kv_bytes": 96113664.0,
+    "attention_variant": "KDA + DSA"
+  },
+  "phases": {
+    "prefill": {
+      "phase": "prefill",
+      "batch": 1,
+      "seq_effective": 16384,
+      "kv_cache_length": 0,
+      "active_params_per_rank": 18379397376.0,
+      "flops_per_step": 641215693112576,
+      "mem_read_bytes": 1719031265536,
+      "mem_write_bytes": 661615476992,
+      "total_bytes": 2380646742528,
+      "arithmetic_intensity": 269.3451664448424,
+      "note": "Compute-bound: forward processes 16384 fresh tokens \u00d7 1 req.",
+      "t_compute_s": 0.2348377864279609,
+      "t_memory_s": 0.297580842816,
+      "t_comm_s": 0.05491864213333333,
+      "t_sol_s": 0.48227920913245864,
+      "t_measured_s": null,
+      "t_partial_s": 0.48227920913245864,
+      "partial_measured_share": 0.0,
+      "measured_rows": 466,
+      "total_rows": 1537,
+      "time_unpublished_reason": "",
+      "pipeline_time": null,
+      "note_detail": "."
+    },
+    "decode": {
+      "phase": "decode",
+      "batch": 1,
+      "seq_effective": 1,
+      "kv_cache_length": 16640.0,
+      "active_params_per_rank": 18973939968.0,
+      "flops_per_step": 40022363756,
+      "mem_read_bytes": 29415582004,
+      "mem_write_bytes": 124494032,
+      "total_bytes": 29540076036,
+      "arithmetic_intensity": 1.3548497203333332,
+      "note": "Memory-bound: 1 fresh tok/step \u00d7 1 req, attending to ~16640 cached tok/req [hybrid: GatedDeltaNet\u00d71@1 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d75@1 pos/query].",
+      "t_compute_s": 1.5125856915555556e-05,
+      "t_memory_s": 0.0036925095045,
+      "t_comm_s": 0.0006874813155555555,
+      "t_sol_s": 0.007095662499555556,
+      "t_measured_s": null,
+      "t_partial_s": 0.007701150627555556,
+      "partial_measured_share": 0.11059542154031916,
+      "measured_rows": 490,
+      "total_rows": 1553,
+      "time_unpublished_reason": "",
+      "pipeline_time": null,
+      "note_detail": ", attending to ~16640 cached tok/req [hybrid: GatedDeltaNet\u00d71@1 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + MLA\u00d73@16640 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d71@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d78@1 + GatedDeltaNet\u00d75@1 pos/query]."
+    }
+  },
+  "assumptions": [
+    {
+      "id": "moe_routing_balance",
+      "knob": "ep_load_factor",
+      "value": 1.0,
+      "effect": "optimistic",
+      "text": "Expert routing is assumed perfectly balanced: every one of the 2 expert-parallel ranks receives exactly the mean token load. Real routing is skewed, and under synchronous EP the layer's wall clock is the busiest rank's, so the MoE step times and the all-to-all here are a lower bound rather than an estimate. Set `ep_load_factor` to the max/mean expert load from a routing trace to price it (the busiest rank's load follows from it and the experts each rank holds); the model carries no default for it, because a number nobody measured would read like one somebody did."
+    },
+    {
+      "id": "sparse_dcp_selected_ownership",
+      "knob": "dcp_selected_load_factor",
+      "value": 1.0,
+      "effect": "optimistic",
+      "text": "Selected-position max/mean ratio is an explicit scenario, not a measured distribution. The busiest rank is capped by its striped resident context; padded top-k slots remain 2048."
+    },
+    {
+      "id": "sparse_dcp_candidate_fallback",
+      "knob": "dcp_failed_owners",
+      "value": 0,
+      "effect": "optimistic",
+      "text": "Failed candidate-certificate owners per query are assumed, not observed. Fallback prices the sender hotspot and a second dependent exchange stage; polling and transport framing are excluded."
+    },
+    {
+      "id": "sparse_dcp_runtime_profile",
+      "knob": null,
+      "value": "sglang_fi_a2a_push1536",
+      "effect": "scope",
+      "text": "TP8/DCP8, replicated Q, BF16 projected partials, prewarmed V projection, no LoRA, default 384-candidate merge and registered push capacity 1536 query rows. This is target-step timing, not DFLASH acceptance or server scheduling. Process-wide communication workspaces and CUDA graph pools are outside resident weight accounting."
+    }
+  ]
+}

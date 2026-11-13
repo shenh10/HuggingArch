@@ -223,8 +223,12 @@ def cache_write_endpoint(rule: Any, node: Any, arrived: EdgeState, shape: Any
             "has no sequence axis")
 
     extent = floored(shape.out[position])
+    # Striped cache owners hold ceil(tokens/world) physical slots. SGLang
+    # pads each owner's prefill gather then trims it back to logical rows;
+    # this storage boundary must not require an exactly divisible prompt.
+    cache_pad = 1 if rule.sparse_dcp.owns_cache_node(node) else None
     target_axis: AxisLayout = (
-        sharded(rule.cache_family)
+        sharded(rule.cache_family, pad_to=cache_pad)
         if rule.cache_family is not None else rule.replicated())
     physical_local_extent(target_axis, extent)
     got = arrived.layout[position]

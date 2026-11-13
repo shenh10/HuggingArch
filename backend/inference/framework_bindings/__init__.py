@@ -156,11 +156,14 @@ class ServingDeployment:
     width depend on itself.
     """
 
-    #: The fields `at` fills from a GPU row. They are `CardClass`'s two
-    #: halves by construction, and `_check_card_fact_classification` refuses
+    #: The fields `at` fills from a GPU row. They are `CardClass`'s hardware
+    #: facts by construction, and `_check_card_fact_classification` refuses
     #: drift between the two spellings.
+    # Runtime scheduler geometry changes a walk independently of fusion dispatch.
+    RUNTIME_CARD_FIELDS: ClassVar[FrozenSet[str]] = frozenset({"sm_count"})
+
     CARD_FIELDS: ClassVar[FrozenSet[str]] = frozenset({
-        "device", "compute_capability", "peak_families",
+        "device", "compute_capability", "peak_families", "sm_count",
     })
 
     server_flags: Tuple[Tuple[str, ServerOption], ...] = ()
@@ -182,6 +185,7 @@ class ServingDeployment:
     #: lists no MMA peak; both leave a capability-gated candidate unselected
     #: rather than guessed.
     peak_families: Tuple[str, ...] = ()
+    sm_count: Optional[int] = None
 
     @classmethod
     def of(cls, *, server_flags: Optional[Mapping[str, ServerOption]] = None,
@@ -190,7 +194,11 @@ class ServingDeployment:
            compute_capability: Optional[str] = None,
            kv_block_size: Optional[int] = None,
            tensor_parallel: Optional[int] = None,
-           peak_families: Tuple[str, ...] = ()) -> "ServingDeployment":
+           peak_families: Tuple[str, ...] = (),
+           sm_count: Optional[int] = None) -> "ServingDeployment":
+        if sm_count is not None and (isinstance(sm_count, bool) or
+                                      not isinstance(sm_count, int) or sm_count < 1):
+            raise ValueError("sm_count must be a positive integer or unknown")
         flags = []
         for name, value in (server_flags or {}).items():
             if isinstance(value, int) and not isinstance(value, bool):
@@ -203,7 +211,7 @@ class ServingDeployment:
                     f"integer, not {value!r}")
         return cls(tuple(sorted(flags)), activation_dtype, device,
                    compute_capability, kv_block_size, tensor_parallel,
-                   tuple(peak_families))
+                   tuple(peak_families), sm_count)
 
     @classmethod
     def at(cls, *, gpu_sku: Optional[str], activation_dtype: Optional[str],
@@ -215,6 +223,9 @@ class ServingDeployment:
         dtype, and the server options it set. A SKU or a dtype the tables do
         not know leaves that fact unknown."""
         gpu = get_gpu(gpu_sku) if gpu_sku else None
+        sm_count = gpu.sm_count if gpu is not None else None
+        if sm_count is not None and (sm_count < 1 or int(sm_count) != sm_count):
+            raise ValueError(f"{gpu.sku}: sm_count must be a positive integer")
         try:
             dtype = (None if activation_dtype is None
                      else canonical(activation_dtype))
@@ -227,7 +238,8 @@ class ServingDeployment:
                       kv_block_size=kv_block_size,
                       tensor_parallel=tensor_parallel,
                       peak_families=(peak_families(gpu)
-                                     if gpu is not None else ()))
+                                     if gpu is not None else ()),
+                      sm_count=int(sm_count) if sm_count is not None else None)
 
     def flag(self, name: str, default: ServerOption) -> ServerOption:
         return dict(self.server_flags).get(name, default)
@@ -366,6 +378,8 @@ class DispatchCondition:
       A non-boolean choice is stated the same way: vLLM's audited linear
       path is `linear_backend=auto`, while another request may say
       `flashinfer_cutedsl`.
+      A list of these mappings requires ALL named flags; a `when` list
+      remains OR alternatives.
     * `activation_dtype: [...]` — the deployment's activation dtype.
     * `kv_block_size: [<positive page>, ...]` — the paged-KV page the request
       deploys with. The binding's default is resolved once by the caller
@@ -406,6 +420,13 @@ class DispatchCondition:
     unquantized_bf16_launch: Optional[bool] = None
     graph: GraphCondition = field(default_factory=GraphCondition)
     server_flag_value: ServerOption = True
+    # Additional conjuncts of a list-valued `server_flag` declaration.
+    additional_server_flags: Tuple[Tuple[str, ServerOption, ServerOption], ...] = ()
+
+    def flag_conditions(self) -> Tuple[Tuple[str, ServerOption, ServerOption], ...]:
+        first = (() if self.server_flag is None else
+                 ((*self.server_flag, self.server_flag_value),))
+        return first + self.additional_server_flags
 
     KEYS = frozenset({"server_flag", "activation_dtype", "device",
                       "kv_block_size", "tensor_parallel",
@@ -451,9 +472,8 @@ class DispatchCondition:
         activation = (deployment.activation_dtype if launch is None
                       else launch.activation_dtype)
         return (self.holds_for_card(deployment)
-                and (self.server_flag is None
-                or deployment.flag(*self.server_flag)
-                    == self.server_flag_value)
+                and all(deployment.flag(name, default) == value
+                        for name, default, value in self.flag_conditions())
                 and _among(activation, self.activation_dtype)
                 and (self.unquantized_bf16_launch is None
                      or (launch is not None
@@ -490,6 +510,10 @@ class DispatchCondition:
                                   "default": self.server_flag[1]}
             if self.server_flag_value != self.server_flag[1]:
                 out["server_flag"]["value"] = self.server_flag_value
+        if self.additional_server_flags:
+            out["server_flag"] = [
+                {"name": name, "default": default, "value": value}
+                for name, default, value in self.flag_conditions()]
         for key, value in (("architectures", self.graph.architectures),
                            ("excluded_architectures",
                             self.graph.excluded_architectures),
@@ -539,6 +563,18 @@ class DispatchCondition:
                 f"{where}: `when` keys {unknown} are not in the vocabulary "
                 f"{sorted(allowed)}")
         flag = raw.get("server_flag")
+        additional_flags = ()
+        if isinstance(flag, list):
+            if len(flag) < 2 or not all(isinstance(item, dict) for item in flag):
+                raise ValueError(f"{where}: server_flag list needs two or more mappings")
+            parsed_flags = tuple(cls.parse({"server_flag": item}, where)
+                                 for item in flag)
+            conditions = tuple(c for parsed in parsed_flags
+                               for c in parsed.flag_conditions())
+            if len({name for name, _, _ in conditions}) != len(conditions):
+                raise ValueError(f"{where}: server_flag conjuncts must name distinct flags")
+            additional_flags = conditions[1:]
+            flag = flag[0]
         value = True
         if flag is not None:
             def option(item: Any) -> bool:
@@ -660,6 +696,7 @@ class DispatchCondition:
         below = bound("below_compute_capability")
         return cls(
             server_flag=flag,
+            additional_server_flags=additional_flags,
             activation_dtype=tuple(canonical(n).lower()
                                    for n in names("activation_dtype")),
             kv_block_size=integers("kv_block_size"),
@@ -753,8 +790,8 @@ _check_dispatch_vocabulary()
 
 
 def _card_walk_columns() -> FrozenSet[str]:
-    """The `gpu_specs.csv` columns that change a WALK — `CardClass`'s two
-    halves, each derived from the declaration it already has rather than
+    """The `gpu_specs.csv` columns that change a WALK — `CardClass`'s
+    facts, each derived from the declaration it already has rather than
     listed a second time:
 
     * the columns a framework's dispatch reads of a card. Those are
@@ -763,6 +800,9 @@ def _card_walk_columns() -> FrozenSet[str]:
       fills those off the sheet row of the same name (`device`,
       `compute_capability`). `peak_families` is the one that is not a
       column of its own — it IS the peak columns below;
+    * the source-selected runtime scheduler inputs declared in
+      `ServingDeployment.RUNTIME_CARD_FIELDS`, which change partition and
+      split-buffer laws independently of fusion predicates;
     * the peak columns the sheet lists (`gpu_specs.PEAK_COLUMNS`), because
       a leaf whose dtype has no column is walked weight-only and a
       deployment-chosen dtype without one is refused (`NoPeakForDtype`).
@@ -773,7 +813,7 @@ def _card_walk_columns() -> FrozenSet[str]:
     has no column to answer with.
     """
     columns = {f.name for f in fields(gpu_specs.GPUSpec)}
-    read = set(DispatchCondition.CARD_KEYS.values())
+    read = set(DispatchCondition.CARD_KEYS.values()) | ServingDeployment.RUNTIME_CARD_FIELDS
     unknown = sorted(read - columns - {"peak_families"})
     if unknown:
         raise ValueError(
@@ -815,14 +855,14 @@ def _check_card_fact_classification() -> None:
     walk = _card_walk_columns()
     card_fields = set(ServingDeployment.CARD_FIELDS)
     expected_card_fields = (
-        set(DispatchCondition.CARD_KEYS.values()) & columns) | {"peak_families"}
+        set(DispatchCondition.CARD_KEYS.values()) & columns) | {"peak_families"} | ServingDeployment.RUNTIME_CARD_FIELDS
     if card_fields != expected_card_fields:
         raise ValueError(
             "framework_bindings: ServingDeployment.CARD_FIELDS is "
-            f"{sorted(card_fields)}, but the card facts a dispatch can read "
+            f"{sorted(card_fields)}, but dispatch and runtime geometry read "
             f"are {sorted(expected_card_fields)}. A serving launch choice "
             "cannot grow a third card fact outside CardClass; add it to "
-            "CARD_KEYS and the sheet, or stop reading it")
+            "CARD_KEYS or RUNTIME_CARD_FIELDS and the sheet, or stop reading it")
     price = set(gpu_specs.PRICE_COLUMNS)
     descriptive = set(gpu_specs.DESCRIPTIVE_COLUMNS)
     stray = sorted((walk | price | descriptive) - columns)
@@ -880,6 +920,8 @@ class CardClass(NamedTuple):
     * what a framework's dispatch reads of the card (`card_dispatch_facts`:
       the device and the compute capability its `when:` keys test), because
       two cards it answers differently fuse the same graph differently;
+    * runtime scheduler hardware geometry (`RUNTIME_CARD_FIELDS`), which
+      changes partition and split-buffer laws even for the same kernel;
     * the peak columns the sheet lists (`gpu_specs.peak_families`) — a leaf
       whose dtype has no column is walked weight-only (activation at the
       edge dtype, no convert term), and a deployment-chosen dtype without a
@@ -897,28 +939,43 @@ class CardClass(NamedTuple):
     #: The peak families the card lists a column for
     #: (`gpu_specs.peak_families`).
     dtype_peaks: Tuple[str, ...]
+    # Source-selected scheduler geometry, separate from when predicates.
+    runtime: Tuple[Tuple[str, Any], ...] = ()
 
     def key(self) -> str:
         """The class as one key part: stable, printable, collision-free."""
         facts = "-".join(f"{name}={value or 'none'}"
-                         for name, value in self.dispatch)
+                         for name, value in (*self.dispatch, *self.runtime))
         return f"{facts}-peaks={'+'.join(self.dtype_peaks) or 'none'}"
 
 
 def card_class(gpu: Any) -> CardClass:
     """The walk class of a card (`CardClass`)."""
-    return CardClass(card_dispatch_facts(gpu), peak_families(gpu))
+    runtime = tuple((name, getattr(gpu, name))
+                    for name in sorted(ServingDeployment.RUNTIME_CARD_FIELDS))
+    return CardClass(card_dispatch_facts(gpu), peak_families(gpu), runtime)
 
 
 @dataclass(frozen=True)
 class SourceLocation:
     """One place in the framework's repository an anchor cites: a path from
-    the repository root and, when it names lines, the first and last."""
+    the repository root and, when it names lines, the first and last.
+
+    A full GitHub permalink may pin a newer source independently of the
+    binding's original audit. Bare repository paths use the binding audit.
+    """
     path: str
     first: Optional[int] = None
     last: Optional[int] = None
+    repo: Optional[str] = None
+    revision: Optional[str] = None
 
     def __str__(self) -> str:
+        if self.revision is not None:
+            url = f"https://github.com/{self.repo}/blob/{self.revision}/{self.path}"
+            return url if self.first is None else url + (
+                f"#L{self.first}" if self.last == self.first
+                else f"#L{self.first}-L{self.last}")
         if self.first is None:
             return self.path
         return self.path + (f":{self.first}" if self.last == self.first
@@ -931,7 +988,10 @@ class SourceAnchor:
     sentence for a reader, in which every place it cites is written as
     `<path from the repository root>[:<line>[-<line>]]`. The places are
     parsed out once at load (`parse`), so a link to the audited commit is
-    built from them (`AuditedAt.cite`) and never by guessing from the text."""
+    built from them (`AuditedAt.cite`) and never by guessing from the text.
+    A full GitHub URL with a 40-character commit explicitly overrides the
+    binding's default revision for that location only.
+    """
     text: str
     #: The sentence split at the places it cites, in order: plain text and
     #: `SourceLocation`s alternating.
@@ -941,8 +1001,10 @@ class SourceAnchor:
     #: source-file extension, optionally followed by `:<line>` or
     #: `:<first>-<last>`.
     _LOCATION = re.compile(
+        r"(?:https://github\.com/(?P<repo>[\w.-]+/[\w.-]+)/blob/"
+        r"(?P<revision>[0-9a-f]{40})/)?"
         r"(?P<path>[\w.-]+(?:/[\w.-]+)+\.(?:py|cu|cuh|cpp|cc|c|h|hpp))(?!\w)"
-        r"(?::(?P<first>\d+)(?:-(?P<last>\d+))?)?")
+        r"(?:(?::|#L)(?P<first>\d+)(?:-L?(?P<last>\d+))?)?")
     #: What reads as a citation but names no file: a bare `:<line>`, or a
     #: file name with no directory. The location is ambiguous without the
     #: path, so the loader refuses it rather than resolve it.
@@ -962,7 +1024,8 @@ class SourceAnchor:
                                  f"{m.group(0)!r}, whose last line is before "
                                  f"its first.")
             parts.append(SourceLocation(
-                m["path"], first, first if last is None else last))
+                m["path"], first, first if last is None else last,
+                m["repo"], m["revision"]))
             at = m.end()
         parts.append(text[at:])
         loose = [m.group(0) for p in parts if isinstance(p, str)
@@ -1104,7 +1167,8 @@ class AuditedAt:
 
     def url(self, location: SourceLocation) -> str:
         """The permalink to `location` at the audited commit."""
-        url = (f"https://github.com/{self.repo}/blob/{self.commit}/"
+        url = (f"https://github.com/{location.repo or self.repo}/blob/"
+               f"{location.revision or self.commit}/"
                f"{location.path}")
         if location.first is None:
             return url
@@ -1337,31 +1401,43 @@ class FrameworkBinding:
                 "`implementations_for(fused_op)`")
         return impls[0] if impls else None
 
-    def precision_launches_for(self) -> Tuple[PrecisionLaunch, ...]:
-        """The precision launches this deployed framework takes.
+    @staticmethod
+    def _precision_program_matches(when: DispatchCondition, program: Any,
+                                   analysis: Any) -> bool:
+        # Missing program facts never satisfy an architecture/phase gate.
+        return (not when.graph.asks_program()
+                or (program is not None
+                    and (not when.graph.phase or analysis is not None)
+                    and when.graph.admits_program(program, analysis)))
 
-        An entry with alternative `when:` conditions is selected when any one
-        holds, exactly as a fused-op implementation is. An unknown deployment
-        fact makes a condition false: no launch is guessed for a card the
-        caller did not name.
+    def precision_launches_for(self, program: Any = None, analysis: Any = None
+                              ) -> Tuple[PrecisionLaunch, ...]:
+        """Ordered launches admitted by this deployment AND this program.
+
+        `when` alternatives are OR; all flags inside one alternative are AND.
+        The graph half uses the same program matcher as edge dtype dispatch.
         """
         return tuple(launch for launch in self.precision_launches
                      if not launch.whens
                      or any(when.holds_for(self.deployment)
+                            and self._precision_program_matches(when, program, analysis)
                             for when in launch.whens))
 
-    def unavailable_precision_launches_for(self) -> Tuple[PrecisionLaunch, ...]:
-        """Launch candidates this deployment did not satisfy, in file order.
+    def unavailable_precision_launches_for(
+            self, program: Any = None, analysis: Any = None
+            ) -> Tuple[PrecisionLaunch, ...]:
+        """Program-applicable candidates missing deployment facts.
 
-        They remain audit facts, not selectable entries: `ResolvedPrecision`
-        records one as a selector gap when its scheme/request matches but a
-        required deployment fact (for example an explicit MoE backend) is
-        absent.
+        A launch for a different architecture is not an audit gap for this
+        program. Missing program facts cannot invent a candidate either.
         """
         return tuple(launch for launch in self.precision_launches
-                     if launch.whens and not any(
-                         when.holds_for(self.deployment)
-                         for when in launch.whens))
+                     if launch.whens
+                     and any(self._precision_program_matches(when, program, analysis)
+                             for when in launch.whens)
+                     and not any(when.holds_for(self.deployment)
+                                 and self._precision_program_matches(when, program, analysis)
+                                 for when in launch.whens))
 
     def dispatch_for(self, op: str, program: Any = None,
                      analysis: Any = None,
@@ -1409,18 +1485,11 @@ class FrameworkBinding:
     def server_flag_names(self) -> FrozenSet[str]:
         """The server flags this binding's conditions read
         (`DispatchCondition.server_flag`)."""
-        return frozenset(when.server_flag[0]
-                         for _op, impl in self.op_implementations
-                         for when in impl.whens
-                         if when.server_flag is not None) | frozenset(
-                             when.server_flag[0]
-                             for dispatch in self.kernel_dispatches
-                             for when in dispatch.whens
-                             if when.server_flag is not None) | frozenset(
-                                 when.server_flag[0]
-                                 for launch in self.precision_launches
-                                 for when in launch.whens
-                                 if when.server_flag is not None)
+        entries = (*[impl for _op, impl in self.op_implementations],
+                   *self.kernel_dispatches, *self.precision_launches,
+                   *self.edge_dtypes)
+        return frozenset(name for entry in entries for when in entry.whens
+                         for name, _default, _value in when.flag_conditions())
 
     def deployed(self, deployment: ServingDeployment) -> "FrameworkBinding":
         """This binding, answering its conditions against `deployment`. A
@@ -1526,11 +1595,11 @@ def _conditions_can_overlap(left: DispatchCondition,
     one key are disjoint only when the closed vocabulary lets us prove no
     value satisfies both.
     """
-    if left.server_flag is not None and right.server_flag is not None:
-        if left.server_flag[0] != right.server_flag[0]:
-            return True
-        if left.server_flag_value != right.server_flag_value:
-            return False
+    left_flags = {name: value for name, _, value in left.flag_conditions()}
+    right_flags = {name: value for name, _, value in right.flag_conditions()}
+    if any(left_flags[name] != right_flags[name]
+           for name in left_flags.keys() & right_flags.keys()):
+        return False
     for left_value, right_value in (
             (left.activation_dtype, right.activation_dtype),
             (left.kv_block_size, right.kv_block_size),
@@ -1835,6 +1904,12 @@ def _precision_launches(raw: Any, fname: str) -> Tuple[PrecisionLaunch, ...]:
         if not isinstance(anchor, str) or not anchor:
             raise ValueError(f"{where}: needs the `source_anchor` that shows "
                              "the framework selects this launch")
+        whens = _parse_whens(entry.get("when"), where)
+        allowed = _KERNEL_DISPATCH_WHEN - DispatchCondition.LAUNCH_KEYS
+        for when in whens:
+            if set(when.as_dict()) - allowed:
+                raise ValueError(f"{where}: precision launch conditions must be "
+                                 "card, deployment or whole-program facts")
         out.append(PrecisionLaunch(
             name=str(name),
             schemes=tuple(schemes),
@@ -1843,7 +1918,7 @@ def _precision_launches(raw: Any, fname: str) -> Tuple[PrecisionLaunch, ...]:
             compute_dtype=compute,
             mma_dtypes=families,
             promotion_ladder=promotion_ladder,
-            whens=_parse_whens(entry.get("when"), where),
+            whens=whens,
             source_anchor=SourceAnchor.parse(anchor, where),
         ))
     return tuple(out)

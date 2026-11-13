@@ -9,8 +9,8 @@ namespace: `E` is Euler's number there, `I` the imaginary unit, and `beta`,
 today, but nothing stopped one from being declared — Kimi-K3 already
 binds `situ_beta` (a `constant` symbol, dims.yaml).
 
-This module sits at the bottom of `arch` and imports nothing from the
-package, so both `eval.dim` (which builds these laws) and `arch.schema`
+This module sits at the bottom of `arch`; its only package dependency is
+the closed runtime-law registry (which has no architecture imports), so both `eval.dim` (which builds these laws) and `arch.schema`
 (which sits below `eval` and compares authored axis text) read through it
 rather than each writing the rule out. `tests/backend/arch/test_dim_symbols.py` asserts
 the rule; `tests/meta/test_structure_debt.py` asserts there is one reader.
@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, Mapping
 
 import sympy as sp
 from sympy.core.logic import fuzzy_and
+
+from .runtime_laws import RUNTIME_LAW_OPERATORS
 
 #: Any name in an authored expression.
 _NAME = re.compile(r"[A-Za-z_]\w*")
@@ -211,5 +213,6 @@ def read_walk_law(text: str, *,
         "Max": lambda *args: as_written(sp.Max, *args),
         "Min": lambda *args: as_written(sp.Min, *args),
         "Cases": Cases, "Quotient": Quotient,
+        **RUNTIME_LAW_OPERATORS,
         "Piecewise": sp.Piecewise,
         "Mod": sp.Mod, "Eq": sp.Eq, "Ne": sp.Ne}, symbol=symbol)

@@ -1,0 +1,128 @@
+{
+  "sglang_commit": "1b2870d33de7b5f31844fd74e97eea6d7896c53a",
+  "scope": "CPU source-method allocation/alias oracle; not GPU allocator or server memory measurement",
+  "tp": 8,
+  "dcp": 8,
+  "dsa_layers": 24,
+  "bytes_per_layer_per_rank": {
+    "checkpoint_qb_and_kvb": 10223616,
+    "with_local_absorbed_weights": 13369344,
+    "after_prepare_replicated_q_proj": 88080384,
+    "after_cuda_v_preprojection": 100663296,
+    "local_absorb_extra": 3145728,
+    "qrep_extra_over_local_absorbed": 74711040,
+    "cuda_v_preprojection_extra": 12582912
+  },
+  "bytes_all_24_layers_per_rank": {
+    "qrep_extra_over_same_tp8_without_qrep": 1793064960,
+    "qrep_and_cuda_v_preprojection_extra_over_local_absorbed": 2095054848,
+    "all_extras_over_checkpoint_graph": 2170552320
+  },
+  "selection_oracle": {
+    "context": 32768,
+    "topk": 2048,
+    "dcp": 8,
+    "tie_ordered_valid_slots_per_rank": [
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256,
+      256
+    ],
+    "rank0_preferred_valid_slots_per_rank": [
+      2048,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "local_candidates_merge_equals_global_topk": true
+  },
+  "communication_geometry_bytes_per_query_per_layer": {
+    "scope": "Logical buffers and declared push slots; excludes synchronization and transport overhead; not measured NVLink traffic",
+    "full_head_q": 110592,
+    "unprojected_partial_and_raw_lse": 98688,
+    "projected_partial_and_raw_lse": 24960,
+    "push_slots_all_heads": 26112,
+    "push_slots_remote_heads_per_sender": 22848
+  },
+  "q_b_original_shard_aliases_replica": true,
+  "cuda_v_preprojection_is_separate_from_w_vc_qrep": true,
+  "buffers_after_projection": {
+    "q_b_proj.weight": {
+      "shape": [
+        2304,
+        1536
+      ],
+      "logical_bytes": 7077888,
+      "storage_bytes": 56623104
+    },
+    "kv_b_proj.weight": {
+      "shape": [
+        3072,
+        512
+      ],
+      "logical_bytes": 3145728,
+      "storage_bytes": 3145728
+    },
+    "w_kc": {
+      "shape": [
+        12,
+        128,
+        512
+      ],
+      "logical_bytes": 1572864,
+      "storage_bytes": 1572864
+    },
+    "w_vc": {
+      "shape": [
+        12,
+        512,
+        128
+      ],
+      "logical_bytes": 1572864,
+      "storage_bytes": 1572864
+    },
+    "q_b_proj_qrep_weight": {
+      "shape": [
+        18432,
+        1536
+      ],
+      "logical_bytes": 56623104,
+      "storage_bytes": 56623104
+    },
+    "w_kc_qrep": {
+      "shape": [
+        96,
+        128,
+        512
+      ],
+      "logical_bytes": 12582912,
+      "storage_bytes": 12582912
+    },
+    "w_vc_qrep": {
+      "shape": [
+        96,
+        512,
+        128
+      ],
+      "logical_bytes": 12582912,
+      "storage_bytes": 12582912
+    },
+    "_dcp_v_weights": {
+      "shape": [
+        96,
+        512,
+        128
+      ],
+      "logical_bytes": 12582912,
+      "storage_bytes": 12582912
+    }
+  }
+}

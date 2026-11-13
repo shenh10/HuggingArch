@@ -1,0 +1,165 @@
+{
+  "fixed_protocol": "Three independent processes, independent seeds, ordinary time_callable defaults60samples; alternate fixed size order. No size or threshold selected by timings.",
+  "runtime": {
+    "torch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "device": "NVIDIA B300 SXM6 AC",
+    "l2_bytes": 132644864,
+    "gpu": 7
+  },
+  "threshold": 1.1,
+  "production_timing_changed": false,
+  "unknown_l2": "skip with explicit explanation; no guessed fallback",
+  "runs": [
+    {
+      "repeat": 1,
+      "utc": "2026-11-13T20:17:18.886173+00:00",
+      "device": "NVIDIA B300 SXM6 AC",
+      "l2_bytes": 132644864,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "physical_gpu": 7,
+      "seed": 2026111301,
+      "measurements": [
+        {
+          "bytes": 16777216,
+          "fraction_l2": 0.12648221343873517,
+          "hot": {
+            "p50_us": 14.336000196635723,
+            "p95_us": 14.879999682307243,
+            "mean_us": 14.383466728031635,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 15.231999335810542,
+            "p95_us": 18.367997370660305,
+            "mean_us": 15.607999633842459,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.0624999390963377
+        },
+        {
+          "bytes": 99483648,
+          "fraction_l2": 0.75,
+          "hot": {
+            "p50_us": 20.35200037062168,
+            "p95_us": 20.735999569296837,
+            "mean_us": 19.93813340862592,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 27.359998552128673,
+            "p95_us": 29.759998666122556,
+            "mean_us": 27.621866560851533,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.3443395270188334
+        }
+      ]
+    },
+    {
+      "repeat": 2,
+      "utc": "2026-11-13T20:17:29.334348+00:00",
+      "device": "NVIDIA B300 SXM6 AC",
+      "l2_bytes": 132644864,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "physical_gpu": 7,
+      "seed": 2026111302,
+      "measurements": [
+        {
+          "bytes": 99483648,
+          "fraction_l2": 0.75,
+          "hot": {
+            "p50_us": 20.54399996995926,
+            "p95_us": 22.752000018954277,
+            "mean_us": 20.99733327825864,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 28.83200254291296,
+            "p95_us": 29.823998920619488,
+            "mean_us": 28.17706645000726,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.4034269171083014
+        },
+        {
+          "bytes": 16777216,
+          "fraction_l2": 0.12648221343873517,
+          "hot": {
+            "p50_us": 14.368000440299511,
+            "p95_us": 14.62399959564209,
+            "mean_us": 14.350933364282051,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 14.975997619330883,
+            "p95_us": 17.247999785467982,
+            "mean_us": 15.30719930306077,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.0423160607182371
+        }
+      ]
+    },
+    {
+      "repeat": 3,
+      "utc": "2026-11-13T20:17:43.466430+00:00",
+      "device": "NVIDIA B300 SXM6 AC",
+      "l2_bytes": 132644864,
+      "torch": "2.11.0+cu130",
+      "cuda": "13.0",
+      "physical_gpu": 7,
+      "seed": 2026111303,
+      "measurements": [
+        {
+          "bytes": 16777216,
+          "fraction_l2": 0.12648221343873517,
+          "hot": {
+            "p50_us": 14.368000440299511,
+            "p95_us": 14.62399959564209,
+            "mean_us": 14.345066683987776,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 16.224001767113805,
+            "p95_us": 17.47200172394514,
+            "mean_us": 15.762133065921565,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.129176034934448
+        },
+        {
+          "bytes": 99483648,
+          "fraction_l2": 0.75,
+          "hot": {
+            "p50_us": 20.38400061428547,
+            "p95_us": 20.67199908196926,
+            "mean_us": 19.968000054359436,
+            "samples": 60,
+            "timing_method": "warm_l2"
+          },
+          "cold": {
+            "p50_us": 27.551996521651745,
+            "p95_us": 29.887997778132558,
+            "mean_us": 27.751466379656147,
+            "samples": 60,
+            "timing_method": "l2_drain"
+          },
+          "ratio": 1.3516481402744276
+        }
+      ]
+    }
+  ]
+}

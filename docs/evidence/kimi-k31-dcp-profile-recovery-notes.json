@@ -1,0 +1,7 @@
+{
+  "formal_results_preserved": "results.json: six runs, 60 requests, 30720 generated tokens; no profiling in these samples",
+  "failure": "torch._disable_profiler RuntimeError basic_string construction from null while stopping second staged profiler",
+  "successful_partial_trace": "profiles/1794594690.1182737/*EXTEND.trace.json.gz (8 ranks, 2K prefill only)",
+  "recovery": "Restart identical target-only server after GPU cleanup; one continuous profiler lifetime across warmed 2K and16K short requests, with_stack=False. No changes to server numeric path.",
+  "not_used": "profile-continuous.sh alternatives retained but prefer profile_once.py to avoid any repeated profiler lifetime in the same server"
+}
