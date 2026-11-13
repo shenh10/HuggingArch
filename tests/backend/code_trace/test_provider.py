@@ -330,14 +330,15 @@ def test_a_growing_entry_carries_what_its_earlier_readers_ran(traced):
 
 def test_a_method_of_a_class_with_a_foreign_base_is_import_time(traced):
     # Rule 3: third-party machinery may memoise calls into such a method,
-    # so it is named by the import-time item, never per recording.
-    # A standard-library base (an exception) memoises no such calls: its
-    # methods stay per recording.
+    # so it is named by every trace, now by its own item where the one
+    # import-time aggregate used to cover it (that aggregate moved on any
+    # addition anywhere). A standard-library base (an exception) memoises
+    # no such calls: its methods stay per recording.
     _tmp, out = traced
     assert out["foreign_in_global"] == ["tpkg/b.py::Quotient.reason"]
-    assert "tpkg/b.py::Quotient.reason" not in out["foreign_in_trace"]
+    assert "tpkg/b.py::Quotient.reason" in out["foreign_in_trace"]
     assert "tpkg/b.py::Refused.why" in out["foreign_in_trace"]
-    assert "<import-time>" in out["foreign_in_trace"]
+    assert "<import-time>" not in out["foreign_in_trace"]
 
 
 def test_another_threads_untraced_window_hides_nothing_this_thread_runs(traced):
@@ -396,11 +397,35 @@ def test_a_module_imported_after_the_traced_trees_is_refused(traced):
     (("tpkg/a.py", "return 0", "return 5"), True),
     # A comment or docstring is no semantic edit.
     (("tpkg/a.py", "def other(x):\n", "def other(x):  # doubled\n"), True),
-    # A new def binds a new name at import: the import-time trace moves.
+    # A new def binds a new name at import, but an old trace names no
+    # such item: it stays valid. (The one import-time aggregate this
+    # replaced moved on the addition and took every record with it.)
     (("tpkg/a.py", "def plain():", "def extra():\n    return 1\n\n\ndef plain():"),
+     True),
+    # A decorated def may write into a registry old code reads: the
+    # module's decorator aggregate moves.
+    (("tpkg/a.py", "def plain():",
+      "@memoize(maxsize=None)\ndef extra():\n    return 1\n\n\ndef plain():"),
+     False),
+    # A new top-level binding runs at import but under a name no old
+    # code reads: a new item, not a move.
+    (("tpkg/a.py", "def helper(x):", "TABLE2 = Memo(maxsize=4)\n\n\ndef helper(x):"),
+     True),
+    # One more import alias is a new item; the old aliases do not move.
+    (("tpkg/a.py", "from backend.code_trace.memo import",
+      "from contextlib import suppress\n\nfrom backend.code_trace.memo import"),
+     True),
+    # A top-level statement that binds no name runs at import all the
+    # same: the module's statement aggregate moves.
+    (("tpkg/a.py", "def helper(x):", "TABLE.warm = True\n\n\ndef helper(x):"),
      False),
     # So does an edit to a method of a class with a foreign base (rule 3).
     (("tpkg/b.py", 'return "no"', 'return "yes"'), False),
+    # An undecorated method is an item of its own: adding one is an
+    # addition, not a move.
+    (("tpkg/a.py", "class C:",
+      "class C:\n    def added(self):\n        return 9\n"),
+     True),
 ])
 def test_a_trace_is_stale_exactly_when_code_it_names_moved(traced, tmp_path,
                                                              edit, valid):

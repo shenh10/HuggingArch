@@ -1,6 +1,7 @@
 """What a verifying trace names code by (`backend.code_trace.source.
-FileIdentity`): each outermost def by its normalized source, and the rest of
-the file as one skeleton."""
+FileIdentity`): each outermost def by its normalized source, and the
+module's import-time state per top-level binding, with the whole-file
+skeleton kept as one legacy item."""
 from __future__ import annotations
 
 import sys
@@ -40,9 +41,12 @@ def _items(src: str) -> dict:
     return FileIdentity("m.py", src).items()
 
 
-def test_each_outermost_def_and_the_skeleton_is_one_item():
-    assert set(_items(SRC)) == {"m.py::helper", "m.py::K.make",
-                                "m.py::K.other", "m.py::<module>"}
+def test_each_def_and_binding_and_the_legacy_skeleton_is_one_item():
+    assert set(_items(SRC)) == {
+        "m.py::helper", "m.py::K.make", "m.py::K.other",
+        "m.py::<binding>:os", "m.py::<binding>:LIMIT", "m.py::<binding>:K",
+        "m.py::<binding>:<decorators>", "m.py::<binding>:<flow>",
+        "m.py::<binding>:<stmt>", "m.py::<module>"}
 
 
 def test_code_inside_a_def_belongs_to_it_and_code_outside_to_the_skeleton():
@@ -55,7 +59,9 @@ def test_code_inside_a_def_belongs_to_it_and_code_outside_to_the_skeleton():
     assert ident.item_of(lam)[0] == "m.py::K.other"
     # A decorated def's code starts at its first decorator.
     assert ident.item_of(decorated)[0] == "m.py::K.make"
-    assert ident.item_of(4)[0] == "m.py::<module>"
+    # Module-level code outside every def names the binding statement it
+    # is, not the whole file.
+    assert ident.item_of(4)[0] == "m.py::<binding>:LIMIT"
 
 
 def _moved(edited: str) -> set:
@@ -75,9 +81,11 @@ def test_comments_docstrings_and_blank_lines_move_nothing():
     assert _moved(edited) == set()
 
 
-def test_a_class_annotation_or_a_new_def_moves_the_skeleton():
+def test_a_class_body_edit_moves_its_binding_and_a_new_def_nothing():
+    # The class is one binding item with its methods excised; a field edit
+    # moves it. A new def is a new item: the legacy skeleton alone moves.
     assert _moved(SRC.replace("field: int = 1", "field: str = 1")) == {
-        "m.py::<module>"}
+        "m.py::<binding>:K", "m.py::<module>"}
     assert _moved(SRC + "\n\ndef extra():\n    return 0\n") == {
         "m.py::<module>", "m.py::extra"}
 

@@ -161,13 +161,19 @@ class FileIdentity:
     Each outermost def — a function or method not nested in another def —
     is an item: its qualname, and the hash of its dedented source through
     `normalized_py_source` (decorators, signature and body; the defs,
-    lambdas and comprehensions inside it are part of it). The rest of the
-    file is one more item, its skeleton: the file with each such def
-    reduced to its decorators and `def <name>(): ...`. The skeleton is what
-    runs when the module is imported — constants, registries, imports,
-    class bodies with their annotations — and which names its defs bind and
-    what decorates them, so adding, removing or rebinding a def moves it
-    while editing a body moves only that def's item."""
+    lambdas and comprehensions inside it are part of it). What the
+    module's import leaves behind is named per top-level binding
+    (`<binding>:NAME`), with three aggregates — `<decorators>`, `<flow>`,
+    `<stmt>` — for what runs at import without binding a name a statement
+    span can name. Adding a def, an import alias or a class is then a new
+    item: a corpus recorded before the addition stays valid, where the
+    one whole-file skeleton it replaces moved on any addition and took
+    every record with it. Editing what an existing binding binds, or
+    removing a def a trace names, still moves what that trace names; so
+    does adding a decorated def, whose decorator may write into a
+    registry old code reads. The whole-file skeleton remains one legacy
+    item, for traces recorded before this and as the fallback for code no
+    statement span names."""
 
     def __init__(self, rel: str, src: str) -> None:
         import ast
@@ -176,6 +182,9 @@ class FileIdentity:
         self.rel = rel
         self._starts: list = []
         self._defs: list = []
+        self._bindings: dict = {}
+        self._top: list = []       # (start, end, item) of top-level stmts
+        self._imports: list = []   # (level, module, alias names)
         try:
             tree = ast.parse(src)
         except SyntaxError:
@@ -195,7 +204,7 @@ class FileIdentity:
                 else:
                     for name in ("body", "orelse", "finalbody"):
                         visit(getattr(node, name, None) or [], prefix)
-                    for part in (getattr(node, "handlers", None) or [])\
+                    for part in (getattr(node, "handlers", None) or []) \
                             + (getattr(node, "cases", None) or []):
                         visit(part.body, prefix)
 
@@ -211,6 +220,7 @@ class FileIdentity:
                 if text is not None))
             self._starts.append(start)
             self._defs.append((node.end_lineno, qual, digest(snippet)))
+        self._binding_items(tree, lines, semantic)
         skeleton = list(semantic)
         for _start, node, _qual in reversed(found):
             header = lines[node.lineno - 1]
@@ -220,29 +230,140 @@ class FileIdentity:
         self.skeleton = digest("\n".join(
             text for text in skeleton if text is not None))
 
+    def _binding_items(self, tree, lines: list, semantic: list) -> None:
+        """Name what the module's import leaves behind, one item per
+        binding.
+
+        A binding's hash is the semantic source of every top-level
+        statement that binds the name, in order (a rebinding joins the
+        first). A class's methods are excised from its item — they are
+        defs, items of their own — while its decorators stay out of it and
+        in the `<decorators>` aggregate with every other decorator at
+        import scope: a decorator may write into module state a
+        computation reads without running the def it decorates. Imports
+        name each alias by where it is imported from, so one more alias on
+        a line is a new item and a different module for an old one moves
+        it. `if`/`try`/`for` and expression statements bind nothing a span
+        can name; each kind shares one aggregate item, moved by any change
+        or addition among them."""
+        import ast
+
+        statements: dict = {}
+        aggregates: dict = {"<decorators>": [], "<flow>": [], "<stmt>": []}
+
+        def text_of(node) -> str:
+            return "\n".join(
+                text for text in semantic[node.lineno - 1:node.end_lineno]
+                if text is not None)
+
+        def names_of(target) -> list:
+            return [n.id for n in ast.walk(target)
+                    if isinstance(n, ast.Name)]
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # its def item is the binding; an addition is new
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                level = getattr(node, "level", 0) or 0
+                module = getattr(node, "module", None)
+                self._imports.append((level, module,
+                                      [a.name for a in node.names]))
+                for alias in node.names:
+                    name = alias.asname or alias.name.split(".")[0]
+                    origin = ("." * level
+                              + (module + "." if module else "") + alias.name)
+                    item = f"{self.rel}::<binding>:{name}"
+                    self._bindings[item] = digest("import " + origin)
+                    self._top.append((node.lineno, node.end_lineno, item))
+                continue
+            if isinstance(node, ast.ClassDef):
+                body = [text_of(child) for child in node.body
+                        if not isinstance(child, (ast.FunctionDef,
+                                                  ast.AsyncFunctionDef))]
+                header = lines[node.lineno - 1]
+                indent = header[:len(header) - len(header.lstrip())]
+                item = f"{self.rel}::<binding>:{node.name}"
+                self._bindings[item] = digest("\n".join(
+                    [indent + "class " + node.name + ":", *body]))
+                self._top.append((node.lineno, node.end_lineno, item))
+                continue
+            names: list = []
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    names += names_of(target)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                names += names_of(node.target)
+            elif isinstance(node, ast.Delete):
+                for target in node.targets:
+                    names += names_of(target)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                names += names_of(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item_ in node.items:
+                    if item_.optional_vars is not None:
+                        names += names_of(item_.optional_vars)
+            elif isinstance(node, ast.Expr):
+                aggregates["<stmt>"].append(text_of(node))
+            else:
+                aggregates["<flow>"].append(text_of(node))
+            if names:
+                for name in sorted(set(names)):
+                    statements.setdefault(name, []).append(text_of(node))
+                first = sorted(set(names))[0]
+                self._top.append((node.lineno, node.end_lineno,
+                                  f"{self.rel}::<binding>:{first}"))
+
+        for name, parts in statements.items():
+            self._bindings[f"{self.rel}::<binding>:{name}"] = digest(
+                "\n".join(parts))
+
+        def decorated(scope, into: list) -> None:
+            for child in scope.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                      ast.ClassDef)):
+                    into.extend(text_of(d) for d in child.decorator_list)
+                if isinstance(child, ast.ClassDef):
+                    decorated(child, into)
+        decorated(tree, aggregates["<decorators>"])
+        for name, parts in aggregates.items():
+            self._bindings[f"{self.rel}::<binding>:{name}"] = digest(
+                "\n".join(parts))
+
     def to_json(self) -> Dict[str, Any]:
         """What this identity is, apart from where the file lives."""
-        return {"starts": self._starts, "defs": self._defs,
-                "skeleton": self.skeleton}
+        return {"v": 2, "starts": self._starts, "defs": self._defs,
+                "skeleton": self.skeleton, "bindings": self._bindings,
+                "top": self._top, "imports": self._imports}
 
     @classmethod
     def from_json(cls, rel: str, data: Dict[str, Any]) -> "FileIdentity":
+        if data.get("v") != 2:
+            # A cache of the one-skeleton format: the binding items it
+            # lacks are not optional, so it is a miss, not an identity.
+            raise ValueError("a file identity of an unknown format")
         identity = cls.__new__(cls)
         identity.rel = rel
         identity._starts = list(data["starts"])
         identity._defs = [tuple(d) for d in data["defs"]]
         identity.skeleton = data["skeleton"]
+        identity._bindings = dict(data["bindings"])
+        identity._top = [tuple(t) for t in data["top"]]
+        identity._imports = [tuple(i) for i in data["imports"]]
         return identity
 
     def item_of(self, line: int) -> Tuple[str, str]:
         """The item of code that starts at `line`: its outermost def's, or
-        the skeleton's for code outside every def (a module-level lambda, a
-        class body)."""
+        the top-level binding statement's for code outside every def (a
+        module-level lambda, a class body); the whole-file skeleton is the
+        fallback."""
         i = bisect.bisect_right(self._starts, line) - 1
         if i >= 0:
             end, qual, h = self._defs[i]
             if line <= end:
                 return f"{self.rel}::{qual}", h
+        for start, end, item in self._top:
+            if start <= line <= end and item in self._bindings:
+                return item, self._bindings[item]
         return self.module_item()
 
     def module_item(self) -> Tuple[str, str]:
@@ -253,6 +374,7 @@ class FileIdentity:
         out = self.__dict__.get("_items")
         if out is None:
             out = {f"{self.rel}::{qual}": h for _end, qual, h in self._defs}
+            out.update(self._bindings)
             out.update((self.module_item(),))
             self.__dict__["_items"] = out
         return out
