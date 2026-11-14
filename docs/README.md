@@ -25,8 +25,7 @@ overview; every other document goes deeper into one subsystem.
 
 | Document | Covers |
 |---|---|
-| [`kimi-k31-sglang.md`](kimi-k31-sglang.md) | Kimi-K3.1's SGLang graph, measured B300 cache layout, reproducible estimates, and DCP serving limitations. |
-| [`kimi-k31-b300-benchmark.md`](kimi-k31-b300-benchmark.md) | Colocated B300 measurements: EP1/EP2 and prefill CUDA graph comparisons. |
+| [`kimi-k31-sglang.md`](kimi-k31-sglang.md) | Kimi-K3.1 SGLang estimates, parallel settings, and cache layout. |
 | [`attention_families.md`](attention_families.md) | The attention variants (MHA/GQA, MLA, SWA, DSA, CSA/HCA, linear/SSM) and the three cost axes that distinguish them: compute, KV storage law, KV read cardinality. |
 | [`kv_cache_storage.md`](kv_cache_storage.md) | How KV-cache storage is modelled per cached node (windowed / per-token / constant state) and how claims cross-check it at every component call. |
 | [`moe_expert_axis.md`](moe_expert_axis.md) | How a MoE module is modelled: the experts are the outermost axis of every tensor of a bank, where each consumer reads the expert count, the mean rows per expert and the routing spread, and the activation peak. |
