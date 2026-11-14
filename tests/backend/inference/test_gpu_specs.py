@@ -280,9 +280,10 @@ class TestEveryColumnIsClassified(unittest.TestCase):
         # "descriptive-only" is a claim that nothing reads it.
         self.assertEqual(descriptive & (walk | price), set())
         # The walk half is derived, not listed: the dispatch's own card
-        # keys and the peak columns the sheet's naming law gives.
+        # keys, declared runtime geometry, and the peak columns.
         self.assertEqual(walk, (set(fb.DispatchCondition.CARD_KEYS.values())
-                                & columns) | set(gs.PEAK_COLUMNS.values()))
+                                & columns) | set(gs.PEAK_COLUMNS.values())
+                         | fb.ServingDeployment.RUNTIME_CARD_FIELDS)
 
     def test_a_new_column_fails_at_load(self):
         """Mutation proof: a field added to `GPUSpec` and classified
@@ -344,7 +345,7 @@ class TestEveryColumnIsClassified(unittest.TestCase):
         from backend.inference import framework_bindings as fb
 
         self.assertEqual(fb.ServingDeployment.CARD_FIELDS, {
-            "device", "compute_capability", "peak_families",
+            "device", "compute_capability", "peak_families", "sm_count",
         })
         with unittest.mock.patch.object(
                 fb.DispatchCondition, "CARD_KEYS",

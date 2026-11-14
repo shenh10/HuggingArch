@@ -48,14 +48,15 @@ class Rate(NamedTuple):
     is the first times the tensor's bytes per position — a compressed pool
     adds a row every `m` tokens, a window adds nothing once full — and the
     second is the per-request constant. `storage_bytes_at` at any length
-    past the windows is their sum, so the two cannot disagree."""
+    past the windows follows this asymptotic slope; integer position
+    padding is retained by `storage_bytes_at`, not flattened into the slope."""
 
     per_token: Any
     fixed: int
 
     @staticmethod
     def of(tensor: Any) -> "Rate":
-        law = algebra(tensor.stored)
+        law = algebra(tensor.storage_law)
         if CACHE_LEN not in law.free_symbols:
             return Rate(sp.Integer(0), int(value_of(law)))
         if not law_grows(law):
@@ -222,7 +223,7 @@ class CacheView:
         the law, the leaf identity, the position owners, the bytes of a
         stored position (data and dynamic scales) and the format they are
         in. Never a display label, never a figure at some length."""
-        return (sp.srepr(algebra(t.stored)), str(expr_of(t.elements)),
+        return (sp.srepr(algebra(t.storage_law)), str(expr_of(t.elements)),
                 t.positions_over, value_of(t.position_bytes),
                 t.resolved_format, t.recurrent)
 
@@ -360,7 +361,8 @@ class CacheView:
         compressed pool adds a row every `m` tokens, so `1/m` of a row)
         versus the positions held whatever the length (a full window, a
         recurrent state), billed once per request. Past every window,
-        `growth × L + floor` is `storage_bytes_at(L)`. Decided per TENSOR:
+        `growth × L + floor` is the asymptotic storage law; integer owner
+        padding remains in `storage_bytes_at(L)`. Decided per TENSOR:
         the law and the format are the tensor's, and a class label has no
         say."""
         growth = 0.0
@@ -623,7 +625,7 @@ class CacheView:
                     * count / tensor.positions_over)
                 rows.append({
                     "node": tensor.name,
-                    "expr": str(tensor.stored),
+                    "expr": str(tensor.storage_law),
                     "positions": positions,
                     "per_token_per_rank": per_token,
                     "bytes": per_token * positions,
@@ -664,7 +666,7 @@ class CacheView:
         × bpe × law`, with `+ scales` when the format stores dynamic scales
         beside each position. Values are the walk's: leaf sizes, the
         format's widths, the law's positions."""
-        law = tensors[0].stored
+        law = tensors[0].storage_law
         owners = tensors[0].positions_over
         positions = int(value_of(substitute(law, CACHE_LEN, length)))
         widths = {t.element_bytes for t in tensors}
@@ -743,7 +745,7 @@ class CacheView:
             by_law: Dict[tuple, List[Any]] = {}
             for t in entry.tensors:
                 by_law.setdefault(
-                    (sp.srepr(algebra(t.stored)), t.positions_over), []).append(t)
+                    (sp.srepr(algebra(t.storage_law)), t.positions_over), []).append(t)
             groups = [{
                 "symbol": f"kv_{key}_{'_'.join(t.name for t in ts)}",
                 "label": f"{tag}.{', '.join(t.name for t in ts)}",
@@ -828,10 +830,10 @@ def cache_view_from_analysis(
         count = int(value_of(copies))
         entries.append(CacheClass(entry, count, program.block_of(uid), stack))
         for tensor in entry.tensors:
-            if cache_mod.CACHE_LEN in algebra(tensor.stored).free_symbols:
+            if cache_mod.CACHE_LEN in algebra(tensor.storage_law).free_symbols:
                 weight = float(tensor.elements) * count
                 if weight > dominant[0]:
-                    dominant = (weight, str(tensor.read), str(tensor.stored))
+                    dominant = (weight, str(tensor.read), str(tensor.storage_law))
     return CacheView(
         entries=tuple(entries),
         tp_shards_cache=(

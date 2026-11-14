@@ -31,6 +31,113 @@ audited_at:
   tag: v0.5.22
   commit: baa9befa381511cd4d56f83980951e5a45fffc6d
 
+# The Kimi pack-quantized path is a serving launch, not a checkpoint
+# activation declaration. These additions were audited at the per-citation
+# main commit below; the older binding's other audits are unchanged.
+# SM100/103/107 are the explicit families in the model override. Each
+# capability interval names exactly one integer CUDA minor version.
+precision_launches:
+  kimi_mxfp4_default:
+    schemes: [mxfp4-pack-quantized]
+    when:
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+    launch:
+      activation: fp8_token_group32_ue8m0
+      compute_dtype: F8_E4M3
+      mma_dtypes: [F8_E4M3, MXFP4]
+    source_anchor: "The Kimi SM100/103/107 auto override selects flashinfer_mxfp4 (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/arg_groups/model_overrides/kimi_k3.py#L244-L262). The default and bf16 branches are explicit (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py#L1567-L1595); the MXFP8 preparation uses per-token group 32 UE8M0 (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/layers/quantization/mxfp4.py#L79-L119)."
+  kimi_mxfp4_bf16:
+    schemes: [mxfp4-pack-quantized]
+    when:
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+      - device: [cuda]
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+      - device: [cuda]
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+      - device: [cuda]
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+      - device: [cuda]
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
+        architectures: [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+    launch:
+      activation: none
+      compute_dtype: BF16
+      mma_dtypes: [BF16]
+    source_anchor: "The Kimi SM100/103/107 auto override selects flashinfer_mxfp4 (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/arg_groups/model_overrides/kimi_k3.py#L244-L262). The default and bf16 branches are explicit (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py#L1567-L1595); the MXFP8 preparation uses per-token group 32 UE8M0 (https://github.com/sgl-project/sglang/blob/1b2870d33de7b5f31844fd74e97eea6d7896c53a/python/sglang/srt/layers/quantization/mxfp4.py#L79-L119)."
+
 # Each entry: a fused-op concept (`fusion_plans/`) sglang runs as one launch,
 # where its source says so, and `when:` it does (absent: whenever the pattern
 # matches).

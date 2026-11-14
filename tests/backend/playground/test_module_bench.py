@@ -1102,7 +1102,7 @@ def test_a_window_of_any_size_reads_as_windowed():
 
     def tensor(law):
         return SimpleNamespace(
-            name="t", stored=law, is_growing=CACHE_LEN in law.free_symbols,
+            name="t", stored=law, storage_law=law, is_growing=CACHE_LEN in law.free_symbols,
             positions=lambda n: int(law.subs(CACHE_LEN, n)))
 
     wide = 1 << 21
@@ -1264,7 +1264,8 @@ def test_explicit_dims_repair_the_gap(loader, monkeypatch):
         ["mha_attention", "kimi_k3_kda_attention"],
         ov={"d_head": 56, "d_gate_lowrank": 128, "d_lin_k_head": 128,
             "d_lin_v_head": 128, "n_lin_k_heads": 96, "n_lin_v_heads": 96,
-            "s_conv_kernel": 4, "n_gate_lower_bound": 1})
+            "s_conv_kernel": 4, "s_conv_history": 4,
+            "n_gate_lower_bound": 1})
     assert out["errors"] == []
     assert {r["component"] for r in out["results"]} == {
         "mha_attention", "kimi_k3_kda_attention"}

@@ -59,6 +59,8 @@ def cache_geometry(
         shapes=shapes,
         state_shapes=state_shapes,
         positions_over=positions_over,
+        padded_position_components=frozenset(
+            plan.component.uid for plan in sharding.sparse_dcp.plans),
     )
     global_cache = cache_mod.derive(analysis)
     local_cache = cache_mod.derive(analysis, geometry=geometry)

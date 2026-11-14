@@ -114,6 +114,7 @@ class PostTransform(str, Enum):
     #: Drop a padded cut's padding after it is gathered: keep the leading
     #: logical extent of one axis (vLLM's `logits[..., :org_vocab_size]`).
     PADDING_TRIM = "padding_trim"
+    ONLINE_ATTENTION_COMBINE = "online_attention_combine"
 
 
 class LogicalBindingGap(str, Enum):
@@ -127,6 +128,8 @@ class PayloadRole(str, Enum):
 
     FLOW_BUFFER = "flow_buffer"
     AUXILIARY_STATISTIC = "auxiliary_statistic"
+    RUNTIME_STAGE = "runtime_stage"
+    PACKED_ATTENTION_PARTIAL = "packed_attention_partial"
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,7 @@ class PhysicalCollective:
     #: buffer is made of (its value is `payload_bytes`), so a row can read
     #: the same payload at another batch.
     payload_extent: Any = field(default=None, compare=False, repr=False)
+    runtime_work: Any = None
     payload_symbolic_shape: Tuple[str, ...] = ()
     post_transform: PostTransform = PostTransform.NONE
     binding_gap: Optional[LogicalBindingGap] = None
@@ -493,7 +497,9 @@ def _comm_layers(
             )
         shape_in = tuple(event.flow_in_shape)
         shape_out = tuple(event.flow_out_shape)
-        costs[node.uid] = Cost()
+        local_flops = (event.runtime_work.flops if event.runtime_work is not None
+                       else dict(event.meta).get("sparse_dcp_local_flops", 0))
+        costs[node.uid] = Cost(flops=local_flops)
         shapes[node.uid] = Shape(
             ins=(shape_in,),
             out=shape_out,
@@ -553,8 +559,23 @@ def _comm_layers(
                 if event.binding_gap is not None else None
             ),
             **{key: value for key, value in event.meta
-               if key in ("cut", "source_occurrence", "sink_occurrences")},
+               if key in ("cut", "source_occurrence", "sink_occurrences")
+               or key.startswith("sparse_dcp_")},
+            **(dict(event.runtime_work.metadata()) if event.runtime_work is not None else {}),
         }
+    # A runtime plan can replace its producer's materialized output traffic
+    # (e.g. MLA FP32 split partials). This is a fact on the existing producer,
+    # not a synthetic extra producer launch or a second evaluation.
+    for event in events:
+        work = event.runtime_work
+        if work is not None and work.producer_uid is not None:
+            if work.producer_write_bytes is None:
+                raise ValueError('runtime producer write override has no byte law')
+            target = comm_meta.setdefault(work.producer_uid, {})
+            if "runtime_write_bytes" in target:
+                raise ValueError('duplicate runtime producer output override')
+            target["runtime_write_bytes"] = work.producer_write_bytes
+            target["runtime_work_basis"] = work.work_basis
     return (
         Layer(program, costs),
         Layer(program, shapes),

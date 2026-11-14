@@ -499,6 +499,46 @@
       }
     }
   },
+  "moonshotai__Kimi-K3.1-Pro": {
+    "1": {
+      "vision": {
+        "bytes_per_rank": 894717952,
+        "nodes": {
+          "kimi_k3_vision_tower@vision|mm_projector.post_norm": 14336,
+          "kimi_k3_vision_tower@vision|mm_projector.proj.0": 33554432,
+          "kimi_k3_vision_tower@vision|mm_projector.proj.2": 58720256,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.mlp.fc0": 226492416,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.mlp.fc1": 226492416,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.norm0": 55296,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.norm1": 55296,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.wo": 84934656,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.wqkv": 254803968,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.final_layernorm": 2048,
+          "kimi_k3_vision_tower@vision|vision_tower.patch_embed.pos_emb.weight": 8388608,
+          "kimi_k3_vision_tower@vision|vision_tower.patch_embed.proj": 1204224
+        }
+      }
+    },
+    "8": {
+      "vision": {
+        "bytes_per_rank": 894717952,
+        "nodes": {
+          "kimi_k3_vision_tower@vision|mm_projector.post_norm": 14336,
+          "kimi_k3_vision_tower@vision|mm_projector.proj.0": 33554432,
+          "kimi_k3_vision_tower@vision|mm_projector.proj.2": 58720256,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.mlp.fc0": 226492416,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.mlp.fc1": 226492416,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.norm0": 55296,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.norm1": 55296,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.wo": 84934656,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.blocks.wqkv": 254803968,
+          "kimi_k3_vision_tower@vision|vision_tower.encoder.final_layernorm": 2048,
+          "kimi_k3_vision_tower@vision|vision_tower.patch_embed.pos_emb.weight": 8388608,
+          "kimi_k3_vision_tower@vision|vision_tower.patch_embed.proj": 1204224
+        }
+      }
+    }
+  },
   "stepfun-ai__Step-3.7-Flash": {
     "1": {
       "vision": {

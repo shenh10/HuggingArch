@@ -870,6 +870,14 @@
   },
   {
     "identifiers": [
+      "moonshotai__Kimi-K3.1-Pro"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_precision_launch_selection.py",
+    "name": "_SGLANG_STEMS"
+  },
+  {
+    "identifiers": [
       "Qwen__Qwen3-30B-A3B",
       "XiaomiMiMo__MiMo-7B-RL"
     ],

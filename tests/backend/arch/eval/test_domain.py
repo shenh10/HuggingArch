@@ -26,7 +26,9 @@ def test_the_domain_is_the_workloads_declaration():
     least one."""
     assert DOMAIN.least == {B: 1, SYMBOLS["s_verify"]: 1, S_IN: 0, S_OUT: 0,
                             SYMBOLS["s_prefix_cached"]: 0,
-                            SYMBOLS["ep_load_factor"]: 1}
+                            SYMBOLS["ep_load_factor"]: 1,
+                            SYMBOLS["dcp_selected_load_factor"]: 1,
+                            SYMBOLS["dcp_failed_owners"]: 0}
 
 
 def test_a_ratio_input_holds_from_its_floor():

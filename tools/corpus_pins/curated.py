@@ -190,6 +190,10 @@ def render_manifest(rows: List[Dict[str, object]]) -> bytes:
 #: reason it does not grow with the corpus. A new model does not join them.
 #: Their container literals are exactly the manifest's rows.
 CURATED_OUT_OF_SCOPE: Tuple[CuratedSet, ...] = (
+    CuratedSet('tests/backend/inference/test_precision_launch_selection.py',
+               '_SGLANG_STEMS',
+               'the SGLang-only hybrid KDA/DSA runtime profile whose MXFP4 '
+               'launch precision is audited against SGLang; not all models'),
     CuratedSet('tests/backend/arch/layout/test_layout_physical.py', 'LANE_COHORT',
                'the chosen lane cohort, read from its golden',
                artifact='tests/golden/shardv3_lane_snapshots.json'),

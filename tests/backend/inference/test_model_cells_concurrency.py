@@ -24,11 +24,11 @@ def test_a_cold_key_is_built_once_while_the_second_caller_waits(monkeypatch):
     builds = []
     real = walk_registry.StepCells
 
-    def blocking_cells():
+    def blocking_cells(runtime_profile):
         builds.append(threading.get_ident())
         entered.set()
         assert release.wait(30)
-        return real()
+        return real(runtime_profile)
 
     monkeypatch.setattr(walk_registry, "StepCells", blocking_cells)
     got = {}

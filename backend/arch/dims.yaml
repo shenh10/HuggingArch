@@ -1154,6 +1154,10 @@ symbols:
     kind: whole
     group: linear_attention_hybrid_recurrence
     meaning: Linear-attention value per-head dim.
+  s_conv_history:
+    kind: whole
+    group: linear_attention_hybrid_recurrence
+    meaning: Number of historical positions retained by each causal convolution cache.
   s_conv_kernel:
     kind: whole
     group: linear_attention_hybrid_recurrence

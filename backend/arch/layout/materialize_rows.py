@@ -542,6 +542,11 @@ def dcp_trio(mat: Any, record: Any) -> List[PhysicalCollective]:
     One semantic record; three physical rows. Head expansion lives in
     kernel geometry, recorded as a binding gap rather than guessed here.
     """
+    from .sparse_dcp_comm import sparse_dcp_finalize
+
+    sparse = sparse_dcp_finalize(mat, record)
+    if sparse is not None:
+        return sparse
     f = dcp_finalize_inputs(mat, record)
     query = mat._event(
         record=record,

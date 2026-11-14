@@ -24,7 +24,8 @@ def test_capacity_and_plan_have_no_private_step_cells():
 
 def test_a_walk_family_key_names_no_point_card_price_or_measurement():
     fields = tuple(walk_registry.WalkCellKey.__dataclass_fields__)
-    assert fields == ("model_id", "version", "config", "parallel", "precision")
+    assert fields == ("model_id", "version", "config", "parallel", "precision",
+                      "runtime_profile")
 
 
 def test_walk_families_are_bound_by_resident_bytes_not_only_by_count():

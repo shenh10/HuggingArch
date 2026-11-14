@@ -58,6 +58,7 @@ def _copy_recipe(ir_node: SpecIRNode, graph: Any) -> None:
     ir_node.kv_states = tuple(graph.kv_states or ())
     ir_node.kv_label = graph.kv_label
     ir_node.attn_variant = graph.attn_variant
+    ir_node.sparse_dcp = graph.sparse_dcp
 
 
 def iter_blocks(resolved) -> List[BlockMeta]:

@@ -218,24 +218,63 @@ register(Provider(
 
 
 def _deepgemm_indexer_build(inv: Invocation, env: Env, inputs: Dict[str, Any]) -> BenchCase:
-    # DeepGEMM `fp8_paged_mqa_logits` is FP8 + paged (page_size=64) and needs an
-    # NSA KV pool, block tables and schedule metadata to invoke faithfully — a
-    # Blackwell-only path. Registered so the catalog lists it; the body is filled
-    # in on a box where DeepGEMM + the paged layout are available. Until then
-    # the registration says so (`disabled_reason`), so no cell is offered to it.
-    raise NotImplementedError("see disabled_reason")
+    """SGLang 1b2870d's paged decode logits call, excluding top-k.
+
+    Q scales are folded into float32 gates. The apparent [pages,64,1,132]
+    byte cache stores each PAGE's FP8 values followed by its float32 scales,
+    not interleaved 132-byte token records. Packing, quantization and the
+    schedule are untimed setup; only fp8_paged_mqa_logits is timed.
+    """
+    _require_cuda()
+    import torch
+    import deep_gemm
+    from ..quant import FORMATS, quantise_groups
+
+    q, k = inputs["q"], inputs["k"]
+    batch, length, width = k.shape
+    heads = q.shape[1]
+    page = int(inv.kv_block_size)
+    pages_per_request = (length + page - 1) // page
+    padded_length = pages_per_request * page
+    q8, qs = quantise_groups(q.reshape(-1, width), FORMATS["fp8_e4m3"],
+                            width, "exact", q.dtype, eps=1e-10)
+    encoding = "pow2" if inv.kv_format == "fp8_pow2_group128" else "exact"
+    k8, ks = quantise_groups(k.reshape(-1, width), FORMATS["fp8_e4m3"],
+                            width, encoding, k.dtype, eps=1e-10)
+    key_bytes = torch.zeros(batch, padded_length, width, dtype=torch.uint8,
+                            device=k.device)
+    scales = torch.ones(batch, padded_length, dtype=torch.float32, device=k.device)
+    key_bytes[:, :length] = k8.reshape(batch, length, width).view(torch.uint8)
+    scales[:, :length] = ks.reshape(batch, length)
+    packed = torch.cat((key_bytes.reshape(-1, page * width),
+                        scales.reshape(-1, page).view(torch.uint8)), dim=1)
+    from ..launch_trace import paged_byte_cache_shape
+    cache = packed.reshape(paged_byte_cache_shape(k.shape, page, inv.kv_format))
+    table = torch.arange(batch * pages_per_request, dtype=torch.int32,
+                         device=k.device).reshape(batch, pages_per_request)
+    lengths = torch.full((batch, 1), length, dtype=torch.int32, device=k.device)
+    num_sms = torch.cuda.get_device_properties(k.device).multi_processor_count
+    schedule = deep_gemm.get_paged_mqa_logits_metadata(lengths, page, num_sms)
+    weights = (inputs["weights"].float() * qs.reshape(batch, heads)).contiguous()
+    query = q8.reshape(batch, 1, heads, width).contiguous()
+    return BenchCase(
+        run=Launch(deep_gemm.fp8_paged_mqa_logits, query, cache, weights,
+                   lengths, table, schedule, padded_length, clean_logits=False),
+        to_canonical=lambda out: out.reshape(batch, -1)[:, :length],
+    )
 
 
 register(Provider(
     library="deepgemm", signature="indexer_logits",
     kernel_impl="deepgemm_fp8_paged_mqa_logits",
     import_name="deep_gemm",
-    # Same claim as the torch kernel: any indexer_logits cell. The paged FP8
-    # body is Blackwell-only, but that is an AVAILABILITY fact (source_build +
-    # the import gate), not a narrower claim about which shapes it serves.
-    # It reads an FP8 e4m3 query and writes fp32 logits.
+    min_sm=100,
     serves=KernelSignature(signature="indexer_logits",
                            activation=("fp8_e4m3",), output=("fp32",),
+                           phases=("decode",),
+                           enum=(("s_query", (1,)), ("n_indexer_heads", (32,)),
+                                 ("d_indexer_head", (128,)), ("kv_block_size", (64,))),
+                           max_dims=(("B", 128),),
                            # `fp8_paged_mqa_logits` is paged at page_size=64,
                            # the same fact the build note above states.
                            kv_block_sizes=(64,),
@@ -244,10 +283,7 @@ register(Provider(
                            # that scale to a power of two is the writer's.
                            kv_format=("fp8_group128", "fp8_pow2_group128")),
     build=_deepgemm_indexer_build,
-    disabled_reason=(
-        "no runnable body yet: fp8_paged_mqa_logits needs the NSA paged KV "
-        "pool, block tables and schedule metadata (see nsa_indexer's paged "
-        "path), built on a Blackwell box"),
+    paged_byte_cache_inputs=(("k", "kv_format"),),
 ))
 
 

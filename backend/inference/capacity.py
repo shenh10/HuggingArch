@@ -21,6 +21,7 @@ all_gathers K/V before the cache write. The displayed shard and replication
 factors are the ratio of the whole-model view to this rank's view.
 """
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
 
 import threading
 import time
@@ -46,7 +47,7 @@ from .gpu_specs import (
 )
 from .defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_DEFAULT
 from .card import Card, CardPrice
-from .framework_bindings import ServingDeployment
+from .framework_bindings import ServingDeployment, THEORY
 from .frontier import POINT_DIMS
 from .point_cloud import estimate_cloud
 from .kv_topology import _counted
@@ -382,6 +383,8 @@ class _CapacityPreparation:
     #: The batch's routing skew, max/mean expert load (`Workload.
     #: ep_load_factor`).
     ep_load_factor: Any
+    dcp_selected_load_factor: Any = 1
+    dcp_failed_owners: Any = 0
     # The speculative draft this decode step counts, or None for the verify
     # forward alone (`speculative_draft.SpeculativeDraft`).
     draft: Optional[SpeculativeDraft] = None
@@ -463,6 +466,8 @@ class CapacityKnobs:
     #: as the symbol `rho`; 1 is balanced routing, and the response says
     #: it is an assumption (`assumptions.deployment_assumptions`).
     ep_load_factor: float = 1.0
+    dcp_selected_load_factor: float = 1.0
+    dcp_failed_owners: int = 0
     #: Count the speculative draft's forwards in the decode step, in this
     #: style (`speculative_draft.DraftStyle`); None prices the verify alone.
     speculative_draft: Optional[str] = None
@@ -1366,7 +1371,8 @@ class ModelCells(NamedTuple):
 
 
 def _model_cells(resolved: Any, parallel: ParallelConfig,
-                 precision: PrecisionProfile, *, model_id: Optional[str]
+                 precision: PrecisionProfile, *, model_id: Optional[str],
+                 runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED
                  ) -> ModelCells:
     """The cells of one model's spec, deployment and precision under this
     code (`fingerprint.result_version`: the code, the shared data, the
@@ -1385,7 +1391,7 @@ def _model_cells(resolved: Any, parallel: ParallelConfig,
     lock, so requests on several threads share one cell. With them, what a
     capacity preparation reads off the cells alone (`CellBasis`)."""
     shared = shared_walk_cells(resolved, parallel, precision,
-                               model_id=model_id)
+                               model_id=model_id, runtime_profile=runtime_profile)
     return shared.reader(
         "capacity", lambda: ModelCells(
             shared.resolved, shared.cells,
@@ -1493,7 +1499,9 @@ def _capacity_preparation(
     # reads the same ones, and so does every later request of the same
     # model, deployment and precision (`_model_cells`).
     resolved, cells, basis, shared = _model_cells(
-        resolved, parallel, precision, model_id=knobs.model_id)
+        resolved, parallel, precision, model_id=knobs.model_id,
+        runtime_profile=(RuntimeProfile.ARCHITECTURE if knobs.framework == THEORY
+                         else RuntimeProfile.DECLARED))
     account_cells = shared.account
     analysis = basis.analysis
     resolved_precision = analysis.resolved_precision
@@ -1776,6 +1784,8 @@ def _capacity_preparation(
             s_verify=knobs.s_verify,
             acceptance_rate=knobs.acceptance_rate,
             ep_load_factor=knobs.ep_load_factor,
+            dcp_selected_load_factor=knobs.dcp_selected_load_factor,
+            dcp_failed_owners=knobs.dcp_failed_owners,
             draft=draft,
             refusal_reason=refusal_reason,
             cells=cells,
@@ -1852,6 +1862,8 @@ def _capacity_preparation(
         s_verify=knobs.s_verify,
         acceptance_rate=knobs.acceptance_rate,
         ep_load_factor=knobs.ep_load_factor,
+        dcp_selected_load_factor=knobs.dcp_selected_load_factor,
+        dcp_failed_owners=knobs.dcp_failed_owners,
         draft=draft,
         refusal_reason=refusal_reason,
         cells=cells,
@@ -3285,6 +3297,7 @@ def _capacity_pending(
                     "ep_moe": parallel.ep_moe, "cp": parallel.cp,
                     "dp_attention": parallel.dp_attention,
                     "dp_replicas": parallel.dp_replicas,
+                    "dcp": parallel.dcp,
                 },
                 "gpu_memory_fraction": p.gpu_memory_fraction,
                 "weight_bytes_total": weight_bytes_total,
@@ -3342,6 +3355,8 @@ def _capacity_pending(
                 output_tokens=avg_output_tokens,
                 s_prefix_cached=p.s_prefix_cached, s_verify=p.s_verify,
                 ep_load_factor=p.ep_load_factor,
+                dcp_selected_load_factor=p.dcp_selected_load_factor,
+                dcp_failed_owners=p.dcp_failed_owners,
                 precision=p.precision, cells=p.cells)
             if _phase == "prefill":
                 prefill_step_eval = _ev
@@ -3563,6 +3578,7 @@ def _capacity_pending(
                 "tp_moe_expert": parallel.tp_moe_expert, "ep_moe": parallel.ep_moe,
                 "cp": parallel.cp, "dp_attention": parallel.dp_attention,
                 "dp_replicas": parallel.dp_replicas,
+                "dcp": parallel.dcp,
             },
             "gpu_memory_fraction": p.gpu_memory_fraction,
             "weight_bytes_total": weight_bytes_total,
@@ -3587,6 +3603,9 @@ def _capacity_pending(
             "assumptions": deployment_assumptions(
                 parallel, ep_load_factor=p.ep_load_factor,
                 has_dispatch_zone=has_dispatch_zone,
+                sparse_dcp=bool(decode_step_eval and decode_step_eval.analysis.rule.sparse_dcp.plans),
+                dcp_selected_load_factor=p.dcp_selected_load_factor,
+                dcp_failed_owners=p.dcp_failed_owners,
                 joined_streams=(
                     sorted(prefill_step_eval.analysis.program.joined_streams)
                     if prefill_step_eval is not None else ())),

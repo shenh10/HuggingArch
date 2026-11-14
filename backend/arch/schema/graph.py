@@ -507,6 +507,25 @@ def resolve_block_input_ports(
 
 
 
+class SparseDcpSpec(BaseModel):
+    """Explicit SGLang sparse MLA runtime graph, independent of model names."""
+    backend: Literal["sglang_fi_a2a"] = "sglang_fi_a2a"
+    query_projection: str
+    absorbed_query: str
+    stored_kv_projection: str
+    value_projection: str
+    score: str
+    softmax: str
+    apply: str
+    indexer_logits: str
+    indexer_topk: str
+
+    @property
+    def framework(self) -> Literal["sglang"]:
+        """The serving framework that owns this backend contract."""
+        return "sglang"
+
+
 class BlockGraph(BaseModel):
     """Computation DAG for a single transformer block.
 
@@ -529,6 +548,7 @@ class BlockGraph(BaseModel):
     # Omitted by every component whose decode form is its prefill form, which is
     # almost all of them.
     decode_variant: Optional[str] = None
+    sparse_dcp: Optional[SparseDcpSpec] = None
     # The phases that run `decode_variant` in place of this graph: decode
     # alone unless the component says otherwise. A sparse MLA attention
     # (DSA) also prefills absorbed — its query reads its selected rows of

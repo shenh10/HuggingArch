@@ -743,7 +743,12 @@ def run_jobs(
                             trace, declared_dtypes=sorted(set(
                                 (inv.dtype_env or {}).values())),
                             declared_elements=_declared_elements(inv),
-                            records=_xcheck_basis(inv, p_inputs)[1])
+                            records=_xcheck_basis(inv, p_inputs)[1],
+                            packed_byte_shapes=tuple(
+                                launch_trace.paged_byte_cache_shape(
+                                    p_inputs[name].shape, inv.kv_block_size,
+                                    inv.dtype_env[slot])
+                                for name, slot in p.paged_byte_cache_inputs))
                     if says is not None:
                         # The launch is not this cell's, so its latency is
                         # not either: a `mismatch` like a cross-check reject,

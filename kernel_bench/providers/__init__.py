@@ -942,6 +942,10 @@ class Provider:
     # what the library takes. Concat, paging, and varlen metadata stay in
     # `build`.
     launch_inputs: Tuple[Any, ...] = ()
+    # Canonical [B,L,D] inputs stored as [pages,page,1,record_bytes] uint8.
+    # Each pair names the input and its dtype_env cache-format slot. The
+    # launch gate derives exact byte extents from that format and page axis.
+    paged_byte_cache_inputs: Tuple[Tuple[str, str], ...] = ()
     # Name of a `launch_inputs` tensor whose grouping to invert on the
     # kernel output. Last-dim width follows the tensor. None = `build`
     # still owns the output mapping.
@@ -1562,6 +1566,7 @@ def discover() -> None:
         return
     from . import attention   # noqa: F401  (self-registers on import)
     from . import gemm         # noqa: F401
+    from . import sglang_mla   # noqa: F401
     from . import linear_ssm   # noqa: F401
     from . import norm_act     # noqa: F401
     from . import rope         # noqa: F401  (rope + fused_qk_norm_rope)

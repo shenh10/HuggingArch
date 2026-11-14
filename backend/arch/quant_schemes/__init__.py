@@ -37,6 +37,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.arch.activation_formats import ACTIVATION_FORMATS
+from backend.arch.dtypes import canonical
 from backend.arch.eval.scheme_dialect import eval_predicate
 
 
@@ -862,20 +863,37 @@ def packed_unpack_factor(name: str, dtype: str, num_bits: int,
     """Elements-per-packed-unit factor for `name` under `scheme`.
 
     Driven by `scheme.format_variants[*].weight_storage_suffix` — find
-    the variant whose suffix this name ends with and apply its
-    `packing_factor` (or `packing_factor_per_num_bits[num_bits]`).
+    the variant whose suffix AND storage dtype match this tensor, then
+    apply its `packing_factor` (or `packing_factor_per_num_bits[num_bits]`).
     Returns 1 when no variant declares packing for this name. A variant that
     packs by bit width and has no entry for `num_bits` refuses: the config
     did not state a width this scheme packs at, and 1 would undercount.
 
-    `dtype` is no longer consulted — the variant's declared storage
-    word size encodes packing implicitly via packing_factor. Kept in
-    the signature for backward compat.
+    Matching the suffix alone is insufficient for mixed checkpoints: a
+    scheme may store packed U8 under `.weight` alongside unquantized BF16
+    tensors using that same suffix. The header's dtype distinguishes them;
+    the scheme remains the sole owner of the unpacking factor.
     """
     if not scheme.format_variants:
         return 1
     for fv in scheme.format_variants.values():
         if not name.endswith(fv.weight_storage_suffix):
+            continue
+        if fv.packing_factor == 1:
+            continue
+        storage_dtype = fv.storage_dtype
+        if fv.storage_dtype_per_num_bits:
+            storage_dtype = fv.storage_dtype_per_num_bits.get(num_bits)
+            if storage_dtype is None:
+                if canonical(dtype) not in {
+                        canonical(value)
+                        for value in fv.storage_dtype_per_num_bits.values()}:
+                    continue
+                raise ValueError(
+                    f"{name}: scheme {scheme.name!r} declares storage dtypes "
+                    f"per bit width {sorted(fv.storage_dtype_per_num_bits)}, "
+                    f"and the quantization config states num_bits={num_bits}")
+        if storage_dtype is None or canonical(dtype) != canonical(storage_dtype):
             continue
         if fv.packing_factor_per_num_bits:
             if num_bits not in fv.packing_factor_per_num_bits:

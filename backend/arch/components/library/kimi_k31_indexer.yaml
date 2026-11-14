@@ -1,0 +1,25 @@
+# SGLang 1b2870d3: configs/kimi_linear.py:137-174 disables rotary and
+# Hadamard, uses LayerNorm (epsilon = rms_norm_eps), FP32 norm parameters,
+# BF16 head gates and one independent indexer per sparse layer.
+# models/deepseek_v2.py:2194 passes scale_fmt="ue8m0" for query quantization.
+# The CUDA fused index-key writer overrides that: fused_store_index_cache.cuh:71
+# stores an ordinary FP32 amax/448 scale, not a rounded power of two.
+# Checkpoint k_norm weight/bias remain BF16; runtime casting is not storage.
+# indexer_logits is the existing fused ReLU + head-weighted MQA score primitive.
+# Its full-history read must not inherit the main attention's top-k cap.
+description: "Kimi-K3.1 lightning indexer: NoPE/No-Hadamard, LayerNorm key, BF16 head-gate projection, FP8 Q/K scoring and independent top-k."
+inputs: [x, q_norm]
+# The enclosing DSA layer includes this sub-cache alongside latent/tail.
+# It is not an additional transformer layer (cache.derive absorbs it).
+cache:
+  entries:
+    - { node: k_norm, kind: index_key }
+graph:
+  weights_proj: { op: linear, role: attention_indexer, in: x, dims: { in: d_model, out: n_indexer_heads }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  wk: { op: linear, role: attention_indexer, in: x, dims: { in: d_model, out: d_indexer_head }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  k_norm: { op: layernorm, role: attention_indexer, in: wk, dim: d_indexer_head, weight_axes: [{ replicated: true }] }
+  wq_b: { op: linear, role: attention_indexer, in: q_norm, dims: { in: d_q_lora, out: "n_indexer_heads * d_indexer_head" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  q_split_heads: { op: head_split, in: wq_b, dims: { n_heads: n_indexer_heads, d_head: d_indexer_head } }
+  logits: { op: indexer_logits, in: [q_split_heads, k_norm, weights_proj], dims: { n_indexer_heads: n_indexer_heads, d_indexer_head: d_indexer_head } }
+  topk: { op: dsa_topk_mask, in: logits, dims: { k: n_topk_keys } }
+outputs: [topk]

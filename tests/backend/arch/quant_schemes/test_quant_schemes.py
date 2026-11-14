@@ -166,6 +166,43 @@ class TestSchemeRegistryLoad(unittest.TestCase):
             "a.qweight", "I32", 4, QUANT_SCHEMES["gptq"]), 8)
 
 
+class TestHeaderPackingDtype(unittest.TestCase):
+    def test_every_packed_variant_requires_its_declared_storage_dtype(self):
+        from backend.arch.quant_schemes import QUANT_SCHEMES, packed_unpack_factor
+        for scheme in QUANT_SCHEMES.values():
+            for variant in scheme.format_variants.values():
+                factors = (variant.packing_factor_per_num_bits or
+                           {4: variant.packing_factor})
+                for bits, factor in factors.items():
+                    if not factor or factor <= 1:
+                        continue
+                    dtype = (variant.storage_dtype or
+                             variant.storage_dtype_per_num_bits[bits])
+                    name = "layer.proj" + variant.weight_storage_suffix
+                    with self.subTest(scheme=scheme.name, variant=variant.name, bits=bits):
+                        self.assertEqual(packed_unpack_factor(name, dtype, bits, scheme), factor)
+                        self.assertEqual(packed_unpack_factor(name, "BF16", bits, scheme), 1)
+
+    def test_plain_u8_packing_and_dtype_aliases_are_preserved(self):
+        from backend.arch.quant_schemes import scheme_named, packed_unpack_factor
+        scheme = scheme_named("mxfp4-pack-quantized")
+        for suffix in (".weight", ".weight_packed"):
+            self.assertEqual(packed_unpack_factor("x" + suffix, "uint8", 4, scheme), 2)
+            self.assertEqual(packed_unpack_factor("x" + suffix, "bfloat16", 4, scheme), 1)
+        # The old generic compressed-tensors I32 variant cannot classify U8
+        # as eight INT4 parameters; the correct MXFP4 scheme is required.
+        self.assertEqual(packed_unpack_factor(
+            "x.weight_packed", "U8", 4, scheme_named("compressed-tensors")), 1)
+
+    def test_no_packing_does_not_require_a_bit_width(self):
+        from backend.arch.quant_schemes import scheme_named, packed_unpack_factor
+        for dtype in ("BF16", "I8", "F8_E4M3"):
+            self.assertEqual(packed_unpack_factor(
+                "x.weight", dtype, 0, scheme_named("compressed-tensors")), 1)
+        self.assertEqual(packed_unpack_factor(
+            "x.qweight", "BF16", 0, scheme_named("gptq")), 1)
+
+
 class TestSchemeYamlValidation(unittest.TestCase):
     """Validators trip on malformed yamls."""
 

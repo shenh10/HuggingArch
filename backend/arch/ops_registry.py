@@ -931,6 +931,16 @@ register_op(OpSpec("one_hot",
     required_dims=("out",),
 ))
 
+# Opaque local launch emitted by a bound serving-runtime plan. Its work is
+# declared once by RuntimeStageWork and grafted into the evaluated layers;
+# this primitive provides semantic flow only, never a second cost formula.
+register_op(OpSpec("runtime_stage",
+    couples_on=(), flops_fn=_zero, params_fn=_zero,
+    shape_in=("B", "s_ctx", "in"), shape_out=("B", "s_ctx", "in"),
+    shape_kind="preserve",
+    description="Local runtime launch with source-declared work and traffic.",
+))
+
 register_op(OpSpec("identity",
     couples_on=(),
     flops_fn=_zero,

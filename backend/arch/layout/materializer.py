@@ -6,9 +6,10 @@ from fractions import Fraction
 from itertools import pairwise
 from math import prod
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+import sympy as sp
 
 from backend.arch.eval.refusal import SpecRefusal, node_context
-from backend.arch.eval.dim import expr_of, value_of, whole_count
+from backend.arch.eval.dim import expr_of, value_of, whole_count, require
 from backend.arch.eval.layer import Layer
 from backend.arch.eval.occurrence import Occurrence
 from backend.arch.eval.program import Program
@@ -83,6 +84,8 @@ def _scaled_one_axis(
 def _collective_geometry_ok(
         op: str, group_size: int,
         collective_in: Sequence[int], collective_out: Sequence[int]) -> bool:
+    if op == "runtime_stage":
+        return tuple(collective_in) == tuple(collective_out)
     if op == "all_gather":
         return _scaled_one_axis(
             collective_in, collective_out, group_size, expand=True)
@@ -103,7 +106,7 @@ def _require_collective_geometry(
         event_id: str, op: str, group_size: int,
         collective_in: Sequence[int], collective_out: Sequence[int]) -> None:
     if op not in ("all_gather", "all_reduce", "all_to_all", "reduce_scatter",
-                  "send_recv"):
+                  "send_recv", "runtime_stage"):
         raise ValueError(
             f"event {event_id} has unsupported collective {op!r}")
     if not _collective_geometry_ok(
@@ -120,6 +123,11 @@ def _require_payload_flow(
         flow_in: Sequence[int], flow_out: Sequence[int],
         collective_in: Sequence[int], collective_out: Sequence[int],
         post_transform: PostTransform) -> None:
+    if payload_role == PayloadRole.RUNTIME_STAGE:
+        if (op != "runtime_stage" or tuple(flow_in) != tuple(flow_out)
+                or tuple(payload_dims) != (0,) or post_transform != PostTransform.NONE):
+            raise ValueError(f"event {event_id} has invalid local runtime stage")
+        return
     expected = collective_out if op == "all_gather" else collective_in
     if tuple(payload_dims) != tuple(expected):
         raise ValueError(
@@ -128,6 +136,20 @@ def _require_payload_flow(
     if not isinstance(payload_role, PayloadRole):
         raise TypeError(
             f"event {event_id} has invalid payload role {payload_role!r}")
+    if payload_role == PayloadRole.PACKED_ATTENTION_PARTIAL:
+        if (op != "all_to_all"
+                or post_transform != PostTransform.ONLINE_ATTENTION_COMBINE
+                or len(flow_in) != 4 or len(flow_out) != 4
+                or len(collective_in) != 3
+                or tuple(collective_out) != tuple(collective_in)
+                or tuple(collective_in[:2]) != (flow_in[0] * flow_in[2], flow_in[1])
+                or any(flow_in[i] != flow_out[i] for i in (0, 2, 3))
+                or flow_out[1] <= 0 or flow_in[1] % flow_out[1]):
+            raise ValueError(f"event {event_id} has invalid packed attention combine geometry")
+        extra = collective_in[-1] - flow_in[-1]
+        require(sp.Or(*(sp.Eq(extra, size) for size in (2, 4, 8))),
+                lambda at: ValueError(f"event {event_id} invalid packed LSE slot {at(extra)}"))
+        return
     if payload_role == PayloadRole.FLOW_BUFFER:
         if tuple(collective_in) != tuple(flow_in):
             raise ValueError(
@@ -164,6 +186,8 @@ def _require_post_transform(
             op == "all_gather" and payload_role == PayloadRole.FLOW_BUFFER),
         PostTransform.PADDING_TRIM: (
             op == "all_gather" and payload_role == PayloadRole.FLOW_BUFFER),
+        PostTransform.ONLINE_ATTENTION_COMBINE: (
+            op == "all_to_all" and payload_role == PayloadRole.PACKED_ATTENTION_PARTIAL),
     }
     if not legal.get(post_transform, False):
         raise ValueError(
@@ -221,7 +245,8 @@ def _require_binding_gap(
     if post_transform != PostTransform.NONE and not (
             binding_gap == LogicalBindingGap.DCP_HEAD_FLOW
             and post_transform in (
-                PostTransform.LOCAL_SLICE, PostTransform.REPLICA_SELECT)):
+                PostTransform.LOCAL_SLICE, PostTransform.REPLICA_SELECT,
+                PostTransform.ONLINE_ATTENTION_COMBINE)):
         raise ValueError(
             f"event {event_id} cannot combine binding gap {binding_gap!r} "
             f"with post-transform {post_transform!r}")
@@ -235,8 +260,10 @@ class _Session:
         *,
         stage: Any = None,
         timing_scope: Optional[FrozenSet[str]] = None,
+        sm_count: Optional[int] = None,
     ) -> None:
         self.analysis = analysis
+        self.sm_count = sm_count
         #: The pipeline stage this rank runs (`stages.StageView`), when the
         #: view is one stage's: its rows count what runs there, and it sends
         #: the hops across its own exit cut and no other. None is the whole
@@ -415,6 +442,7 @@ class _Session:
         post_transform: PostTransform = PostTransform.NONE,
         binding_gap: Optional[LogicalBindingGap] = None,
         meta: Tuple[Tuple[str, Any], ...] = (),
+        runtime_work: Any = None,
         source: Any = _DEFAULT_SOURCE,
         source_event: Optional[str] = None,
         rewrites: Optional[Tuple[RewriteTarget, ...]] = None,
@@ -454,6 +482,9 @@ class _Session:
             flow_in, flow_out, collective_in, collective_out, post_transform)
         _require_collective_geometry(
             event_id, op, group_size, collective_in, collective_out)
+        if (payload_role == PayloadRole.PACKED_ATTENTION_PARTIAL
+                and flow_in[1] != flow_out[1] * group_size):
+            raise ValueError(f"event {event_id} combine head cut differs from group size")
         _require_post_transform(
             event_id, op, payload_role, post_transform,
             flow_in, flow_out, collective_out)
@@ -500,6 +531,7 @@ class _Session:
             flow_out_shape=tuple(flow_out_shape),
             payload_shape=tuple(payload_shape),
             payload_role=payload_role,
+            runtime_work=runtime_work,
             **payload,
             payload_symbolic_shape=self._payload_symbols(
                 resolved_source,
@@ -569,6 +601,8 @@ class _Session:
                 raw.extend(produced)
                 if produced:
                     terminal_events[record_index] = produced[-1].event_id
+        from .sparse_dcp_prefill import sparse_dcp_prefill_events
+        raw.extend(sparse_dcp_prefill_events(self))
         events = _coalesce_events(raw, self._node_order)
         validate_event_graph(self.analysis, events)
         return events
@@ -777,9 +811,10 @@ def collect_events(
     *,
     stage: Any = None,
     timing_scope: Optional[FrozenSet[str]] = None,
+    sm_count: Optional[int] = None,
 ) -> List[PhysicalCollective]:
     return _Session(
-        analysis, stage=stage, timing_scope=timing_scope,
+        analysis, stage=stage, timing_scope=timing_scope, sm_count=sm_count,
     ).events()
 
 
@@ -788,12 +823,14 @@ def materialize_comm_events(
     *,
     stage: Any = None,
     timing_scope: Optional[FrozenSet[str]] = None,
+    sm_count: Optional[int] = None,
 ) -> List[PhysicalCollective]:
     """Every comm record lowered without discarding graph topology."""
     return collect_events(
         analysis,
         stage=stage,
         timing_scope=timing_scope,
+        sm_count=sm_count,
     )
 
 
@@ -802,6 +839,7 @@ def materialize_comm_tree(
     *,
     stage: Any = None,
     timing_scope: Optional[FrozenSet[str]] = None,
+    sm_count: Optional[int] = None,
 ) -> MaterializedCommTree:
     """Graft the typed physical events into a copied full ``SpecIRTree``.
 
@@ -816,6 +854,7 @@ def materialize_comm_tree(
         analysis,
         stage=stage,
         timing_scope=timing_scope,
+        sm_count=sm_count,
     ))
     copied_tree, copied = _copy_program_tree(analysis)
     graft = _CommGraft(copied_tree, copied)

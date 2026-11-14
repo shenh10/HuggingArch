@@ -15,7 +15,7 @@ fused QKV report one projection's FLOPs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 import sympy as sp
 
@@ -193,6 +193,7 @@ class Shape:
     ins: Tuple[Dims, ...] = ()
     ports: Mapping[str, Dims] = field(default_factory=dict)
     moved: Optional[Moved] = None
+    pair_share: Any = None
 
     @property
     def rank(self) -> Optional[int]:

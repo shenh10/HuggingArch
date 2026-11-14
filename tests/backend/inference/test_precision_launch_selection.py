@@ -35,6 +35,8 @@ _PACK_STEMS = (
 )
 _GPT_OSS_STEM = "openai__gpt-oss-20b"
 _ALL_STEMS = (*_DOT_STEMS, *_PACK_STEMS, _GPT_OSS_STEM)
+# SGLang-only model coordinates are covered in test_sglang_precision_launches.
+_SGLANG_STEMS = ("moonshotai__Kimi-K3.1-Pro",)
 
 
 @dataclass(frozen=True)
@@ -352,7 +354,7 @@ def test_humming_ladder_falls_back_when_no_rung_is_priced():
 
 def test_the_matrix_covers_every_mxfp4_snapshot():
     """No corpus MXFP4 model escapes the snapshot-derived matrix."""
-    assert _mxfp4_snapshots() == set(_ALL_STEMS)
+    assert _mxfp4_snapshots() == set((*_ALL_STEMS, *_SGLANG_STEMS))
 
 
 def test_deepgemm_needs_its_explicit_backend_fact_even_on_b200():

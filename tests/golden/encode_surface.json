@@ -2035,6 +2035,128 @@
       }
     }
   },
+  "moonshotai__Kimi-K3.1-Pro": {
+    "1": {
+      "one": {
+        "max_tokens_per_item": 49,
+        "media": {
+          "pixel_values": {
+            "img_h": 196,
+            "img_w": 196,
+            "n_img": 1
+          }
+        },
+        "media_tokens": {
+          "pixel_values": 49
+        },
+        "output_cache_bytes_per_token": 14336,
+        "stacks": {
+          "vision": {
+            "act_peak_bytes_per_rank": 9191424,
+            "act_read_bytes": 14819168,
+            "act_write_bytes": 14488320,
+            "flops": 166823875904,
+            "handoff_rows": {
+              "vision": [
+                49
+              ]
+            },
+            "params": 447358976,
+            "weight_bytes_per_rank": 894717952
+          }
+        }
+      },
+      "two": {
+        "max_tokens_per_item": 98,
+        "media": {
+          "pixel_values": {
+            "img_h": 392,
+            "img_w": 196,
+            "n_img": 2
+          }
+        },
+        "media_tokens": {
+          "pixel_values": 196
+        },
+        "output_cache_bytes_per_token": 14336,
+        "stacks": {
+          "vision": {
+            "act_peak_bytes_per_rank": 18765824,
+            "act_read_bytes": 66652544,
+            "act_write_bytes": 65329152,
+            "flops": 693035452928,
+            "handoff_rows": {
+              "vision": [
+                196
+              ]
+            },
+            "params": 447358976,
+            "weight_bytes_per_rank": 894717952
+          }
+        }
+      }
+    },
+    "8": {
+      "one": {
+        "max_tokens_per_item": 49,
+        "media": {
+          "pixel_values": {
+            "img_h": 196,
+            "img_w": 196,
+            "n_img": 1
+          }
+        },
+        "media_tokens": {
+          "pixel_values": 49
+        },
+        "output_cache_bytes_per_token": 14336,
+        "stacks": {
+          "vision": {
+            "act_peak_bytes_per_rank": 9191424,
+            "act_read_bytes": 14819168,
+            "act_write_bytes": 14488320,
+            "flops": 166823875904,
+            "handoff_rows": {
+              "vision": [
+                49
+              ]
+            },
+            "params": 447358976,
+            "weight_bytes_per_rank": 894717952
+          }
+        }
+      },
+      "two": {
+        "max_tokens_per_item": 98,
+        "media": {
+          "pixel_values": {
+            "img_h": 392,
+            "img_w": 196,
+            "n_img": 2
+          }
+        },
+        "media_tokens": {
+          "pixel_values": 196
+        },
+        "output_cache_bytes_per_token": 14336,
+        "stacks": {
+          "vision": {
+            "act_peak_bytes_per_rank": 18765824,
+            "act_read_bytes": 66652544,
+            "act_write_bytes": 65329152,
+            "flops": 693035452928,
+            "handoff_rows": {
+              "vision": [
+                196
+              ]
+            },
+            "params": 447358976,
+            "weight_bytes_per_rank": 894717952
+          }
+        }
+      }
+    }
+  },
   "stepfun-ai__Step-3.7-Flash": {
     "1": {
       "one": {
