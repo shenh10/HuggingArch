@@ -711,7 +711,7 @@ class TestShippedBindingsLoad(unittest.TestCase):
             FrameworkBinding.KEYS,
             {"framework", "audited_at", "op_implementations", "kv_block_size",
              "ssm_chunk_size", "collectives", "precision_launches",
-             "edge_dtypes", "kernel_dispatches"})
+             "edge_dtypes", "weight_loaders", "kernel_dispatches"})
         self.assertEqual(set(CollectiveRung._fields), {
             "algorithm", "max_bytes", "max_bytes_times_world",
             "min_compute_capability", "below_compute_capability",
@@ -722,6 +722,20 @@ class TestShippedBindingsLoad(unittest.TestCase):
             for _op, rungs in binding.collectives:
                 for rung, _graph in rungs:
                     self.assertIn(rung.algorithm, ALGORITHMS)
+
+    def test_weight_loader_is_selected_by_model_architecture(self):
+        from types import SimpleNamespace
+        from backend.inference.framework_bindings import get_binding
+        mimo = SimpleNamespace(architectures=("MiMoV2ForCausalLM",))
+        other = SimpleNamespace(architectures=("LlamaForCausalLM",))
+        for framework, loader in (("sglang", "whole_chunks"),
+                                  ("vllm", "head_gather")):
+            binding = get_binding(framework)
+            self.assertEqual(binding.weight_loaders_for(mimo, None),
+                             {"tp_interleaved": loader})
+            self.assertEqual(binding.weight_loaders_for(other, None), {})
+        self.assertEqual(
+            get_binding("deepinfer").weight_loaders_for(mimo, None), {})
 
     def test_fused_qk_norm_rope_plan_has_four_node_chain(self):
         # The plan is the (q_norm, k_norm, q_rope, k_rope) chain the
@@ -1645,6 +1659,8 @@ class TestAnchorsResolveAtTheAuditedCommit(unittest.TestCase):
                         for launch in binding.precision_launches]
             anchors += [("edge_dtypes", entry.source_anchor)
                         for entry in binding.edge_dtypes]
+            anchors += [("weight_loaders", entry.source_anchor)
+                        for entry in binding.weight_loaders]
             anchors += [("kernel_dispatches", dispatch.source_anchor)
                         for dispatch in binding.kernel_dispatches]
             for op, anchor in anchors:

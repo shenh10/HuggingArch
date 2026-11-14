@@ -34,7 +34,7 @@ from backend.arch.eval.dim import value_of
 from backend.arch.eval.formats import quant_granularity
 from backend.arch.eval.precision import PrecisionProfile
 from backend.arch.eval.program import Program
-from backend.arch.eval.refusal import stage_context
+from backend.arch.eval.refusal import DeploymentRefusal, stage_context
 from backend.arch.eval.transforms import Workload
 from backend.arch.layout.stages import StagePlacement
 from backend.arch.loader import get_default_loader
@@ -1317,6 +1317,8 @@ class CellBasis:
     _cells: StepCells
     _lock: Any = field(default_factory=threading.RLock)
     _views: Dict[FrozenSet[str], Tuple[Any, Any]] = field(default_factory=dict)
+    _loaded: Dict[Tuple[Tuple[str, str], ...], Tuple[Any, Tuple[Any, ...]]] = (
+        field(default_factory=dict))
 
     @memo_property
     def analysis(self) -> Any:
@@ -1332,6 +1334,32 @@ class CellBasis:
         from backend.arch.layout.persistent import physical_artifacts
         with self._lock:
             return physical_artifacts(self.analysis)
+
+    def loaded(self, framework_binding: Any) -> Tuple[Any, Tuple[Any, ...]]:
+        """The resident walk and artifacts for the binding's selected loaders.
+
+        The base walk remains framework-free and shared with every reader. A
+        framework's resolved loader mapping keys only the derived format view,
+        so two frameworks cannot publish each other's resident scale grids.
+        """
+        from backend.arch.layout.persistent import physical_artifacts
+        base = self.analysis
+        loaders = (framework_binding.weight_loaders_for(base.program, base)
+                   if framework_binding is not None else {})
+        key = tuple(sorted(loaders.items()))
+        if not key:
+            return base, self.artifacts
+        with self._lock:
+            entry = self._loaded.get(key)
+            if entry is None:
+                analysis = base.with_load_formats(loaders)
+                if analysis.load_refusals:
+                    raise DeploymentRefusal(
+                        "; ".join(analysis.load_refusals),
+                        knobs=("tp_attention",))
+                entry = self._loaded[key] = (
+                    analysis, physical_artifacts(analysis))
+            return entry
 
     @memo_property
     def placement(self) -> Optional[StagePlacement]:
@@ -1510,7 +1538,8 @@ def _capacity_preparation(
             server_flags=knobs.framework_options),
     )
 
-    artifacts = all_artifacts = basis.artifacts
+    analysis, artifacts = basis.loaded(framework_binding)
+    all_artifacts = artifacts
     # Weights kept in host memory are not GPU weights: every per-rank weight
     # sum below — the stage profiles, the cache room — reads the device
     # artifacts alone. A weight's scale metadata goes with it.

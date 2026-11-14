@@ -255,14 +255,24 @@ class TestTheChildProcessIsTheOneThatGetsIt:
             assert env.get("LD_LIBRARY_PATH") == "/disk/compat", command[:4]
             assert env.get("SHARED") == "box-wide", command[:4]
 
+    @pytest.mark.parametrize("inherited", ["/parent/cuda/lib", None])
     def test_a_library_the_box_says_nothing_about_gets_no_overlay(
-            self, tmp_path, monkeypatch):
+            self, tmp_path, monkeypatch, inherited):
+        # No overlay means inherit the parent, including a CUDA image's
+        # library path; it does not mean erase that path from every child.
+        if inherited is None:
+            monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+        else:
+            monkeypatch.setenv("LD_LIBRARY_PATH", inherited)
         seen = self._run_all(
             tmp_path, monkeypatch,
             '[library_env.sglang]\nLD_LIBRARY_PATH = "/disk/compat"\n')
         assert seen, "run-all launched nothing"
         for command, env in seen:
-            assert "LD_LIBRARY_PATH" not in env, command[:4]
+            if inherited is None:
+                assert "LD_LIBRARY_PATH" not in env, command[:4]
+            else:
+                assert env.get("LD_LIBRARY_PATH") == inherited, command[:4]
 
 
 class TestTheQueueFindsTheProfileFromAnyWorkingDirectory:
