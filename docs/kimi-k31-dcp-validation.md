@@ -142,6 +142,10 @@ All raw requests, server logs, runtime configuration, profile attempts and
 scripts remain under `/tmp/scratch-space/k3-performance/benchmark/dcp-validation`.
 Full analytical rows remain under `/tmp/scratch-space/k3-performance/logs`.
 The repository keeps compact summaries rather than the large raw trace files.
+The [evidence index](evidence/README.md) records the persistent raw archive and
+checksums, including detailed continuous-trace spans and per-job calibration
+files. The [calibration reproduction guide](evidence/kimi-k31-b300-calibration/README.md)
+retains the scripts and generates new raw outputs outside the checkout.
 
 ```bash
 .venv313/bin/python scripts/compare_kimi_k31_dcp.py \

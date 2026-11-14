@@ -255,15 +255,13 @@ def runtime_framework_inputs(resolved: Any) -> dict[str, str]:
 
 
 def measure_case(config: dict[str, Any], deployment: dict[str, Any],
-                 resolved: Any = None) -> dict[str, Any]:
+                 resolved: Any) -> dict[str, Any]:
+    """Measure the supplied resolved snapshot under its declared runtime."""
     from backend.inference.capacity import estimate_pending
     from backend.inference.parallel_config import ParallelConfig
     from backend.inference.sol_closure import check_closure
 
-    if resolved is None:
-        from backend.arch.loader import get_default_loader
-        resolved = get_default_loader().match(config)
-    runtime_inputs = runtime_framework_inputs(resolved) if resolved is not None else {}
+    runtime_inputs = runtime_framework_inputs(resolved)
 
     # The walk, not the published estimate: a deployment that cannot hold
     # the weights publishes no step (`capacity.without_step`), and half the
@@ -333,6 +331,8 @@ def main() -> int:
         config = json.loads((snapshot_dir / name).read_text())["config"]
         model_id = Path(name).stem.replace("__", "/", 1)
         resolved = SpecLoader().match(config, model_id=model_id)
+        if resolved is None:
+            raise ValueError(f"No spec matches snapshot {name!r}")
         cases[name] = {
             deployment_name: measure_case(
                 config, DEPLOYMENTS[deployment_name], resolved)

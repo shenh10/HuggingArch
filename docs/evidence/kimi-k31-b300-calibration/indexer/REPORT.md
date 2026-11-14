@@ -12,13 +12,11 @@ Implementation adds an explicit `paged_byte_cache_inputs` operand declaration. T
 
 An initial production DCP8 planning dependency error was repaired before timing. The initial valid numerical kernel was then refused by the old provenance gate solely because uint8 packed storage was not expressible; that rejected run remains under `rejected-byte-gate`. No refused timing enters calibration. `PLAN.md` records the predeclared split and intermediate planning issue; final jobs use the repaired DCP8 planner. The planner's display string omits dcp, so `summary.json` records the explicit deployment.
 
-Reproduce from /tmp/scratch-space/k3-performance:
+Reproduction commands and the required output-directory setup are in the
+[calibration README](../README.md). Raw `jobs.json`, training/holdout CSVs,
+per-run environment dumps and test logs are archived outside Git at
+`/tmp/scratch-space/k3-performance/benchmark/pr-review-raw-evidence/kimi-k31-b300-calibration/indexer/`.
+The original `rejected-byte-gate` attempt remains in
+`/tmp/scratch-space/k3-performance/benchmark/indexer-calibration/rejected-byte-gate/`.
 
-```bash
-source env.sh
-CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/HuggingArch /opt/sglang/bin/python benchmark/indexer-calibration/run.py train
-CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/HuggingArch /opt/sglang/bin/python benchmark/indexer-calibration/run.py holdout
-PYTHONPATH=$PWD/HuggingArch /opt/sglang/bin/python benchmark/indexer-calibration/summarize.py
-```
-
-`runtime.json` and per-run environment files record packages, source hashes, driver and SM. The wheel reports DeepGEMM0.2.8 without an upstream commit; do not substitute a guessed commit. FlashInfer optional wheel mismatch warnings are retained but this provider calls DeepGEMM and does not compile FlashInfer kernels.
+The retained [runtime record](runtime.json) and archived per-run environment files record packages, source hashes, driver and SM. The wheel reports DeepGEMM0.2.8 without an upstream commit; do not substitute a guessed commit. FlashInfer optional wheel mismatch warnings are retained but this provider calls DeepGEMM and does not compile FlashInfer kernels.

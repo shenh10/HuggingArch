@@ -615,7 +615,7 @@ def law_columns(exprs: Mapping[str, sp.Expr], book: "LawBook"
     (a view op, a sampler that reads what is already resident). Stated
     once, where the law is built; every reader of a step asks the row
     (`StepTerm`)."""
-    return {"roofline_expr": {name: book.write(exprs.get(name, 1) if name == "comm_dependency_rounds" else exprs[name])
+    return {"roofline_expr": {name: book.write(exprs[name])
                               for name in EXPR_NAMES},
             "zero_cost": all(exprs[name] == 0
                              for name in ("flops", "access", "comm_payload"))}

@@ -93,7 +93,8 @@
         }
       },
       "outstanding": [],
-      "fixture_change": "Warm-cache test uses fixed 3/4 reported L2 capacity; threshold 1.1 unchanged; no production timing change."
+      "fixture_change": "Warm-cache test uses fixed 3/4 reported L2 capacity; threshold 1.1 unchanged; no production timing change.",
+      "source_commit": "43d0cf9"
     },
     "final_service_eval_boundaries": {
       "passed": 17
@@ -102,6 +103,15 @@
       "passed": 3,
       "evidence": "kimi-k31-b300-timing-fixture.json",
       "production_timing_changed": false
+    },
+    "review_followup": {
+      "scope": "Layout directory, runtime profile, eval/service boundaries; targeted serving/row-law/corpus-framework checks. Prior full-CI coverage belongs to 43d0cf9.",
+      "layout_and_boundaries_passed": 469,
+      "subtests_passed": 98,
+      "targeted_contracts_passed": 11,
+      "row_fixture_compatibility_passed": 52,
+      "backend_ruff": "passed",
+      "diff_check": "passed"
     }
   },
   "corpus_new_model": {

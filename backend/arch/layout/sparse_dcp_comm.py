@@ -61,8 +61,6 @@ def sparse_dcp_finalize(mat: Any, record: Any):
     targets = mat._targets_for_source(exit_uid, projected.uid, 'out')
     semantic = rewrite_flow_shape(mat, targets)
     expected = (batch, exact_div(heads, plan.degree), queries, width)
-    if len(semantic) != len(expected):
-        raise ValueError('sparse DCP local output must retain four attention axes')
     for got, wanted in zip(semantic, expected, strict=True):
         require_equal(got, wanted, lambda at: ValueError('sparse DCP local output geometry mismatch'))
     key = ('sparse_dcp', value.group, projected.uid)

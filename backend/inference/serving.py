@@ -356,7 +356,8 @@ def build_serving_layers(cell: Any, *,
     required_framework = (analysis.program.required_runtime_framework
                           if analysis.rule.sparse_dcp.storage_plans else None)
     if (required_framework is not None
-            and getattr(framework_binding, "framework", None) != required_framework):
+            and (framework_binding is None
+                 or framework_binding.framework != required_framework)):
         raise NotImplementedError(
             f"Sparse DCP runtime plans require the {required_framework} framework profile; "
             "reference and other framework profiles cannot reuse SGLang allocation and communication contracts")

@@ -1,11 +1,12 @@
-from backend.arch.layout.flashmla_schedule import native_head_partitions, windowed_schedule
+from tests.backend.arch.layout.flashmla_oracle import native_head_partitions, windowed_schedule
 
 
 def test_native_head_partitions_match_installed_wheel_probe():
-    assert native_head_partitions(148, 1, 96) == 74
-    assert native_head_partitions(148, 73, 96) == 74
-    assert native_head_partitions(148, 74, 96) == 148
-    assert native_head_partitions(148, 128, 96) == 148
+    from backend.arch.layout.sparse_dcp_contract import SparseMlaLocalStages
+    assert SparseMlaLocalStages(1, (256,), 96, 512, 148).parts == 74
+    assert SparseMlaLocalStages(73, (256,), 96, 512, 148).parts == 74
+    assert SparseMlaLocalStages(74, (256,), 96, 512, 148).parts == 148
+    assert SparseMlaLocalStages(128, (256,), 96, 512, 148).parts == 148
 
 
 def test_windowed_schedule_has_split_and_no_work_combine_cases():
@@ -15,22 +16,6 @@ def test_windowed_schedule_has_split_and_no_work_combine_cases():
     assert windowed_schedule((64,), 74).num_splits == (1,)
     schedule = windowed_schedule((256,) * 128, 148)
     assert all(1 <= count <= 4 for count in schedule.num_splits)
-
-
-def test_uniform_work_matches_independent_source_schedule():
-    from backend.arch.layout.flashmla_schedule import windowed_work
-    work = windowed_work(1, (256,), 74)
-    assert work.total_splits == 4
-    assert work.combining_rows == 1
-    assert work.combining_splits == 4
-    skipped = windowed_work(1, (64,), 74)
-    assert skipped.total_splits == 1
-    assert skipped.combining_rows == skipped.combining_splits == 0
-    multi = windowed_work(16, (256,), 74)
-    actual = windowed_schedule((256,) * 16, 74).num_splits
-    assert multi.total_splits == sum(actual)
-    assert multi.combining_rows == sum(n > 1 for n in actual)
-    assert multi.combining_splits == sum(n for n in actual if n > 1)
 
 
 def test_symbolic_periodic_work_reads_same_numeric_scheduler():

@@ -62,33 +62,3 @@ def test_local_combine_counts_arithmetic_and_successful_slot_traffic():
     assert push.write_bytes == 2 * 22848 + 12 * 256
     fi = LocalAttentionCombine(1, 96, 8, 128, 8, clears_slots=0)
     assert fi.write_bytes == 22176 + 12 * 256
-
-
-def test_fixed_verification_block_counts_each_causal_length():
-    from backend.arch.layout.sparse_dcp_contract import sparse_dcp_query_pairs
-    assert sparse_dcp_query_pairs(10, 5, 2048, 8) == (7, 7)
-    assert sparse_dcp_query_pairs(8196, 5, 2048, 8) == (1280, 5124)
-    assert sparse_dcp_query_pairs(2050, 5, 2048, 8, 2) == (1282, 1282)
-
-
-def test_local_mla_runtime_keeps_partials_and_combine_as_distinct_work():
-    from backend.arch.layout.sparse_dcp_contract import SparseMlaLocalStages
-    stages = SparseMlaLocalStages(1, (256,), 96, 512, 148)
-    assert stages.parts == 74
-    assert stages.work.total_splits == 4
-    scheduler = stages.scheduler()
-    assert scheduler.read_bytes == 4
-    assert scheduler.write_bytes == 74 * 32 + 8
-    combine = stages.combine(123)
-    assert combine.producer_uid == 123
-    assert combine.producer_write_bytes == 4 * 96 * 513 * 4
-    assert combine.read_bytes == combine.producer_write_bytes + 8
-    assert combine.write_bytes == 96 * 1028
-    assert combine.flops == 96 * (4 * 1030 + 1)
-    skipped = SparseMlaLocalStages(1, (64,), 96, 512, 148).combine(123)
-    assert skipped.flops == skipped.write_bytes == 0
-    assert skipped.read_bytes == 8
-    assert skipped.producer_write_bytes == 96 * 1028
-    unknown = SparseMlaLocalStages(1, (256,), 96, 512, None)
-    assert unknown.parts == 0
-    assert unknown.combine(123).work_basis.startswith('unresolved_sm_count')

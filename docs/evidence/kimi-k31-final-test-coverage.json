@@ -20,5 +20,6 @@
     }
   },
   "outstanding": [],
-  "fixture_change": "Warm-cache test uses fixed 3/4 reported L2 capacity; threshold 1.1 unchanged; no production timing change."
+  "fixture_change": "Warm-cache test uses fixed 3/4 reported L2 capacity; threshold 1.1 unchanged; no production timing change.",
+  "source_commit": "43d0cf9"
 }

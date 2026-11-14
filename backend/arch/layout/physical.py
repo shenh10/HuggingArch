@@ -71,8 +71,8 @@ def physical_axis_partition_audit(
         if same_law(extent, 0):
             # An axis the model leaves empty partitions nothing.
             continue
-        plans = getattr(sharding, "sparse_dcp", None)
-        if world.label == "dcp" and plans is not None and plans.plans:
+        plans = sharding.sparse_dcp
+        if world.label == "dcp" and plans.plans:
             # Striped ownership permits a final partial shard. This audit
             # reports the owner count, not an equal contiguous partition.
             out.append(AxisPartitionAudit(
@@ -853,8 +853,8 @@ def local_definitions(definitions: Optional[Mapping[str, Any]], *,
                 # Explicit runtime geometry may be a bounded, nonuniform
                 # ownership law rather than a constant tensor partition.
                 # Publish that law in workload names, not a fake fixed cut.
-                plans = getattr(analysis.rule, "sparse_dcp", None)
-                plan = plans.for_node(node) if plans is not None else None
+                plan = (None if analysis.rule.is_trivial else
+                        analysis.rule.sparse_dcp.for_node(node))
                 if plan is not None and plan.decode:
                     law = exact(carried[name])
                     out[name] = Definition(

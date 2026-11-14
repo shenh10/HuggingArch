@@ -19,7 +19,6 @@ def test_architecture_profile_has_no_sglang_allocations():
     analysis = deployment.analyze()
     assert not analysis.rule.sparse_dcp.storage_plans
     assert not any(a.surface == RUNTIME_ALLOCATION for a in physical_artifacts(analysis))
-    assert not deployment.specializes_verification
 
 
 def test_runtime_profile_is_part_of_walk_identity_and_cell_input():

@@ -33,8 +33,6 @@ class SparseDcpPlans:
         runtime_profile = RuntimeProfile(runtime_profile)
         if runtime_profile == RuntimeProfile.ARCHITECTURE:
             return cls()
-        if program is None or parallel is None:
-            return cls()
         plans = []
         storage_plans = []
         for component in program.sparse_dcp_components:

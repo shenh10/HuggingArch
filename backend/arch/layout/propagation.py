@@ -259,8 +259,12 @@ class LayoutPropagation(Rule):
     def __post_init__(self) -> None:
         if self.sparse_dcp is None:
             from .sparse_dcp import SparseDcpPlans
-            object.__setattr__(self, "sparse_dcp", SparseDcpPlans.of(
-                self.program, self.parallel, self.phase, self.runtime_profile))
+            # An unbound rule is valid for isolated operator walks. Program
+            # runtime plans are constructed only at the bound-rule boundary.
+            plans = (SparseDcpPlans() if self.program is None else
+                     SparseDcpPlans.of(self.program, self.parallel, self.phase,
+                                       self.runtime_profile))
+            object.__setattr__(self, "sparse_dcp", plans)
         if self.attention is None:
             object.__setattr__(
                 self, "attention", AttentionPlan.from_rule(self))
