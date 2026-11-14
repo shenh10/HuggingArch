@@ -66,5 +66,3 @@ def windowed_schedule(local_lengths: tuple[int, ...], parts: int, *,
     counts = tuple(1 + max((prefix[r + 1] - 1 - (overhead if snapping else 0)) // window
                            - (prefix[r] + overhead) // window, 0) for r in range(rows))
     return WindowedSchedule(parts, counts, snapping, cost(snap if snapping else plain))
-
-
