@@ -30,6 +30,7 @@ Physical compute, storage, cache and communication values are derived from that
 """
 
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
 
 import threading
 from collections import OrderedDict
@@ -94,6 +95,8 @@ class StepEvaluation:
     #: The deployment's precision profile (`precision.PrecisionProfile`);
     #: None is as shipped.
     precision: Any = None
+    dcp_selected_load_factor: Any = 1
+    dcp_failed_owners: Any = 0
     #: An encode step's encoder stack and the media each request carries
     #: (`Workload.media`); a language-model step names neither.
     stack: Optional[str] = None
@@ -112,11 +115,12 @@ class StepEvaluation:
         from backend.arch.eval.program import Program
         from backend.arch.eval.transforms import ENCODE, Deployment
 
+        runtime_profile = self.cell.runtime_profile if self.cell is not None else RuntimeProfile.DECLARED
         if self.phase == ENCODE:
             # The encoder's own step: the batch and its media, nothing of
             # the language model's (`Deployment.binding`).
             deployment = Deployment(
-                Program.of(self.spec), config=self.parallel,
+                Program.of(self.spec), config=self.parallel, runtime_profile=runtime_profile,
             ).at(batch=self.batch, media=self.media).during(
                 ENCODE, stack=self.stack)
             if self.precision is not None:
@@ -124,7 +128,7 @@ class StepEvaluation:
             return deployment
         deployment = Deployment(
             Program.of(self.spec),
-            config=self.parallel,
+            config=self.parallel, runtime_profile=runtime_profile,
         ).at(
             batch=self.batch,
             input_tokens=self.input_tokens,
@@ -132,6 +136,8 @@ class StepEvaluation:
             s_prefix_cached=self.s_prefix_cached,
             s_verify=self.s_verify,
             ep_load_factor=self.ep_load_factor,
+            dcp_selected_load_factor=self.dcp_selected_load_factor,
+            dcp_failed_owners=self.dcp_failed_owners,
             logit_positions=self.logit_positions,
         )
         if self.phase != "prefill":
@@ -261,6 +267,9 @@ class Cell:
     #: that does not walks its verify width as the number 1
     #: (`Workload.symbolic`), so the two never share a walk.
     speculative: bool = False
+    # Sparse DCP verification reads sum causal rows at this fixed width.
+    verify_width: Optional[int] = None
+    runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED
     _walk: Optional[Any] = field(default=None, init=False, repr=False)
     #: The spec rebound to the forms the phase runs
     #: (`rebind_decode_variants`), as a one-tuple once asked (its content
@@ -329,11 +338,20 @@ class Cell:
                         f"{'do' if self.speculative else 'do not'} speculate")
                 deployment = step.as_deployment()
                 workload, _point = deployment.workload.symbolic()
+                if self.verify_width is not None:
+                    workload = replace(workload, s_verify=self.verify_width)
                 if self.phase != ENCODE:
                     workload = replace(
                         workload, logit_positions=sampled_logit_positions(
                             self.phase, workload.s_verify))
-                self._walk = replace(deployment, workload=workload).analyze()
+                compiled = replace(deployment, workload=workload)
+                if self.verify_width is not None:
+                    # This is already a symbolic cell, specialized only in
+                    # verify width. Reading it at that width here would erase
+                    # its admission guard before other points can check it.
+                    self._walk = compiled._walk(compiled.binding())
+                else:
+                    self._walk = compiled.analyze()
             return self._walk
 
     def physical(self) -> Any:
@@ -395,14 +413,15 @@ class StepCells:
     step and its prefill step are one walk — or a sweep's, across all its
     points."""
 
-    def __init__(self) -> None:
+    def __init__(self, runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED) -> None:
+        self.runtime_profile = RuntimeProfile(runtime_profile)
         self._cells: List[Cell] = []
         self._lock = threading.Lock()
 
     def cell(self, spec: Any, parallel: Any, *, phase: str,
              precision: Any = None, stack: Optional[str] = None,
              media: Optional[Mapping[str, Mapping[str, int]]] = None,
-             speculative: bool = False) -> Cell:
+             speculative: bool = False, verify_width: Optional[int] = None) -> Cell:
         """The cell of these, one registry-wide: the `CELLS_KEPT` most
         recently asked are kept."""
         media = dict(media or {})
@@ -411,12 +430,14 @@ class StepCells:
                 if (cell.spec is spec and cell.parallel == parallel
                         and cell.phase == phase and cell.precision == precision
                         and cell.stack == stack and cell.media == media
-                        and cell.speculative == speculative):
+                        and cell.speculative == speculative
+                        and cell.verify_width == verify_width):
                     self._cells.append(self._cells.pop(i))
                     return cell
             cell = Cell(spec=spec, parallel=parallel, phase=phase,
                         precision=precision, stack=stack, media=media,
-                        speculative=speculative)
+                        speculative=speculative, verify_width=verify_width,
+                        runtime_profile=self.runtime_profile)
             self._cells.append(cell)
             del self._cells[:-CELLS_KEPT]
             return cell
@@ -426,6 +447,8 @@ def evaluate_step(resolved_spec: Any, parallel: Any, *, phase: str, batch: int,
                   input_tokens: int, output_tokens: int,
                   s_prefix_cached: int = 0, s_verify: int = 1,
                   ep_load_factor: Any = 1,
+                  dcp_selected_load_factor: Any = 1,
+                  dcp_failed_owners: Any = 0,
                   precision: Any = None,
                   cells: Optional[StepCells] = None,
                   ) -> StepEvaluation:
@@ -453,9 +476,16 @@ def evaluate_step(resolved_spec: Any, parallel: Any, *, phase: str, batch: int,
         raise ValueError(refusal)
     from backend.arch.eval.transforms import Workload
     s_verify = int(s_verify or 1)
-    cell = (cells if cells is not None else StepCells()).cell(
+    fixed_verify = None
+    cells = cells if cells is not None else StepCells()
+    if cells.runtime_profile == RuntimeProfile.DECLARED and parallel.dcp > 1 and phase == "decode":
+        from backend.arch.eval.program import Program
+        if Program.of(resolved_spec).sparse_dcp_components:
+            fixed_verify = s_verify
+    cell = cells.cell(
         resolved_spec, parallel, phase=phase, precision=precision,
-        speculative=not Workload.walked_as_number("s_verify", s_verify))
+        speculative=not Workload.walked_as_number("s_verify", s_verify),
+        verify_width=fixed_verify)
     # vLLM / SGLang / TRT-LLM all decode through the absorbed MLA form
     # (kv_b_proj folded into the Q- and O-side per-head matmuls, cache held
     # in latent d_kv_lora+d_qk_rope), and prefill a sparse (top-k) MLA the
@@ -479,6 +509,8 @@ def evaluate_step(resolved_spec: Any, parallel: Any, *, phase: str, batch: int,
         s_prefix_cached=int(s_prefix_cached),
         s_verify=int(s_verify or 1),
         ep_load_factor=ep_load_factor,
+        dcp_selected_load_factor=dcp_selected_load_factor,
+        dcp_failed_owners=dcp_failed_owners,
         dp_attention=max(1, int(getattr(parallel, "dp_attention", 1) or 1)),
         logit_positions=sampled_logit_positions(phase, s_verify),
         mla_absorbed=mla_absorbed,

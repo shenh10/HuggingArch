@@ -2069,6 +2069,7 @@ class Evaluator:
             walk.kernel_shapes[node.uid] = Shape(
                 out=geometry.output,
                 ins=tuple(axes or () for axes in geometry.inputs),
+                pair_share=geometry.pair_share,
             )
         for index, state in enumerate(kernel_required):
             walk.input_states[(node.uid, index)] = state

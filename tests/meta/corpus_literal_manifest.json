@@ -862,7 +862,8 @@
   {
     "identifiers": [
       "XiaomiMiMo__MiMo-V2.6-Pro-RL",
-      "moonshotai__Kimi-K3"
+      "moonshotai__Kimi-K3",
+      "moonshotai__Kimi-K3.1-Pro"
     ],
     "kind": "curated",
     "module": "tests/backend/inference/test_precision_launch_selection.py",

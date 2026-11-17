@@ -122,6 +122,12 @@ required_fields: [num_bits, strategy, type, symmetric, format]
 optional_fields: [group_size, block_h, block_w]
 valid_status: [compressed, frozen]
 
+# Checkpoints emitted through compressed-tensors whose `format` names a
+# dedicated packing layout (e.g. Kimi-K3 / Kimi-K3.1 `mxfp4-pack-quantized`:
+# U8 2/byte + UE8M0 scales, not I32 8/word) resolve directly to that scheme.
+delegates_to:
+  - { field: format, equals: mxfp4-pack-quantized, scheme: mxfp4-pack-quantized }
+
 # Default values for scheme-config fields per_role can omit. These match
 # `compressed_tensors.QuantizationScheme` upstream defaults.
 default_fields:

@@ -42,6 +42,9 @@ def deployment_assumptions(
     ep_load_factor: float = 1.0,
     has_dispatch_zone: bool = False,
     joined_streams: Sequence[str] = (),
+    sparse_dcp: bool = False,
+    dcp_selected_load_factor: float = 1,
+    dcp_failed_owners: int = 0,
 ) -> List[Dict[str, Any]]:
     """What this deployment assumed that its inputs did not determine.
 
@@ -90,6 +93,37 @@ def deployment_assumptions(
                 f"a number nobody measured would read like one somebody did."
             ),
         })
+
+    if sparse_dcp:
+        out.extend([
+            {
+                "id": "sparse_dcp_selected_ownership",
+                "knob": "dcp_selected_load_factor",
+                "value": float(dcp_selected_load_factor),
+                "effect": "optimistic" if dcp_selected_load_factor == 1 else "scenario",
+                "text": "Selected-position max/mean ratio is an explicit scenario, not a measured distribution. "
+                        "The busiest rank is capped by its striped resident context; padded top-k slots remain 2048.",
+            },
+            {
+                "id": "sparse_dcp_candidate_fallback",
+                "knob": "dcp_failed_owners",
+                "value": int(dcp_failed_owners),
+                "effect": "optimistic" if dcp_failed_owners == 0 else "scenario",
+                "text": "Failed candidate-certificate owners per query are assumed, not observed. "
+                        "Fallback prices the sender hotspot and a second dependent exchange stage; "
+                        "polling and transport framing are excluded.",
+            },
+            {
+                "id": "sparse_dcp_runtime_profile",
+                "knob": None,
+                "value": "sglang_fi_a2a_push1536",
+                "effect": "scope",
+                "text": "TP8/DCP8, replicated Q, BF16 projected partials, prewarmed V projection, "
+                        "no LoRA, default 384-candidate merge and registered push capacity 1536 query rows. "
+                        "This is target-step timing, not DFLASH acceptance or server scheduling. "
+                        "Process-wide communication workspaces and CUDA graph pools are outside resident weight accounting.",
+            },
+        ])
 
     if joined_streams:
         names = ", ".join(f"`{name}`" for name in joined_streams)

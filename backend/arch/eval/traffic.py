@@ -327,6 +327,8 @@ class TrafficGeometry:
     #: a fact of `shapes`' program: replacing `shapes` replaces it too.
     cache_view_frame_divisor: Mapping[int, Extent] = field(
         default_factory=dict)
+    # Runtime operand replicas can differ from checkpoint alias ownership.
+    read_aliases: Optional[Mapping[int, Mapping[int, Any]]] = None
 
     @staticmethod
     def _axis_identity(axis: Any, *, tracked_only: bool = False) -> Optional[str]:
@@ -1406,7 +1408,8 @@ def derive(analysis: Any, *,
     launch_of = {member: program.by_uid(fused)
                  for fused, members in origins.items() for member in members
                  if program.by_uid(fused) is not None}
-    read_aliases = program.read_aliases or {}
+    read_aliases = (geometry.read_aliases if geometry is not None and geometry.read_aliases is not None
+                    else program.read_aliases or {})
     borrowed_by = _borrowed_sources(program)
     # Each walked matmul whose weight is held wider than its activation —
     # the walk's own layer (`Analysis.weight_promotions`). Read for the

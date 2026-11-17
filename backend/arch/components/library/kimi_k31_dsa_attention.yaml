@@ -1,0 +1,68 @@
+# SGLang 1b2870d3: models/kimi_k3.py KimiK3MLAAttention (skip_rope=True,
+# g_proj sigmoid gate), models/deepseek_v2.py DeepseekV2AttentionMLA,
+# layers/attention/dsa_backend.py (flashmla_kv absorbed prefill and decode).
+# DCP1 eager short prefill may select MHA_ONE_SHOT instead; use the absorbed
+# profile (dense-attention threshold 0) or context >2048. See the support doc.
+# No rotary, pooling, sink, or shared top-k. kv_b_proj remains one stored
+# weight, consumed as W_UK and W_UV per-head GEMMs on both serving phases.
+role: attention
+description: "Kimi-K3.1 SGLang sparse absorbed MLA: NoPE, independent indexer, top-2048, sigmoid output gate. Both prefill and decode."
+attn_variant: DSA
+sparse_dcp:
+  backend: sglang_fi_a2a
+  query_projection: q_b_proj
+  absorbed_query: q_absorbed_nope
+  stored_kv_projection: kv_b_proj
+  value_projection: v_absorbed
+  score: qk_score
+  softmax: softmax
+  apply: attn_apply_latent
+  indexer_logits: indexer.logits
+  indexer_topk: indexer.topk
+cache:
+  family: MLA
+  entries:
+    - { node: kv_a_layernorm, kind: latent }
+    - { node: k_pe_slice, kind: rope_key }
+    - { node: indexer, kind: index_key }
+graph:
+  # --- Q path: LoRA down/up, unchanged by absorption ---
+  q_a_proj:           { op: linear, in: x, dims: { in: d_model, out: d_q_lora }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  q_a_layernorm:      { op: rmsnorm, in: q_a_proj, dim: d_q_lora, weight_axes: [{ replicated: true }] }
+  q_b_proj:           { op: linear, in: q_a_layernorm, dims: { in: d_q_lora, out: "n_heads * (d_qk_nope + d_qk_rope)" }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }
+  q_split_heads:      { op: head_split, in: q_b_proj, dims: { n_heads: n_heads, d_head: "d_qk_nope + d_qk_rope" } }
+  q_nope_slice:       { op: slice, in: q_split_heads, dims: { in: "d_qk_nope + d_qk_rope", out: d_qk_nope } }
+  q_pe_slice:         { op: slice, in: q_split_heads, dims: { in: "d_qk_nope + d_qk_rope", out: d_qk_rope } }
+  # W_uk per-head, d_qk_nope → d_kv_lora: the K-decoder half of kv_b_proj.
+  kv_b_proj:          { op: parameter_tensor, shape: ["n_heads * (d_qk_nope + d_v_head)", d_kv_lora], tensor_suffix: { weight: .weight }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }   # the stored kv_b_proj; the per-head GEMMs at its address (`module: kv_b_proj`) run it
+  q_absorbed_nope:    { op: per_head_linear, module: kv_b_proj, in: q_nope_slice, dims: { n_heads: n_heads, in: d_qk_nope, out: d_kv_lora }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }, { replicated: true }] }
+  q_concat:           { op: concat, in: [q_absorbed_nope, q_pe_slice], dims: { in_a: d_kv_lora, in_b: d_qk_rope, out: "d_kv_lora + d_qk_rope" } }
+
+  # --- Latent KV (head-shared): the cached bytes ---
+  kv_a_proj_with_mqa: { op: linear, in: x, dims: { in: d_model, out: "d_kv_lora + d_qk_rope" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  kv_latent_slice:    { op: slice, in: kv_a_proj_with_mqa, dims: { in: "d_kv_lora + d_qk_rope", out: d_kv_lora } }
+  k_pe_slice:         { op: slice, in: kv_a_proj_with_mqa, dims: { in: "d_kv_lora + d_qk_rope", out: d_qk_rope } }
+  kv_a_layernorm:     { op: rmsnorm, in: kv_latent_slice, dim: d_kv_lora, weight_axes: [{ replicated: true }] }   # K_latent = V_latent (shared)
+  # One KV head: the cached latent and RoPE key, joined once per position
+  # (the 576-wide entry the sparse/dense MLA kernel reads, `num_heads_k=1`),
+  # then shown to every query head as a zero-byte view. Joining before the
+  # broadcast keeps one copy of each cached position, not n_heads.
+  kv_concat:          { op: concat, in: [kv_a_layernorm, k_pe_slice], dims: { in_a: d_kv_lora, in_b: d_qk_rope, out: "d_kv_lora + d_qk_rope" } }   # (B, s_kv, d_kv_lora+d_qk_rope)
+  k_concat:           { op: head_broadcast, in: kv_concat, dims: { n_heads: n_heads } }   # (B, n_heads, s_kv, d_kv_lora+d_qk_rope), a view
+  k_latent_broadcast: { op: head_broadcast, in: kv_a_layernorm, dims: { n_heads: n_heads } }   # V == the latent, a view
+
+  indexer: { op: kimi_k31_indexer, in: [x, q_a_layernorm] }
+
+  # --- Attention in latent space (contraction d_kv_lora + d_qk_rope) ---
+  qk_score:           { op: dsa_attention_score, in: [q_concat, k_concat, indexer], dims: { n_heads: n_heads, d_head: "d_kv_lora + d_qk_rope", k: n_topk_keys } }
+  softmax:            { op: dsa_softmax, in: qk_score, dims: { n_heads: n_heads, k: n_topk_keys } }
+  attn_apply_latent:  { op: dsa_attention_apply, in: [softmax, k_latent_broadcast], dims: { n_heads: n_heads, d_head: d_kv_lora, k: n_topk_keys } }
+
+  # --- O side: absorb W_uv per-head (d_kv_lora → d_v_head), merge, gate, project ---
+  v_absorbed:         { op: per_head_linear, module: kv_b_proj, in: attn_apply_latent, dims: { n_heads: n_heads, in: d_kv_lora, out: d_v_head }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }, { replicated: true }] }
+  o_merge_heads:      { op: head_merge, in: v_absorbed, dims: { n_heads: n_heads, d_head: d_v_head } }
+  g_proj:             { op: linear, in: x, dims: { in: d_model, out: "n_heads * d_v_head" }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }
+  g_act:              { op: sigmoid, in: g_proj, dim: "n_heads * d_v_head" }
+  o_gated:            { op: mul, in: [o_merge_heads, g_act], dim: "n_heads * d_v_head" }
+  o_proj:             { op: linear, in: o_gated, dims: { in: "n_heads * d_v_head", out: d_model }, weight_axes: [{ replicated: true }, { world: attention, parts: n_heads, fit: replica_cells }] }
+outputs: [o_proj]

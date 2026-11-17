@@ -52,6 +52,8 @@ from fractions import Fraction
 
 from sympy.printing.lambdarepr import LambdaPrinter
 
+from backend.arch.runtime_laws import RUNTIME_LAW_FUNCTIONS
+
 from backend.arch.law_text import read_walk_law
 
 from . import lookup as _lookup
@@ -249,6 +251,9 @@ class _ExactPrinter(LambdaPrinter):
 
     _default_settings: ClassVar[dict] = {**LambdaPrinter._default_settings, "order": "none"}
 
+    def _print_SparseWindow(self, expr: Any) -> str:
+        return "SparseWindow(" + ", ".join(self._print(arg) for arg in expr.args) + ")"
+
     def _print_Rational(self, expr: sp.Rational) -> str:
         return f"Fraction({expr.p}, {expr.q})"
 
@@ -310,7 +315,7 @@ def compile_law(exprs: Sequence[Any], names: Tuple[str, ...]
                          f"(it binds {sorted(names)})")
     return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
                        list(exprs),
-                       modules=[{"math": math, "Fraction": Fraction,
+                       modules=[{**RUNTIME_LAW_FUNCTIONS, "math": math, "Fraction": Fraction,
                                  "_law_div": exact_div}],
                        printer=_ExactPrinter,
                        cse=_each_law_once)
@@ -348,7 +353,7 @@ def compile_law_float(exprs: Sequence[Any], names: Tuple[str, ...]
     by_name = {sym.name: sym for expr in exprs for sym in expr.free_symbols}
     return sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
                        list(exprs),
-                       modules=[{"math": math, "_law_div": lambda a, b: a / b}],
+                       modules=[{**RUNTIME_LAW_FUNCTIONS, "math": math, "_law_div": lambda a, b: a / b}],
                        printer=_FloatPrinter,
                        cse=_eachLawInOrder)
 
@@ -418,7 +423,9 @@ def compile_law_vector(exprs: Sequence[Any], names: Tuple[str, ...]
     by_name = {sym.name: sym for expr in exprs for sym in expr.free_symbols}
     program = sp.lambdify([by_name.get(n, sp.Symbol(n)) for n in names],
                           list(exprs),
-                          modules=[{"np": np, "math": np,
+                          modules=[{**{name: np.vectorize(fn, otypes=["int64"])
+                                       for name, fn in RUNTIME_LAW_FUNCTIONS.items()},
+                                    "np": np, "math": np,
                                     "_law_div": lambda a, b: a / b}],
                           printer=_VectorPrinter,
                           cse=_eachLawInOrder)

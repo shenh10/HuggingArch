@@ -35,6 +35,24 @@ GOLDEN = Path(__file__).resolve().parents[2] / "golden" / "payload_fields.json"
 
 #: Paths the payload gained on purpose: `{path: why}`.
 ADDED = {
+    "gpu.sm_count": "observed scheduler hardware geometry, unknown when the sheet has no measurement",
+    "parallel.dcp": "the explicit decode-context parallel degree of the reported deployment",
+    "per_op_timing[*].point_law.point.dcp_failed_owners": "the declared candidate-certificate fallback scenario used to reread this law",
+    "per_op_timing[*].point_law.point.rho_dcp": "the declared selected-position ownership scenario used to reread this law",
+    "per_op_timing_decode[*].point_law.point.dcp_failed_owners": "the decode law's candidate-certificate fallback scenario",
+    "per_op_timing_decode[*].point_law.point.rho_dcp": "the decode law's selected-position ownership scenario",
+    "per_op_timing[*].roofline_expr.comm_dependency_rounds": "serial transfers inside one runtime kernel; independent of kernel launch count",
+    "per_op_timing_decode[*].roofline_expr.comm_dependency_rounds": "decode serial transfers inside one runtime kernel",
+    "phases.decode.flops_by_module[*].flops_law.point.dcp_failed_owners": "complete workload point accompanying a module arithmetic law",
+    "phases.decode.flops_by_module[*].flops_law.point.rho_dcp": "selected-position workload point accompanying a module arithmetic law",
+    "phases.decode.flops_by_module[*].shape_law.point.dcp_failed_owners": "complete workload point accompanying a module shape law",
+    "phases.decode.flops_by_module[*].shape_law.point.rho_dcp": "selected-position workload point accompanying a module shape law",
+    "phases.prefill.flops_by_module[*].flops_law.point.dcp_failed_owners": "shared workload point, retaining fallback scenario identity across phases",
+    "phases.prefill.flops_by_module[*].flops_law.point.rho_dcp": "shared workload point, retaining selected-position scenario identity across phases",
+    "phases.prefill.flops_by_module[*].shape_law.point.dcp_failed_owners": "shared workload point accompanying the prefill shape law",
+    "phases.prefill.flops_by_module[*].shape_law.point.rho_dcp": "shared workload point accompanying the prefill shape law",
+    "phases.decode.flops_by_module[*].roofline_expr.comm_dependency_rounds": "module row's serial-transfer law, without extra kernel launches",
+    "phases.prefill.flops_by_module[*].roofline_expr.comm_dependency_rounds": "module row's serial-transfer law, defaulting to one for ordinary collectives",
     "phases.decode.throughput.concurrent_requests":
         "the requests the cluster decodes at once (B per group × groups), "
         "the dimension a decode Pareto frontier is held at "

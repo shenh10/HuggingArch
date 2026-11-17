@@ -98,7 +98,7 @@ class CollectiveAlgorithm:
                         symbol: str = "N") -> str:
         """`factor` as text: over `symbol` when `world` is None, substituted
         otherwise (`7` for a one-shot of 8, `2*7/8`, `7/8`)."""
-        if self.name == NCCL:
+        if self.name in (NCCL, "direct_exchange"):
             return ring_factor_symbolic(op, world, symbol=symbol)
         less = f"({symbol}-1)" if world is None else f"{int(world) - 1}"
         over = symbol if world is None else f"{int(world)}"
@@ -127,6 +127,12 @@ NCCL = "nccl"
 #:   collective.
 ALGORITHMS: Dict[str, CollectiveAlgorithm] = {
     a.name: a for a in (
+        # Sparse DCP's peer multicast/push kernels exchange directly within
+        # one NVLink domain. Recipient-volume accounting, one transfer stage;
+        # synchronization polling and local merge work are separate costs.
+        CollectiveAlgorithm("direct_exchange", "nvlink",
+                            lambda op, n: 1 if n > 1 else 0,
+                            lambda op, n: ring_factor(op, n) if n > 1 else 0.0),
         CollectiveAlgorithm("one_shot", "nvlink",
                             lambda op, n: 1 if n > 1 else 0,
                             lambda op, n: float(n - 1) if n > 1 else 0.0),

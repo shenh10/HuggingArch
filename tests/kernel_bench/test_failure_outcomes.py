@@ -397,8 +397,34 @@ def test_a_kernel_with_no_body_is_declared_disabled_not_left_to_raise():
     `error` row on every cell it is offered."""
     from kernel_bench.providers import all_providers
     by_impl = {p.kernel_impl: p for p in all_providers()}
-    for impl in ("deepgemm_fp8_paged_mqa_logits", "deepgemm_fp8_fp4_mega_moe"):
+    for impl in ("deepgemm_fp8_fp4_mega_moe",):
         assert by_impl[impl].disabled_reason, impl
+
+
+def test_implemented_paged_indexer_is_offered_at_its_audited_geometry():
+    """The paged indexer has a real body; MegaMoE remains a stub.
+
+    Layout and numerical checks of this body live in test_paged_indexer_build.
+    This regression protects the catalog/driver contract from disabling the
+    implementation just to keep an obsolete stub fixture green.
+    """
+    from kernel_bench.invocation import Invocation
+    from kernel_bench.providers import all_providers
+    from kernel_bench.providers.indexer import _deepgemm_indexer_build
+    provider = next(p for p in all_providers()
+                    if p.kernel_impl == "deepgemm_fp8_paged_mqa_logits")
+    inv = Invocation(signature="indexer_logits", op="indexer_logits",
+                     dims={"B": 1, "s_query": 1, "s_kv": 257,
+                           "n_indexer_heads": 32, "d_indexer_head": 128,
+                           "kv_block_size": 64},
+                     dtype_env={"activation": "fp8_e4m3", "kv": "fp8_e4m3",
+                                "kv_format": "fp8_group128", "output": "fp32"},
+                     phase="decode", tp=8)
+    env = Env("2.14.1", True, "NVIDIA B300 SXM6 AC", "B300", 8000,
+              sm="sm_103", libs={"deep_gemm": "0.2.8"}, library="deepgemm")
+    assert not provider.disabled_reason
+    assert provider.build is _deepgemm_indexer_build
+    assert list(provider.declines(inv, env)) == []
 
 
 class TestTheSchema:

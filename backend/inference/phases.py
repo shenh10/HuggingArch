@@ -1531,6 +1531,9 @@ def compute_per_op_timing(
             # Humming's Hopper WGMMA launch explicitly declares the
             # alternative-family ladder; a quantised activation alone proves
             # nothing about the instruction.
+            local_comm_meta = ((comm_meta.values.get(uid) or {})
+                               if comm_meta is not None else {})
+            local_compute_dtype = local_comm_meta.get("runtime_compute_dtype") or local_comm_meta.get("sparse_dcp_local_compute_dtype")
             adt_name = ab.act_dtype if ab is not None else None
             converts = True
             op_peak: Optional[float] = None
@@ -1582,6 +1585,10 @@ def compute_per_op_timing(
                 # already handles (`NoPeakForDtype`).
                 raise NoPeakForDtype(gpu_sku or "This GPU", adt_name,
                                      peak_kind(adt_name))
+            if local_compute_dtype is not None:
+                adt_name = local_compute_dtype
+                op_peak = (peak_flops_for_op_fn(adt_name)
+                           if peak_flops_for_op_fn is not None else None)
             if op_peak is None:
                 op_peak = peak_flops_per_sec
             # Comm rooftop: a parallelism collective's per-rank traffic
@@ -1614,12 +1621,29 @@ def compute_per_op_timing(
             # (`ServingLayers.collectives`): the rungs it is priced over.
             comm_rungs = ([r.as_dict() for r in laws.collectives.get(comm_op, ())]
                           if is_comm and comm_world > 1 else [])
+            if is_comm and m.get("sparse_dcp_protocol") in (
+                    "candidate_multicast", "projected_push_or_fi_a2a"):
+                # An explicitly lowered runtime kernel, not NCCL's logarithmic
+                # exchange schedule. One direct NVLink stage is the base; the
+                # source contract below supplies any dependent fallback stage.
+                comm_rungs = [{"algorithm": "direct_exchange",
+                               "worlds": [comm_world]}]
             # The payload as the emitter built it, one instance's, as the
             # walk's law.
             law_m = (law_comm_meta.values.get(uid) or {}
                      if law_comm_meta is not None else {})
             comm_payload_one = (value_of(law_m["tensor_bytes_extent"])
                                 if is_comm and m else 0)
+            if "sparse_dcp_local_read_bytes" in law_m:
+                # The source contract's complete local memory floor replaces
+                # generic copy-flow traffic, so operands are not double read.
+                act_in_one = value_of(law_m["sparse_dcp_local_read_bytes"])
+                act_out_one = value_of(law_m["sparse_dcp_local_write_bytes"])
+            if "runtime_read_bytes" in law_m:
+                act_in_one = value_of(law_m["runtime_read_bytes"])
+            if "runtime_write_bytes" in law_m:
+                act_out_one = value_of(law_m["runtime_write_bytes"])
+            dependency_rounds = value_of(law_m.get("sparse_dcp_dependency_rounds", 1))
             # The row's law, over the workload and the card, built from the
             # walk's laws: the same at every point of the cell, so written
             # once (`ServingLayers.written`).
@@ -1635,7 +1659,8 @@ def compute_per_op_timing(
                 comm_payload=comm_payload_one,
                 comm_factor=comm_factor(comm_op, comm_world) if is_comm else 0.0,
                 comm_priced=is_comm and comm_world > 1,
-                comm_rungs=len(comm_rungs)), laws.book))
+                comm_rungs=len(comm_rungs),
+                comm_dependency_rounds=dependency_rounds), laws.book))
             # This row at the walk's point: its law read there on the card
             # (`LawBook.row_at`), the one reading every re-evaluation of it
             # makes, and published through the one rendering
@@ -1868,6 +1893,12 @@ def compute_per_op_timing(
                 "display_path": node.display_path,
                 "op": node.op,
                 "role": node.role,
+                # Source-declared runtime stages retain their identity and
+                # limitations in the public table, including unresolved SMs.
+                **{key: m[key] for key in (
+                    "runtime_stage_name", "runtime_work_basis", "runtime_source") if key in m},
+                **({"runtime_integer_ops": as_number(value_of(m["runtime_integer_ops"]))}
+                   if "runtime_integer_ops" in m else {}),
                 # This node's Invocation dims, carried on the row so the identity
                 # reads the constants a tensor shape can't (a rope rotation width
                 # hidden inside heads x width) off the row itself — not a global

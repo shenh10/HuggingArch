@@ -1,0 +1,12 @@
+schema: huggingarch.claims/v1
+subject: kimi_k31_dsa_attention
+axioms:
+  checks:
+    - kind: kv_growth
+      storage: per_token
+      src: 'SGLang 1b2870d3 DSATokenToKVPool: store every token; flashmla_kv selects top-k rows only at read time. No eviction or compression of history.'
+    - kind: kv_growth
+      node: indexer.k_norm
+      storage: per_token
+      expect: d_indexer_head
+      src: 'SGLang 1b2870d3 dsa_indexer.py _store_index_k_cache: one 128-wide key per token, shared by all 32 query heads. Full-history index search.'

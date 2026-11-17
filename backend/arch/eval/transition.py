@@ -61,6 +61,9 @@ class KernelGeometry:
 
     inputs: Tuple[Optional[Tuple[Any, ...]], ...]
     output: Optional[Tuple[Any, ...]]
+    # Actual work can be ragged across query rows even when allocation
+    # axes are rectangular (striped sparse verification).
+    pair_share: Any = None
 
 
 @dataclass(frozen=True)

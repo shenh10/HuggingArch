@@ -130,6 +130,8 @@ class CacheGeometry:
     #: tensor parallelism divides of the cache in this deployment, measured
     #: by projecting it (`layout.physical_cache.cache_geometry`).
     tp_divided: FrozenSet[Tuple[int, int, str]] = frozenset()
+    # Components whose striped owners reserve a final partial position slot.
+    padded_position_components: FrozenSet[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.positions_over <= 0:
@@ -196,6 +198,9 @@ class CachedTensor:
     #: `carrier` — the leaf whose kernel reads and rewrites it each step, and
     #: so the one it is billed and drawn on.
     recurrent: bool = False
+    # Invocation-only projected read law; stored/read retain graph identity.
+    runtime_read_positions: Any = None
+    position_padding: bool = False
 
     def __post_init__(self) -> None:
         if self.positions_over <= 0:
@@ -204,11 +209,21 @@ class CachedTensor:
                 f"{self.positions_over}"
             )
 
+    @property
+    def storage_law(self) -> Any:
+        """Global-equivalent occupied positions, including owner padding."""
+        law = self.stored if self.stored is not None else CACHE_LEN
+        if self.position_padding and not self.recurrent:
+            return sp.ceiling(algebra(law) / self.positions_over) * self.positions_over
+        return law
+
     def positions(self, cache_len: Extent, *, read: bool = False) -> Extent:
         """The law, at a length. Substitution rather than a second evaluation of
         the op's lambda: the lambda closed over the frame's other dims when the
         walk recorded it, and re-running it here would need that frame back."""
-        expr = self.read if read else self.stored
+        expr = self.read if read else self.storage_law
+        if read and self.runtime_read_positions is not None:
+            expr = self.runtime_read_positions
         if expr is None:
             return cache_len
         return substitute(expr, CACHE_LEN, cache_len)
@@ -394,13 +409,13 @@ class Cache:
         buckets: Dict[Tuple[str, Any], Tuple[Any, Extent, List[str]]] = {}
         for tensor in self.tensors:
             per_position = tensor.position_bytes / tensor.positions_over
-            key = (sp.srepr(algebra(tensor.stored)), per_position)
+            key = (sp.srepr(algebra(tensor.storage_law)), per_position)
             if key in buckets:
                 law, total, names = buckets[key]
                 buckets[key] = (law, total + per_position,
                                 [*names, tensor.name])
             else:
-                buckets[key] = (tensor.stored, per_position, [tensor.name])
+                buckets[key] = (tensor.storage_law, per_position, [tensor.name])
         return list(buckets.values())
 
 
@@ -487,7 +502,8 @@ def _per_call(
         out[uid] = replace(entry, tensors=tuple(
             replace(t, format=bind_format(
                 precision.cache_format(t.kind, stack, t.declared),
-                analysis, node))
+                analysis, node), position_padding=(geometry is not None
+                    and uid in geometry.padded_position_components and not t.recurrent))
             for t in entry.tensors))
     return out, absorbed
 

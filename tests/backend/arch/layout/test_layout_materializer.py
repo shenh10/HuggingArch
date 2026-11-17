@@ -1125,6 +1125,7 @@ class TestUnknownCollectivesRefuse(unittest.TestCase):
                         )
 
     def test_dsa_indexer_score_cannot_impersonate_the_main_score(self):
+        from backend.arch.layout.sparse_dcp import SparseDcpPlans
         def ref(node):
             return SimpleNamespace(src=node, port="")
 
@@ -1239,6 +1240,7 @@ class TestUnknownCollectivesRefuse(unittest.TestCase):
                     tp_attention=4, tp_dense_ffn=4, cp=2, dcp=2
                 ),
                 route_family=None,
+                sparse_dcp=SparseDcpPlans(),
                 families={"dcp": pending.group},
                 project_local_extent=lambda extent, layout: (
                     physical_local_extent(layout, int(value_of(extent)))

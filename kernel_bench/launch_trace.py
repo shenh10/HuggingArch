@@ -473,9 +473,29 @@ def _written(func, args, kwargs) -> List[Any]:
     return out
 
 
+def paged_byte_cache_shape(shape, page: int, record: str) -> Tuple[int, ...]:
+    """Paged [B,L,D] cache stored as bytes, including its declared scales.
+
+    The format supplies payload and scale widths; the adapter supplies the
+    page layout. This is a storage contract, not permission for any byte
+    operand to stand for a floating-point tensor.
+    """
+    from backend.arch.cache_formats import CacheFormat
+    fmt = CacheFormat.parse(record, "paged byte cache")
+    batch, length, width = map(int, shape)
+    if page <= 0 or fmt.tail is not None or fmt.transform != "none":
+        raise ValueError("paged byte cache requires positive pages and no tail/transform")
+    dynamic, static = fmt.scale_counts(width, width, 1)
+    size = width * fmt.bytes_per_element(width) + dynamic * fmt.scale_bytes
+    if static or int(size) != size or fmt.scale is None:
+        raise ValueError("paged byte cache requires integral dynamic records")
+    return (batch * ((length + page - 1) // page), page, 1, int(size))
+
+
 def disagreement(trace: Trace, *, declared_dtypes: Sequence[str],
                  declared_elements: Sequence[int],
-                 records: Sequence[str] = ()) -> Optional[str]:
+                 records: Sequence[str] = (),
+                 packed_byte_shapes: Sequence[Tuple[int, ...]] = ()) -> Optional[str]:
     """Why this launch is not the cell's, or None.
 
     Both questions are asked of the WIDEST buffer the launch moved, which
@@ -511,7 +531,9 @@ def disagreement(trace: Trace, *, declared_dtypes: Sequence[str],
         spellings = tuple(sorted({*spellings, "float32"}))
     # Buffers tied for widest share the row's bytes, and none of them alone
     # stands for it: the launch is the cell's precision if any of them is.
-    if spellings and all(e.dtype not in spellings
+    if spellings and all(e.dtype not in spellings and not (
+                         e.dtype == "uint8" and
+                         e.operand.shape in packed_byte_shapes)
                          for e in trace.widest_buffers):
         return (f"the launch's largest operand is {widest.dtype} where the "
                 f"cell declares {'/'.join(sorted(spellings))} ({widest}) — "
