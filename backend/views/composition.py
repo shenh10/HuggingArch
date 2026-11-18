@@ -16,11 +16,13 @@ they add up to the dashboard's totals, which are the same ledgers summed.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.arch.eval import capacity as capacity_mod
 from backend.arch.eval.cache_view import cache_view_from_analysis
+from backend.arch.eval.dim import expr_of
 from backend.arch.dtypes import display_name
 from backend.arch import roles
 from backend.arch.ops import owns_lookup_table
@@ -101,6 +103,335 @@ def root_kind(name: str, node: Any) -> Tuple[str, str]:
     return "model_root", name
 
 
+_DIM_MEANINGS = {
+    "d_model": "hidden-state width",
+    "d_head": "attention head width",
+    "d_v_head": "attention value-head width",
+    "d_qk_nope": "non-rotary query/key width",
+    "d_qk_rope": "rotary query/key width",
+    "d_q_lora": "query low-rank width",
+    "d_kv_lora": "KV low-rank width",
+    "d_ffn": "dense FFN intermediate width",
+    "d_ffn_expert": "one expert's intermediate width",
+    "n_heads": "number of attention heads",
+    "n_kv_heads": "number of KV heads",
+    "n_route_targets": "number of routed experts",
+    "n_expert_copies": "number of stored expert copies",
+    "n_experts_active": "experts selected for one token",
+    "total_params_per_layer": "parameter ledger total for one layer",
+    "attention_params_per_layer": "attention ledger total for one layer",
+    "experts_params_per_layer": "routed-expert ledger total for one layer",
+    "active_params_per_layer": "active parameter ledger total for one layer",
+}
+
+
+def _role_roots(nodes: List[Any], kind: str) -> List[Any]:
+    """Outermost report nodes counted by projection's role classifier."""
+    out: List[Any] = []
+
+    def visit(node: Any) -> None:
+        node_kind = roles.kind_of(node.role or "")
+        if node_kind == kind:
+            out.append(node)
+            return
+        if node.role is not None and node_kind != "wrapper":
+            return
+        for child in node.children or ():
+            visit(child)
+
+    for node in nodes:
+        visit(node)
+    return out
+
+
+def _routed_roots(nodes: List[Any], program: Any) -> List[Any]:
+    """Outermost routed banks, the same boundary as `routed_params`."""
+    out: List[Any] = []
+
+    def visit(node: Any) -> None:
+        if node.ir_node is not None and program.is_routed(node.ir_node.uid):
+            out.append(node)
+            return
+        for child in node.children or ():
+            visit(child)
+
+    for node in nodes:
+        visit(node)
+    return out
+
+
+def _other_roots(nodes: List[Any]) -> List[Any]:
+    """Parameter-bearing roots outside attention and FFN classifiers."""
+    out: List[Any] = []
+
+    def visit(node: Any) -> None:
+        node_kind = roles.kind_of(node.role or "")
+        if node_kind in CALL_KINDS:
+            return
+        if node.role is not None and node_kind != "wrapper":
+            if node.params:
+                out.append(node)
+            return
+        if not node.children:
+            if node.params:
+                out.append(node)
+            return
+        for child in node.children:
+            visit(child)
+
+    for node in nodes:
+        visit(node)
+    return out
+
+
+def _sum_expr(nodes: List[Any], symbolic_attr: str = "params_symbolic",
+              values_attr: str = "params_values") -> Tuple[str, str, int]:
+    held = [n for n in nodes if n.params]
+    symbolic = " + ".join(
+        f"({getattr(n, symbolic_attr) or n.params})" for n in held) or "0"
+    values = " + ".join(
+        f"({getattr(n, values_attr) or n.params})" for n in held) or "0"
+    return symbolic, values, sum(int(n.params) for n in held)
+
+
+def _bound_expr(symbolic: str, dims: Dict[str, int]) -> str:
+    """Keep the expression visible while replacing each named dimension."""
+    return re.sub(
+        r"[A-Za-z_][A-Za-z_0-9]*",
+        lambda match: str(dims.get(match.group(0), match.group(0))),
+        symbolic,
+    )
+
+
+def _active_expr(nodes: List[Any], analysis: Any,
+                 dims: Dict[str, int]) -> Tuple[str, str, int]:
+    parts: List[Tuple[str, str, int]] = []
+    for node in nodes:
+        cost = analysis.cost.values.get(node.ir_node.uid)
+        value = int(node.active_params)
+        if cost is None or not value:
+            continue
+        symbolic = str(expr_of(cost.active_params))
+        parts.append((symbolic, _bound_expr(symbolic, dims), value))
+    return (
+        " + ".join(f"({p[0]})" for p in parts) or "0",
+        " + ".join(f"({p[1]})" for p in parts) or "0",
+        sum(p[2] for p in parts),
+    )
+
+
+def _parameter_term(label: str, layers: int, symbolic: str, substituted: str,
+                    result: int, dims: Dict[str, int]) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "symbolic": f"n_layers × ({symbolic})",
+        "substituted": f"{layers} × ({substituted})",
+        "result": result,
+        "_dims": dims,
+    }
+
+
+def _formula_defs(symbolic: str, terms: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    values: Dict[str, set[str]] = {}
+    for term in terms:
+        for name, value in term.get("_dims", {}).items():
+            values.setdefault(name, set()).add(str(value))
+    names = list(dict.fromkeys(re.findall(
+        r"[A-Za-z_][A-Za-z_0-9]*", symbolic)))
+    out: List[Dict[str, str]] = []
+    for name in names:
+        if name == "n_layers":
+            meaning = "number of layers represented by this formula term"
+            value = " / ".join(dict.fromkeys(
+                str(t["substituted"]).split(" × ", 1)[0] for t in terms))
+        elif name in values:
+            meaning = _DIM_MEANINGS.get(name, "resolved model dimension")
+            value = " / ".join(sorted(values[name]))
+        else:
+            meaning = "formula quantity defined by the architecture"
+            value = "see substituted expression"
+        out.append({"name": name, "formula": meaning, "value": value})
+    return out
+
+
+def _parameter_formula(label: str, terms: List[Dict[str, Any]],
+                       result: int) -> Dict[str, Any]:
+    symbolic = " + ".join(t["symbolic"] for t in terms) or "0"
+    substituted = " + ".join(t["substituted"] for t in terms) or "0"
+    clean = [{k: v for k, v in term.items() if k != "_dims"}
+             for term in terms]
+    formula: Dict[str, Any] = {
+        "label": label,
+        "symbolic": symbolic,
+        "substituted": substituted,
+        "result": result,
+    }
+    if len(clean) > 1:
+        formula["subterms"] = clean
+    defs = _formula_defs(symbolic, terms)
+    if defs:
+        formula["defs"] = defs
+    return formula
+
+
+def _storage_formula(label: str, weights: Any) -> Dict[str, Any]:
+    parameters = int(weights.parameters)
+    metadata = int(weights.metadata)
+    buffers = int(weights.buffers)
+    terms = [
+        {"label": dtype, "symbolic": "stored_dtype_bytes",
+         "substituted": str(int(amount)), "result_bytes": int(amount),
+         "defs": [{"name": "stored_dtype_bytes",
+                   "formula": "bytes stored at this dtype",
+                   "value": str(int(amount))}]}
+        for dtype, amount in sorted(weights.by_dtype.items(),
+                                    key=lambda item: -item[1]) if amount
+    ]
+    return {
+        "label": label,
+        "symbolic": "parameter_bytes + quantization_metadata_bytes + buffer_bytes",
+        "substituted": f"{parameters} + {metadata} + {buffers}",
+        "result_bytes": int(weights.resident),
+        "defs": [
+            {"name": "parameter_bytes", "formula": "learnable tensor storage",
+             "value": str(parameters)},
+            {"name": "quantization_metadata_bytes",
+             "formula": "scale and zero-point storage", "value": str(metadata)},
+            {"name": "buffer_bytes", "formula": "non-learnable tensor storage",
+             "value": str(buffers)},
+        ],
+        "subterms": terms,
+    }
+
+
+def _append_block_formula_terms(row: "_Row", block: Any, layers: int,
+                                analysis: Any, program: Any) -> None:
+    dims = {
+        name: int(value) for name, value in
+        analysis.program.resolved.dim_values.items()
+        if isinstance(value, (int, float)) and int(value) == value
+    }
+    dims.update(block.dims)
+    total = _sum_expr(block.nodes)
+    attention = _sum_expr(_role_roots(block.nodes, "attention"))
+    ffn_total = _sum_expr(_role_roots(block.nodes, "ffn"))
+    experts = _sum_expr(_routed_roots(block.nodes, program))
+    other = _sum_expr(_other_roots(block.nodes))
+    active = _active_expr(block.nodes, analysis, dims)
+
+    expected = {
+        "total": int(block.total_params),
+        "attention": int(block.attention_params),
+        "experts": int(block.routed_params),
+        "other": int(block.total_params - block.attention_params - block.ffn_params),
+        "active": int(block.total_active_params),
+    }
+    measured = {
+        "total": total[2], "attention": attention[2],
+        "experts": experts[2], "other": other[2], "active": active[2],
+    }
+    # Some encoder blocks classify a compound as FFN while its descendants
+    # carry a different role family. In that case the projected ledger is
+    # still authoritative: write the category as the exact subtraction of
+    # total, attention and FFN instead of publishing an incomplete subtree.
+    if other[2] != expected["other"]:
+        other = (
+            f"({total[0]}) - ({attention[0]}) - ({ffn_total[0]})",
+            f"({total[1]}) - ({attention[1]}) - ({ffn_total[1]})",
+            expected["other"],
+        )
+    for name, value in expected.items():
+        if name == "other" or measured[name] == value:
+            continue
+        symbol = f"{name}_params_per_layer"
+        dims[symbol] = value
+        fallback = (symbol, str(value), value)
+        if name == "total":
+            total = fallback
+        elif name == "attention":
+            attention = fallback
+        elif name == "experts":
+            experts = fallback
+        elif name == "active":
+            active = fallback
+
+    if experts[2]:
+        ffn = (
+            f"({ffn_total[0]}) - ({experts[0]})",
+            f"({ffn_total[1]}) - ({experts[1]})",
+            ffn_total[2] - experts[2],
+        )
+    else:
+        ffn = ffn_total
+    expected_ffn = int(block.ffn_params - block.routed_params)
+    if ffn[2] != expected_ffn:
+        raise ValueError(
+            f"{block.template_name}: FFN formula is {ffn[2]}, expected "
+            f"{expected_ffn}")
+
+    per_kind = {
+        "attention": attention,
+        "ffn": ffn,
+        "experts": experts,
+        "other": other,
+        "total": total,
+        "active": active,
+    }
+    for kind, (symbolic, substituted, per_layer) in per_kind.items():
+        if not per_layer:
+            continue
+        row.formula_terms.setdefault(kind, []).append(_parameter_term(
+            f"{block.template_name} × {layers} layers", layers,
+            symbolic, substituted, layers * per_layer, dims))
+
+
+def _set_model_node_formula_terms(row: "_Row", node: Any,
+                                  analysis: Any) -> None:
+    dims = {
+        name: int(value) for name, value in
+        analysis.program.resolved.dim_values.items()
+        if isinstance(value, (int, float)) and int(value) == value
+    }
+    dims.update({name: int(value) for name, value in
+                 (node.op_dims or {}).items()
+                 if isinstance(value, (int, float)) and int(value) == value})
+    symbolic = node.params_symbolic or str(node.params)
+    substituted = node.params_values or str(node.params)
+    total = _parameter_term(node.name, 1, symbolic, substituted,
+                            int(node.params), dims)
+    row.formula_terms["total"] = [total]
+    row.formula_terms["other"] = [total]
+    active = _active_expr([node], analysis, dims)
+    if active[2]:
+        row.formula_terms["active"] = [_parameter_term(
+            node.name, 1, active[0], active[1], active[2], dims)]
+
+
+def _component_total_formula(label: str, symbol: str, rows: List["_Row"],
+                             key: str, result: int, *,
+                             result_bytes: bool = False) -> Dict[str, Any]:
+    subterms = []
+    for row in rows:
+        formula = row.formulas().get(key)
+        if formula and (formula.get("result") or formula.get("result_bytes")):
+            subterms.append({**formula, "label": row.label})
+    out: Dict[str, Any] = {
+        "label": label,
+        "symbolic": f"Σ {symbol}",
+        "substituted": " + ".join(
+            str(term.get("result_bytes") if result_bytes else term.get("result"))
+            for term in subterms),
+        "defs": [{
+            "name": symbol,
+            "formula": "value contributed by one model-composition row",
+            "value": "see row subterms",
+        }],
+        "subterms": subterms,
+    }
+    out["result_bytes" if result_bytes else "result"] = result
+    return out
+
+
 @dataclass
 class _Row:
     """One row's sums, folded over the invocations (or the node) it holds."""
@@ -129,6 +460,11 @@ class _Row:
     #: "declared" by the spec's `cache.entries`, else the model's stated
     #: default ("native").
     kv_dtypes: Dict[str, str] = field(default_factory=dict)
+    kv_growth_formula: Optional[Dict[str, Any]] = None
+    kv_constant_formula: Optional[Dict[str, Any]] = None
+    cache_blocks: List[int] = field(default_factory=list, repr=False)
+    formula_terms: Dict[str, List[Dict[str, Any]]] = field(
+        default_factory=dict, repr=False)
     derived: List[Dict[str, Any]] = field(default_factory=list)
     #: The attention and FFN calls its layers make (`calls_of`): what a
     #: comparison lines up, since one component bound with different slots
@@ -138,6 +474,30 @@ class _Row:
     def add_kv(self, growth: float, floor: float) -> None:
         self.kv_per_token = (self.kv_per_token or 0.0) + growth
         self.kv_constant = (self.kv_constant or 0.0) + floor
+
+    def formulas(self) -> Dict[str, Dict[str, Any]]:
+        results = {
+            "attention": self.attention,
+            "ffn": self.ffn - self.experts,
+            "experts": self.experts,
+            "other": self.total - self.attention - self.ffn,
+            "total": self.total,
+            "active": self.active,
+        }
+        labels = {
+            "attention": "Attention parameters",
+            "ffn": "FFN parameters excluding routed experts",
+            "experts": "Routed-expert parameters",
+            "other": "Other parameters",
+            "total": "Total parameters",
+            "active": "Active parameters per token",
+        }
+        formulas = {
+            key: _parameter_formula(labels[key], self.formula_terms.get(key, []), value)
+            for key, value in results.items() if value
+        }
+        formulas["storage"] = _storage_formula("Stored model state", self.weights)
+        return formulas
 
     def payload(self) -> Dict[str, Any]:
         by_dtype = sorted(self.weights.by_dtype.items(), key=lambda kv: -kv[1])
@@ -167,11 +527,14 @@ class _Row:
             "storage_bytes": int(self.weights.resident),
             "storage_by_dtype": [{"dtype": name, "bytes": int(amount)}
                                  for name, amount in by_dtype if amount],
+            "formulas": self.formulas(),
             # Backbone caches only (`CacheView`'s scope): None for an aux
             # stack, whose cache is not part of serving the model.
             "kv": (None if self.kv_per_token is None else {
                 "per_token_bytes": self.kv_per_token,
                 "constant_bytes": self.kv_constant,
+                "growth_formula": self.kv_growth_formula,
+                "constant_formula": self.kv_constant_formula,
                 "dtypes": [{"dtype": d, "source": src}
                            for d, src in self.kv_dtypes.items()],
             }),
@@ -268,6 +631,7 @@ class ModelComposition:
                        stack=stack or None,
                        aux_kind=aux_kinds.get(stack),
                        encoder=stack in self._encoders)
+            _set_model_node_formula_terms(row, node, analysis)
             if row.aux_kind is not None:
                 aux_roots.append(row)
             else:
@@ -328,16 +692,25 @@ class ModelComposition:
             row.experts += int(count) * int(block.routed_params)
             row.total += int(count) * int(block.total_params)
             row.active += int(count) * int(block.total_active_params)
+            _append_block_formula_terms(
+                row, block, int(count), report.analysis, program)
             if i in block_weights:
                 row.weights = row.weights.merged(block_weights[i])
             if row.aux_kind is None and self.cache is not None:
                 growth, floor = kv.get(i, (0.0, 0.0))
                 row.add_kv(growth, floor)
                 row.kv_dtypes.update(self._kv_dtypes.get(i, {}))
+                row.cache_blocks.append(i)
             if group is not None:
                 row.derived.append(group)
             row.calls.extend(calls_of(report.analysis,
                                       report.analysis.program.blocks[i]))
+        if self.cache is not None:
+            for row in rows.values():
+                scoped = self.cache.for_blocks(frozenset(row.cache_blocks))
+                if scoped.entries:
+                    row.kv_growth_formula = scoped.growth_formula_explained
+                    row.kv_constant_formula = scoped.constant_formula
         main = [r for r in rows.values() if r.aux_kind is None]
         aux = [r for r in rows.values() if r.aux_kind is not None]
         first = (lambda r: min(r.layer_indices) if r.layer_indices else 0)
@@ -384,10 +757,22 @@ class ModelComposition:
         language = [r for r in rows if not r.encoder]
         growth, floor = (self.cache.growth_and_floor()
                          if self.cache is not None else (None, None))
+        total_formulas = {
+            "params": _component_total_formula(
+                "Model parameters", "component_params", rows, "total",
+                totals["params"]),
+            "active": _component_total_formula(
+                "Active parameters per token", "component_active_params",
+                rows, "active", totals["active_params"]),
+            "storage": _component_total_formula(
+                "Stored model state", "component_storage_bytes", rows,
+                "storage", totals["storage_bytes"], result_bytes=True),
+        }
         return {
             "rows": [r.payload() for r in rows],
             "totals": {
                 **totals,
+                "formulas": total_formulas,
                 # The rows' stored bytes by dtype, summed: the whole model's
                 # weight ledger split by width.
                 "storage_by_dtype": by_dtype_of(rows),
@@ -403,6 +788,10 @@ class ModelComposition:
                 },
                 "kv_per_token_bytes": growth,
                 "kv_constant_bytes": floor,
+                "kv_growth_formula": (self.cache.growth_formula_explained
+                                      if self.cache is not None else None),
+                "kv_constant_formula": (self.cache.constant_formula
+                                        if self.cache is not None else None),
                 # Every dtype the cached tensors behind those figures are
                 # priced at, with where it is stated: a cache that declares
                 # FP8 entries beside native ones is both.

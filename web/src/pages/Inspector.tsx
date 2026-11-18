@@ -30,6 +30,8 @@ import type { EngineGap } from "../specStatus";
 import { EngineBlockedBanner } from "../EngineGaps";
 import { filterAndSortModels, ModelOptions, useSupportedModels } from "../supportedModels";
 import { currentHref, readLastInspectorHref, rememberInspectorHref } from "../lastVisited";
+import { FormulaHover } from "../FormulaHover";
+import type { FormulaFields } from "../tooltip";
 
 // The "Try:" quick-pick is fetched from `/inspector/examples` (the latest
 // ≥100B models in the corpus, computed server-side so it never drifts). This
@@ -235,9 +237,20 @@ type CompositionRow = {
   active_params: number;
   storage_bytes: number;
   storage_by_dtype: Array<{ dtype: string; bytes: number }>;
+  formulas?: {
+    attention?: FormulaFields;
+    ffn?: FormulaFields;
+    experts?: FormulaFields;
+    other?: FormulaFields;
+    total?: FormulaFields;
+    active?: FormulaFields;
+    storage?: FormulaFields;
+  };
   kv: {
     per_token_bytes: number;
     constant_bytes: number;
+    growth_formula?: FormulaFields | null;
+    constant_formula?: FormulaFields | null;
     dtypes: KvDtype[];
   } | null;
   histogram?: Array<{ visible: number; layers: number; layer_indices: number[] }>;
@@ -252,6 +265,13 @@ type Composition = {
     storage_bytes: number;
     kv_per_token_bytes: number | null;
     kv_constant_bytes: number | null;
+    kv_growth_formula?: FormulaFields | null;
+    kv_constant_formula?: FormulaFields | null;
+    formulas?: {
+      params?: FormulaFields;
+      active?: FormulaFields;
+      storage?: FormulaFields;
+    };
     storage_by_dtype: Array<{ dtype: string; bytes: number }>;
     /** Every dtype the KV figures are priced at, and where it is stated. */
     kv_dtypes?: KvDtype[];
@@ -3365,20 +3385,44 @@ const AUX_LABELS: Record<string, string> = {
   speculative: "MTP / Speculative Head",
 };
 
-/** One composition figure, or a dash for a role the row does not have. */
-function compCell(v: number, fmt: (n: number) => string = formatNumber): string {
-  return v ? fmt(v) : "—";
+/** A composition amount with its ledger-backed derivation on hover. */
+function compFormulaCell(v: number, formula?: FormulaFields,
+                         fmt: (n: number) => string = formatNumber): ReactNode {
+  if (!v) return "—";
+  const shown = fmt(v);
+  return <FormulaHover value={shown} formula={formula ? {
+    ...formula, result: shown,
+  } : undefined} />;
+}
+
+function withFormulaResult(formula: FormulaFields | undefined,
+                           result: string): FormulaFields | undefined {
+  return formula ? { ...formula, result } : undefined;
 }
 
 /** The KV cell: bytes each token adds, and/or the state held per sequence. */
-function KvCell({ kv }: { kv: { per_token_bytes: number; constant_bytes: number; dtypes?: KvDtype[] } | null }) {
+function KvCell({ kv }: { kv: {
+  per_token_bytes: number;
+  constant_bytes: number;
+  growth_formula?: FormulaFields | null;
+  constant_formula?: FormulaFields | null;
+  dtypes?: KvDtype[];
+} | null }) {
   if (!kv) return <span className="text-gray-300" title="Not part of the serving KV cache, or the model states no dtype to price it at">—</span>;
   const parts: ReactNode[] = [];
-  if (kv.per_token_bytes) parts.push(<div key="t">{formatGiB(kv.per_token_bytes)} / token</div>);
+  if (kv.per_token_bytes) parts.push(
+    <div key="t"><FormulaHover
+      value={`${formatGiB(kv.per_token_bytes)} / token`}
+      formula={kv.growth_formula || undefined}
+    /></div>,
+  );
   if (kv.constant_bytes) {
     parts.push(
       <div key="c" title="Held per sequence whatever its length: a recurrent state, or a sliding window's cache once the sequence is past the window">
-        {formatGiB(kv.constant_bytes)} <span className="text-gray-400">constant / sequence</span>
+        <FormulaHover
+          value={`${formatGiB(kv.constant_bytes)} constant / sequence`}
+          formula={kv.constant_formula || undefined}
+        />
       </div>,
     );
   }
@@ -3455,12 +3499,12 @@ function CompositionTable({
       sortValue: (r) => (r.kind === "block" ? r.layer_indices[0] : null),
     },
     numCol("count", "Count", (r) => (r.kind === "block" ? r.layers : "—"), (r) => (r.kind === "block" ? r.layers : null)),
-    numCol("attention", "Attention", (r) => compCell(r.params.attention), (r) => r.params.attention || null),
-    numCol("ffn", "FFN", (r) => compCell(r.params.ffn), (r) => r.params.ffn || null),
-    ...(hasExperts ? [numCol("experts", "Experts", (r) => compCell(r.params.experts), (r) => r.params.experts || null)] : []),
-    numCol("other", "Other", (r) => compCell(r.params.other), (r) => r.params.other || null),
-    numCol("params", "Params", (r) => formatNumber(r.params.total), (r) => r.params.total, "text-gray-900"),
-    ...(hasActive ? [numCol("active", "Active", (r) => formatNumber(r.active_params), (r) => r.active_params, "text-orange-700")] : []),
+    numCol("attention", "Attention", (r) => compFormulaCell(r.params.attention, r.formulas?.attention), (r) => r.params.attention || null),
+    numCol("ffn", "FFN", (r) => compFormulaCell(r.params.ffn, r.formulas?.ffn), (r) => r.params.ffn || null),
+    ...(hasExperts ? [numCol("experts", "Experts", (r) => compFormulaCell(r.params.experts, r.formulas?.experts), (r) => r.params.experts || null)] : []),
+    numCol("other", "Other", (r) => compFormulaCell(r.params.other, r.formulas?.other), (r) => r.params.other || null),
+    numCol("params", "Params", (r) => compFormulaCell(r.params.total, r.formulas?.total), (r) => r.params.total, "text-gray-900"),
+    ...(hasActive ? [numCol("active", "Active", (r) => compFormulaCell(r.active_params, r.formulas?.active), (r) => r.active_params, "text-orange-700")] : []),
     {
       key: "stored", wrap: true,
       header: "Stored",
@@ -3468,7 +3512,9 @@ function CompositionTable({
       sortValue: (r) => r.storage_bytes,
       render: (r) => (
         <>
-          <div className="text-gray-900 whitespace-nowrap">{formatGiB(r.storage_bytes)}</div>
+          <div className="text-gray-900 whitespace-nowrap">
+            {compFormulaCell(r.storage_bytes, r.formulas?.storage, formatGiB)}
+          </div>
           {r.storage_by_dtype.length > 1 || (r.storage_by_dtype[0] && r.storage_by_dtype[0].dtype !== dash.weight_dtype) ? (
             // One line per width, so a mixed row does not widen the table.
             <div className="text-10 text-gray-400">
@@ -3525,10 +3571,16 @@ function CompositionTable({
             <td className={tbl.cell}></td>
             <td className={footTd}>{dash.num_layers || "—"}</td>
             <td className={footTd} colSpan={hasExperts ? 4 : 3}></td>
-            <td className={`${footTd} text-gray-900`} id="composition-total-params">{dash.total_params_formatted}</td>
-            {hasActive ? <td className={`${footTd} text-orange-700`} id="composition-total-active">{dash.total_active_params_formatted}</td> : null}
+            <td className={`${footTd} text-gray-900`} id="composition-total-params">
+              <FormulaHover value={dash.total_params_formatted || formatNumber(composition.totals.params)} formula={withFormulaResult(composition.totals.formulas?.params, dash.total_params_formatted || formatNumber(composition.totals.params))} />
+            </td>
+            {hasActive ? <td className={`${footTd} text-orange-700`} id="composition-total-active">
+              <FormulaHover value={dash.total_active_params_formatted || formatNumber(composition.totals.active_params)} formula={withFormulaResult(composition.totals.formulas?.active, dash.total_active_params_formatted || formatNumber(composition.totals.active_params))} />
+            </td> : null}
             <td className={`${tbl.wrapCell} font-mono`}>
-              <div id="composition-total-bytes" title="Weights as loaded">{formatGiB(dash.weight_bytes || 0)}</div>
+              <div id="composition-total-bytes" title="Weights as loaded">
+                <FormulaHover value={formatGiB(dash.weight_bytes || 0)} formula={withFormulaResult(composition.totals.formulas?.storage, formatGiB(dash.weight_bytes || 0))} />
+              </div>
               <div className="text-10 text-gray-400 font-normal">
                 {composition.totals.storage_by_dtype.map((d) => <div key={d.dtype} className="whitespace-nowrap">{d.dtype} {formatGiB(d.bytes)}</div>)}
               </div>
@@ -3537,6 +3589,8 @@ function CompositionTable({
               <KvCell kv={composition.totals.kv_per_token_bytes == null ? null : {
                 per_token_bytes: composition.totals.kv_per_token_bytes,
                 constant_bytes: composition.totals.kv_constant_bytes || 0,
+                growth_formula: composition.totals.kv_growth_formula,
+                constant_formula: composition.totals.kv_constant_formula,
               }} />
             </td>
           </tr>

@@ -14,6 +14,8 @@ Gated DeltaNet state is kept in fp32), else its stated default precision.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from backend.arch.eval import capacity
@@ -52,6 +54,21 @@ def test_rows_sum_to_the_model_totals(built):
         p = r["params"]
         assert p["attention"] + p["ffn"] + p["experts"] + p["other"] == p["total"]
         assert sum(d["bytes"] for d in r["storage_by_dtype"]) == r["storage_bytes"]
+        expected = {
+            "attention": p["attention"], "ffn": p["ffn"],
+            "experts": p["experts"], "other": p["other"],
+            "total": p["total"], "active": r["active_params"],
+        }
+        for name, result in expected.items():
+            formula = r["formulas"].get(name)
+            if result:
+                assert formula["result"] == result
+                symbols = set(re.findall(
+                    r"[A-Za-z_][A-Za-z_0-9]*", formula["symbolic"]))
+                assert symbols <= {d["name"] for d in formula["defs"]}
+            else:
+                assert formula is None
+        assert r["formulas"]["storage"]["result_bytes"] == r["storage_bytes"]
     # The walk's resolved precision, not `ResolvedSpec.shipped_dtype` — the
     # view used to ask that a second time and answered F32 for a gemma-2
     # cache the walk had already priced at BF16. Asserting against the
@@ -72,6 +89,16 @@ def test_rows_sum_to_the_model_totals(built):
     # included — not the data alone.
     assert totals["kv_per_token_bytes"] == growth == view.growth_formula["result_bytes"]
     assert totals["kv_constant_bytes"] == floor
+    assert totals["kv_growth_formula"]["result_bytes"] == growth
+    assert totals["kv_constant_formula"]["result_bytes"] == floor
+    assert totals["formulas"]["params"]["result"] == totals["params"]
+    assert totals["formulas"]["active"]["result"] == totals["active_params"]
+    assert totals["formulas"]["storage"]["result_bytes"] == totals["storage_bytes"]
+    for row in (r for r in rows if r["kv"] is not None):
+        assert row["kv"]["growth_formula"]["result_bytes"] == pytest.approx(
+            row["kv"]["per_token_bytes"], rel=1e-12)
+        assert row["kv"]["constant_formula"]["result_bytes"] == pytest.approx(
+            row["kv"]["constant_bytes"], rel=1e-12)
     length = 1 << 17
     assert growth * length + floor == pytest.approx(
         view.storage_bytes_at(length), rel=1e-12)
@@ -132,6 +159,25 @@ def test_a_recurrent_state_is_constant_per_sequence():
     assert [r["layers"] for r in full] == [12]
     assert not linear[0]["kv"]["per_token_bytes"]
     assert not full[0]["kv"]["constant_bytes"]
+
+
+def test_kv_formulas_explain_their_symbols():
+    """The Dashboard does not publish an unexplained KV byte total."""
+    _report, comp = _composition("Qwen/Qwen3-Coder-Next")
+    blocks = [r for r in comp["rows"] if r["kind"] == "block"]
+    linear = next(r for r in blocks if r["kv"]["constant_bytes"])
+    full = next(r for r in blocks if r["kv"]["per_token_bytes"])
+
+    growth = full["kv"]["growth_formula"]
+    assert growth["result_bytes"] == full["kv"]["per_token_bytes"]
+    assert {d["name"] for d in growth["defs"]} >= {
+        "n_layers", "bpe"}
+
+    constant = linear["kv"]["constant_formula"]
+    assert constant["result_bytes"] == linear["kv"]["constant_bytes"]
+    assert constant["subterms"]
+    assert {d["name"] for d in constant["defs"]} >= {
+        "n_layers", "bytes_per_position", "state_positions"}
 
 
 def test_kv_is_priced_at_the_dtype_the_model_states():
