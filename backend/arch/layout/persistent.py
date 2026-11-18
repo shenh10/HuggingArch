@@ -121,15 +121,20 @@ class PhysicalWeightLeaf:
             + self.resident_metadata_bytes_per_rank
         )
 
-def physical_artifacts(analysis: Any) -> Tuple[PhysicalArtifact, ...]:
-    """Join all persistent placement facts for one analysis."""
+def physical_artifacts(analysis: Any, *, stored_only: bool = False
+                       ) -> Tuple[PhysicalArtifact, ...]:
+    """Join persistent placement facts for one analysis.
+
+    `stored_only` is for readers of weight-axis geometry alone: it avoids
+    projecting scale metadata before a loader has been selected.
+    """
     context = weight_endpoints.placement_context(analysis)
     weights = weight_endpoints.instantiate_analysis(analysis, context)
     _require_unique(
         ((row.node_uid, row.tensor_index) for row in weights),
         "weight endpoint",
     )
-    return _PhysicalJoin(analysis, weights).run()
+    return _PhysicalJoin(analysis, weights, stored_only=stored_only).run()
 
 
 
@@ -612,8 +617,9 @@ class _PhysicalJoin:
     the artifacts list, so the per-uid / per-tensor / per-surface stages stop
     re-passing them."""
 
-    def __init__(self, analysis, weights):
+    def __init__(self, analysis, weights, *, stored_only: bool = False):
         self.analysis = analysis
+        self.stored_only = stored_only
         self.weight_by_key = {
             (row.node_uid, row.tensor_index): row for row in weights
         }
@@ -682,28 +688,45 @@ class _PhysicalJoin:
             )
         runtime_stored = replace(tensor, shape=weight.runtime_shape)
         local_symbols = dict(weight.runtime_symbol_extents)
+        # A refused load may be projected only for the planner's diagnostic
+        # rows; ordinary analyze and capacity reject it before reading them.
+        metadata_surfaces = not self.stored_only
+        saved_layout = rep.saved.block_scale_layout
+        saved_tp = (self.analysis.rule.world_degree(saved_layout.world)
+                    if saved_layout is not None else 1)
+        # Checkpoint grids belong to complete chunks. A head-gather loader
+        # can requantize a finer runtime shard, but that does not give the
+        # source scales a contiguous rank-local grid. Keep their global
+        # checkpoint representation and omit that undefined physical surface.
+        projects_saved = metadata_surfaces and (
+            saved_layout is None or saved_layout.checkpoint_tp % saved_tp == 0)
         projected_saved = rep.saved.project_metadata(
             runtime_stored,
             local_symbols=local_symbols,
-        ) if rep.saved.metadata else ()
+            runtime_tp=saved_tp,
+        ) if rep.saved.metadata and projects_saved else ()
         projected_resident = rep.resident.project_metadata(
             runtime_stored,
             local_symbols=local_symbols,
-        ) if rep.resident.metadata else ()
+            runtime_tp=(self.analysis.rule.world_degree(rep.resident.block_scale_layout.world)
+                        if rep.resident.block_scale_layout is not None else 1),
+        ) if rep.resident.metadata and metadata_surfaces else ()
 
         surfaces = [(STORED, None, tensor, runtime_stored, None)]
         surfaces.extend(
             (SAVED_METADATA, index, metadata, local,
              rep.saved.metadata_geometry[index])
             for index, (metadata, local) in enumerate(
-                zip(rep.saved.metadata, projected_saved, strict=True)
+                zip(rep.saved.metadata if projects_saved else (),
+                    projected_saved, strict=True)
             )
         )
         surfaces.extend(
             (RESIDENT_METADATA, index, metadata, local,
              rep.resident.metadata_geometry[index])
             for index, (metadata, local) in enumerate(
-                zip(rep.resident.metadata, projected_resident, strict=True)
+                zip(rep.resident.metadata if metadata_surfaces else (),
+                    projected_resident, strict=True)
             )
         )
         for surface, metadata_index, logical, local, geometry in surfaces:

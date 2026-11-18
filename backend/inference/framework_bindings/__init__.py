@@ -93,6 +93,7 @@ from backend.arch.activation_formats import ACTIVATION_FORMATS
 from backend.arch.dims import PHASES, capabilities_of, world_by_label
 from backend.arch.dtypes import UnknownDtype, canonical
 from backend.arch.eval.fusion import CROSSES, GraphCondition
+from backend.arch.eval.formats import LOADER_TRANSFORMS
 from backend.arch.quant_schemes import QUANT_SCHEMES
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from backend.inference import gpu_specs
@@ -1204,6 +1205,22 @@ class EdgeDtype:
 
 
 @dataclass(frozen=True)
+class WeightLoader:
+    """How this framework loads one declared checkpoint scale layout.
+
+    The model spec owns `kind`; the framework owns the transform. Selection
+    uses the same deployment and model-class conditions as the other binding
+    facts, and the resolved transform crosses into eval as plain data.
+    """
+    kind: str
+    loader: str
+    whens: Tuple[DispatchCondition, ...] = ()
+    source_anchor: Optional[SourceAnchor] = None
+
+    KEYS = frozenset({"kind", "loader", "when", "source_anchor"})
+
+
+@dataclass(frozen=True)
 class FrameworkBinding:
     """One framework's binding — a frozen, ordered list of fused_op entries
     saying where and when the framework runs each span.
@@ -1273,6 +1290,9 @@ class FrameworkBinding:
     #: A walk asks for its own (`edge_dtypes_for`); a role named by none
     #: carries no requirement and keeps its stored width.
     edge_dtypes: Tuple[EdgeDtype, ...] = ()
+    #: Checkpoint scale-layout transforms this framework's weight loader runs,
+    #: in file order. A walk asks for its own (`weight_loaders_for`).
+    weight_loaders: Tuple[WeightLoader, ...] = ()
     #: Audited provider implementations this framework dispatches to, in file
     #: order. Conditions here select AFTER precision/key derivation; they never
     #: restate weight dtype, quant scheme, activation format, or MMA dtype.
@@ -1281,7 +1301,7 @@ class FrameworkBinding:
     #: The fields of a binding file.
     KEYS = frozenset({"framework", "audited_at", "op_implementations",
                       "kv_block_size", "ssm_chunk_size", "collectives",
-                      "precision_launches", "edge_dtypes",
+                      "precision_launches", "edge_dtypes", "weight_loaders",
                       "kernel_dispatches"})
 
     def collectives_for(self, program: Any, analysis: Any
@@ -1316,6 +1336,22 @@ class FrameworkBinding:
             or any(when.holds_for(self.deployment)
                    and when.graph.admits_program(program, analysis)
                    for when in entry.whens))
+
+    def weight_loaders_for(self, program: Any, analysis: Any
+                           ) -> Dict[str, str]:
+        """The checkpoint-layout transforms this deployed framework runs.
+
+        Only plain strings cross into eval. An architecture with no declared
+        loader has no entry; the checkpoint format and ordinary scale guards
+        then remain in force.
+        """
+        return {
+            entry.kind: entry.loader for entry in self.weight_loaders
+            if not entry.whens
+            or any(when.holds_for(self.deployment)
+                   and when.graph.admits_program(program, analysis)
+                   for when in entry.whens)
+        }
 
     def implementations_for(self, fused_op: str
                             ) -> Tuple[FusionImplementation, ...]:
@@ -1954,6 +1990,56 @@ def _edge_dtypes(raw: Any, fname: str) -> Tuple[EdgeDtype, ...]:
     return tuple(out)
 
 
+def _weight_loaders(raw: Any, fname: str) -> Tuple[WeightLoader, ...]:
+    """Parse the framework's audited checkpoint-layout load transforms."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"framework_bindings/{fname}: weight_loaders must be "
+                         "a mapping")
+    out = []
+    for name, entry in raw.items():
+        where = f"framework_bindings/{fname}: weight_loaders[{name!r}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be a mapping")
+        unknown = sorted(set(entry) - WeightLoader.KEYS)
+        if unknown:
+            raise ValueError(f"{where} has unknown fields {unknown}")
+        kind = entry.get("kind")
+        if not isinstance(kind, str) or not kind:
+            raise ValueError(f"{where}: `kind` names a checkpoint layout")
+        loader = entry.get("loader")
+        if loader not in LOADER_TRANSFORMS:
+            raise ValueError(
+                f"{where}: `loader` must be one of {sorted(LOADER_TRANSFORMS)}")
+        raw_when = entry.get("when")
+        whens = _parse_whens(raw_when, where)
+        asked: set = set()
+        for raw_alt in (raw_when if isinstance(raw_when, list) else [raw_when]):
+            if isinstance(raw_alt, dict):
+                asked |= set(raw_alt)
+        for when in whens:
+            asked |= set(when.as_dict())
+        unanswered = sorted(asked - _EDGE_DTYPE_WHEN)
+        if unanswered:
+            raise ValueError(
+                f"{where}: `when` asks facts loader selection does not answer: "
+                f"{unanswered}")
+        anchor = entry.get("source_anchor")
+        if not isinstance(anchor, str) or not anchor:
+            raise ValueError(f"{where}: needs the `source_anchor` that shows "
+                             "the framework's loader behavior")
+        out.append(WeightLoader(
+            kind=kind, loader=loader, whens=whens,
+            source_anchor=SourceAnchor.parse(anchor, where)))
+    for i, left in enumerate(out):
+        for right in out[i + 1:]:
+            if (left.kind == right.kind
+                    and _when_sets_can_overlap(left.whens, right.whens)):
+                raise ValueError(
+                    f"framework_bindings/{fname}: weight_loaders state "
+                    f"{left.kind!r} twice under conditions that can both hold")
+    return tuple(out)
+
+
 def _when_sets_can_overlap(left: Tuple[DispatchCondition, ...],
                            right: Tuple[DispatchCondition, ...]) -> bool:
     """Whether two `when:` alternative SETS can both hold at once, over the
@@ -2089,6 +2175,8 @@ def _load_framework_bindings_dir(
         precision_launches = _precision_launches(
             data.get("precision_launches") or {}, fname)
         edge_dtypes = _edge_dtypes(data.get("edge_dtypes") or {}, fname)
+        weight_loaders = _weight_loaders(
+            data.get("weight_loaders") or {}, fname)
         kernel_dispatches = _kernel_dispatches(
             data.get("kernel_dispatches"), fname, known_fused_ops)
         out[framework] = FrameworkBinding(
@@ -2101,6 +2189,7 @@ def _load_framework_bindings_dir(
             collective_anchors=anchors,
             precision_launches=precision_launches,
             edge_dtypes=edge_dtypes,
+            weight_loaders=weight_loaders,
             kernel_dispatches=kernel_dispatches,
         )
     return out

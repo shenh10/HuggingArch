@@ -57,6 +57,7 @@ class Entry:
     tensors_re: Optional[str] = None
     select: Optional[Any] = None
     scale_shape: Optional[List[str]] = None
+    block_scale_layout: Optional[Any] = None
     model_extra: Dict[str, Any] = field(default_factory=dict)
 
 

@@ -16,6 +16,7 @@ from backend.arch.eval.access import LeafAccess
 from backend.arch.eval.analysis import Point
 from backend.arch.eval.dim import value_of
 from backend.arch.eval.layer import Layer, Rewrite
+from backend.arch.eval.refusal import DeploymentRefusal
 from backend.arch.eval.values import Cost, Shape
 from backend.arch.dtypes import peak_kind
 from backend.arch.spec_tree import SpecIRTree
@@ -141,12 +142,15 @@ def leaf_peak(gpu: Any, dtype: str) -> Optional[float]:
 def serving_layers(step_eval: Any, *,
                    framework_binding: Optional[FrameworkBinding],
                    stage: Optional[int],
-                   timed: FrozenSet[str]) -> ServingLayers:
+                   timed: FrozenSet[str],
+                   allow_load_refusals: bool = False) -> ServingLayers:
     """The layers a step's rows are read from (`ServingLayers`), off its
     walk: its cell's for this reader configuration (`step_eval.Cell.
     serving`), so the points of a cell share them."""
     step_eval.walk  # noqa: B018 — the cell's walk, built before it is read
-    return step_eval.cell.serving(framework_binding, stage, timed)
+    return step_eval.cell.serving(
+        framework_binding, stage, timed,
+        allow_load_refusals=allow_load_refusals)
 
 
 def analyze(
@@ -184,6 +188,7 @@ def analyze(
     step_eval: Optional[Any] = None,
     include_aux_timing: bool = False,
     timed_stacks: Optional[Collection[str]] = None,
+    allow_load_refusals: bool = False,
     breakdown: bool,
 ) -> AnalysisResult:
     """Run physical serving analysis and return layer views plus wire rows.
@@ -204,6 +209,10 @@ def analyze(
     choice above when given: a speculative draft prices its MTP stack alone
     (`speculative_draft.SpeculativeDraft`), on the same step the backbone
     rows describe; an encode step (`step_eval.evaluate_encode`) its encoder.
+
+    A selected loader's refusal rejects the analysis. Only the kernel planner
+    passes `allow_load_refusals`, so it can turn the published refusal into an
+    unplaced cell instead of losing every other measurable cell.
 
     Without `step_eval`, the step is evaluated here at the workload the
     request states, and it must state it: `avg_input_tokens` and
@@ -237,7 +246,8 @@ def analyze(
             include_aux=include_aux_timing)
     )
     layers = serving_layers(step_eval, framework_binding=framework_binding,
-                            stage=stage, timed=timed)
+                            stage=stage, timed=timed,
+                            allow_load_refusals=allow_load_refusals)
     # The rows are read at this step's point: every layer above is the
     # walk's laws, and this is where they become this point's numbers.
     return step_rows(

@@ -170,6 +170,16 @@ collectives:
       worlds: [5, 6, 7, 8, 16]
       source_anchor: "CustomAllReduceV2's multicast two-shot (python/sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py:343-344), multimem.ld_reduce / multimem.st at python/sglang/kernels/jit/csrc/distributed/custom_all_reduce.cuh:123-127"
 
+# Checkpoint scale layouts this framework's model loader transforms. The model
+# spec declares the layout; this binding owns the framework behavior and its
+# audited source.
+weight_loaders:
+  mimo_v2_fused_qkv:
+    kind: tp_interleaved
+    loader: whole_chunks
+    when: { architectures: [MiMoV2ForCausalLM] }
+    source_anchor: "sglang loads whole interleaved chunks and merges them at lower TP (python/sglang/srt/models/mimo_v2.py:101-158), refusing a runtime attention TP that does not divide the checkpoint degree (python/sglang/srt/models/mimo_v2.py:118-122); at lower TP it dequantizes, de-interleaves Q/K/V and requantizes (python/sglang/srt/models/mimo_v2.py:193-289); the fused layer skips the generic block check (python/sglang/srt/models/mimo_v2.py:653), and the checkpoint degree comes from the fused-qkv KV-head count (python/sglang/srt/configs/model_config.py:117-145)"
+
 op_implementations:
   # The FA3 backend (srt/layers/attention/flashattention_backend.py:132), the
   # Hopper default for MHA and MLA (srt/arg_groups/model_override_base.py:297-303,

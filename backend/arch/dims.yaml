@@ -1679,3 +1679,9 @@ symbols:
       same launch (`SituAndMul(beta, linear_beta)`). Optional in vLLM: unset
       forwards the up branch.
     config: activation_situ_linear_beta
+  chunks_per_rank:
+    kind: constant
+    group: function_constants
+    meaning: >-
+      Number of checkpoint TP-interleaved FP8 scale-block chunks held on one
+      rank (`checkpoint_tp // runtime_tp`).

@@ -360,17 +360,20 @@ class Cell:
             return self._physical_flops
 
     def serving(self, framework_binding: Any, stage: Optional[int],
-                timed: Any) -> Any:
+                timed: Any, *,
+                allow_load_refusals: bool = False) -> Any:
         """The serving layers the walk is read through under
         `framework_binding`, for pipeline stage `stage` (None: the whole
         model), timing the stacks `timed` (`serving.ServingLayers`), built
         once, by the one builder of them (`serving.build_serving_layers`):
         what is kept under a key is what that key builds."""
         with self.lock:
-            return _kept(self._serving, (framework_binding, stage, timed),
+            return _kept(self._serving,
+                         (framework_binding, stage, timed, allow_load_refusals),
                          lambda: build_serving_layers(
                              self, framework_binding=framework_binding,
-                             stage=stage, timed=timed))
+                             stage=stage, timed=timed,
+                             allow_load_refusals=allow_load_refusals))
 
     def liveness(self, framework_binding: Any, timed: Any) -> Any:
         """The walk's activation liveness under `framework_binding`, timing
