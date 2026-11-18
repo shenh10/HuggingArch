@@ -843,6 +843,42 @@
       "verdict": "framework_replicated"
     }
   },
+  "moonshotai__Kimi-K3.1-Pro": {
+    "": {
+      "citations": {
+        "language_model.lm_head": "python/sglang/srt/models/kimi_k3.py:3508 ParallelLMHead",
+        "language_model.model.embed_tokens": "python/sglang/srt/models/kimi_k3.py:3205 VocabParallelEmbedding",
+        "language_model.model.norm": "python/sglang/srt/models/kimi_k3.py:3230 RMSNorm",
+        "language_model.model.output_attn_res_norm.weight": "python/sglang/srt/models/kimi_k3.py:3232 RMSNorm",
+        "language_model.model.output_attn_res_proj.weight": "python/sglang/srt/models/kimi_k3.py:3235 ReplicatedLinear"
+      },
+      "encoder": false,
+      "nodes": {
+        "language_model.lm_head": {
+          "decided_by": "sglang",
+          "framework": "split"
+        },
+        "language_model.model.embed_tokens": {
+          "decided_by": "sglang",
+          "framework": "split"
+        },
+        "language_model.model.norm": {
+          "decided_by": "sglang",
+          "framework": "replicated"
+        },
+        "language_model.model.output_attn_res_norm.weight": {
+          "decided_by": "sglang",
+          "framework": "replicated"
+        },
+        "language_model.model.output_attn_res_proj.weight": {
+          "decided_by": "sglang",
+          "framework": "replicated"
+        }
+      },
+      "source": "SGLang 1b2870d33de7b5f31844fd74e97eea6d7896c53a: each node's assignment, read by tools/corpus_pins/decisions/framework_split.py",
+      "verdict": "framework_split"
+    }
+  },
   "stepfun-ai__Step-3.7-Flash": {
     "vision": {
       "encoder": true,

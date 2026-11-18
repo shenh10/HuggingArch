@@ -351,10 +351,10 @@ def build_serving_layers(cell: Any, *,
     run under the walk's conditions (`Analysis.assumed`): a condition one of
     them states on the point joins the ones the point is checked against."""
     analysis = cell.built_walk()
-    launches = (framework_binding.precision_launches_for()
+    launches = (framework_binding.precision_launches_for(analysis.program, analysis)
                 if framework_binding is not None else ())
     unavailable_launches = (
-        framework_binding.unavailable_precision_launches_for()
+        framework_binding.unavailable_precision_launches_for(analysis.program, analysis)
         if framework_binding is not None else ())
     # The output widths the kernels this framework dispatches to require of
     # a declared role (`FrameworkBinding.edge_dtypes_for`), with both halves

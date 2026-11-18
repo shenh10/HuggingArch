@@ -1038,7 +1038,7 @@
         }
       ]
     },
-    "quant_scheme": "compressed-tensors",
+    "quant_scheme": "mxfp4-pack-quantized",
     "num_bits": 4
   },
   "forward_source": {

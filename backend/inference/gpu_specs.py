@@ -74,6 +74,9 @@ class GPUSpec:
     #: `is_device_capability_family(100)`). A generation name (`arch`) spans
     #: several capabilities, so it is its own column. Empty off CUDA.
     compute_capability: str = ""
+    #: Streaming multiprocessors available to runtime tile/split schedulers.
+    #: Unknown is not inferred from architecture or peak FLOPs.
+    sm_count: Optional[float] = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -277,6 +280,8 @@ DESCRIPTIVE_COLUMNS: Mapping[str, str] = MappingProxyType({
     "notes": "the sheet's provenance for a cell a reader would otherwise "
              "query — the clock a GeForce peak was scaled to (module "
              "docstring). Prose; nothing parses it",
+    "sm_count": "hardware streaming multiprocessor count; recorded for "
+                "tile/split schedulers, not yet read by dispatch or pricing",
 })
 
 

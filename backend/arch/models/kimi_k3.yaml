@@ -69,6 +69,7 @@ dims:
   d_lin_k_head:  config.text_config.linear_attn_config.head_dim              # 128
   d_lin_v_head:  config.text_config.linear_attn_config.head_dim              # 128
   s_conv_kernel:   config.text_config.linear_attn_config.short_conv_kernel_size  # 4
+  s_conv_history: "s_conv_kernel"  # Reference FLA cache retains the full convolution window.
   d_gate_lowrank:  config.text_config.linear_attn_config.head_dim              # 128 (full-rank-gate low-rank == head_dim)
   # Decay-gate form: lower-bounded sigmoid when the config sets
   # gate_lower_bound (-5.0 here), softplus otherwise (modeling_kimi_linear.py
