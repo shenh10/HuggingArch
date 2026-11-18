@@ -535,10 +535,14 @@ class CacheView:
                 fixed = Rate.of(tensor).fixed
                 if not fixed:
                     continue
-                owners = tensor.positions_over
+                # Physical cache geometry validates this as a positive whole
+                # rank count.  Make that boundary explicit before arithmetic
+                # so a symbolic dimension can never be decided by Python's
+                # division operator here.
+                owners = int(tensor.positions_over)
                 amount = occupancy.fold(
                     count * float(value_of(tensor.position_bytes))
-                    * fixed / owners)
+                    * fixed * float(sp.Rational(1, owners)))
                 symbolic = (
                     "n_layers × bytes_per_position × state_positions"
                     + (" / position_owners" if owners != 1 else ""))

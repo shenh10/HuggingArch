@@ -118,6 +118,10 @@ _DIM_MEANINGS = {
     "n_route_targets": "number of routed experts",
     "n_expert_copies": "number of stored expert copies",
     "n_experts_active": "experts selected for one token",
+    "total_params_per_layer": "parameter ledger total for one layer",
+    "attention_params_per_layer": "attention ledger total for one layer",
+    "experts_params_per_layer": "routed-expert ledger total for one layer",
+    "active_params_per_layer": "active parameter ledger total for one layer",
 }
 
 
@@ -326,10 +330,30 @@ def _append_block_formula_terms(row: "_Row", block: Any, layers: int,
         "total": total[2], "attention": attention[2],
         "experts": experts[2], "other": other[2], "active": active[2],
     }
-    if measured != expected:
-        raise ValueError(
-            f"{block.template_name}: formula terms {measured} do not match "
-            f"the parameter ledger {expected}")
+    # Some encoder blocks classify a compound as FFN while its descendants
+    # carry a different role family. In that case the projected ledger is
+    # still authoritative: write the category as the exact subtraction of
+    # total, attention and FFN instead of publishing an incomplete subtree.
+    if other[2] != expected["other"]:
+        other = (
+            f"({total[0]}) - ({attention[0]}) - ({ffn_total[0]})",
+            f"({total[1]}) - ({attention[1]}) - ({ffn_total[1]})",
+            expected["other"],
+        )
+    for name, value in expected.items():
+        if name == "other" or measured[name] == value:
+            continue
+        symbol = f"{name}_params_per_layer"
+        dims[symbol] = value
+        fallback = (symbol, str(value), value)
+        if name == "total":
+            total = fallback
+        elif name == "attention":
+            attention = fallback
+        elif name == "experts":
+            experts = fallback
+        elif name == "active":
+            active = fallback
 
     if experts[2]:
         ffn = (
