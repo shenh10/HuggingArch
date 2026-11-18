@@ -11,6 +11,7 @@ export type FormulaSubterm = {
   result_bytes?: number;
   note?: string;
   subterms?: FormulaSubterm[];
+  defs?: FormulaDef[];
 };
 
 /** An intermediate quantity a formula names, at the shown point: its law
@@ -112,6 +113,7 @@ export function formulaHTML({ title, label, symbolic, substituted, result, resul
         result_bytes: st.result_bytes,
         note: st.note,
         subterms: st.subterms,
+        defs: st.defs,
       })}</div>`);
     }
   }

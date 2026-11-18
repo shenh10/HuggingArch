@@ -15,6 +15,7 @@ breakdown) are the presentation rows the dashboard renders
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
@@ -161,6 +162,78 @@ class CacheView:
     #: The stacks whose cache these entries are (`cache_view_from_analysis`'s
     #: `cache_scope`) — what a pipeline stage re-counts within (`on`).
     cache_scope: FrozenSet[str] = frozenset({""})
+
+    def for_blocks(self, block_indexes: FrozenSet[int]) -> "CacheView":
+        """This view narrowed to the named model block invocations.
+
+        Composition rows can merge several derived block invocations.  Their
+        KV formula must therefore be built from the same cache entries as the
+        row's numeric total, rather than reconstructed from its label.
+        """
+        return replace(self, entries=tuple(
+            c for c in self.entries if c.block_index in block_indexes))
+
+    def _formula_defs(self, symbolic: str, *, cache_len: Optional[int] = None
+                      ) -> List[Dict[str, str]]:
+        """Definitions for every public symbol a KV formula prints."""
+        names = list(dict.fromkeys(re.findall(
+            r"[A-Za-z_][A-Za-z_0-9]*", symbolic or "")))
+        dims = self.source_analysis.program.resolved.dim_values
+        meanings = {
+            "d_head": "attention KV head width",
+            "d_indexer_head": "CSA indexer key width",
+            "d_kv_lora": "latent KV width",
+            "d_qk_rope": "rotary key width",
+            "d_lin_k_head": "linear-attention key head width",
+            "d_lin_v_head": "linear-attention value head width",
+            "n_heads": "number of attention heads",
+            "n_kv_heads": "number of KV heads",
+            "n_lin_v_heads": "number of linear-attention value heads",
+            "s_conv_kernel": "linear-attention convolution-state length",
+            "compress_ratio": "input tokens represented by one compressed row",
+        }
+        constant = "state_positions" in names
+        relevant = [
+            (c, t) for c in self.entries for t in c.cache.tensors
+            if ((Rate.of(t).fixed > 0) if constant
+                else (Rate.of(t).per_token > 0))
+        ]
+        counts = sorted({c.count for c, _t in relevant})
+        widths = sorted({t.element_bytes for _c, t in relevant})
+        special = {
+            "n_layers": ("cache-bearing layer count for each formula term",
+                         " / ".join(map(str, counts)) or "0"),
+            "bpe": ("bytes per cached data element",
+                    " / ".join(f"{w:g} B" for w in widths) or "0 B"),
+            "scales": ("dynamic quantization scales stored per position",
+                       "format-dependent"),
+            "scale_bytes": ("bytes per dynamic quantization scale",
+                            "format-dependent"),
+            "s_kv": ("cached sequence length", str(cache_len)
+                     if cache_len is not None else "request-dependent"),
+            "state_positions": ("positions held regardless of sequence length",
+                                "tensor-dependent"),
+            "position_owners": ("ranks sharing the stored positions",
+                                "tensor-dependent"),
+            "bytes_per_position": ("data plus dynamic-scale bytes per position",
+                                   "tensor-dependent"),
+        }
+        out: List[Dict[str, str]] = []
+        for name in names:
+            if name in special:
+                meaning, value = special[name]
+            elif name in dims:
+                meaning, value = meanings.get(name, "resolved model dimension"), str(dims[name])
+            else:
+                continue
+            out.append({"name": name, "formula": meaning, "value": value})
+        return out
+
+    def _with_formula_defs(self, formula: Dict[str, Any], *,
+                           cache_len: Optional[int] = None) -> Dict[str, Any]:
+        defs = self._formula_defs(formula.get("symbolic") or "",
+                                  cache_len=cache_len)
+        return {**formula, **({"defs": defs} if defs else {})}
 
     def on(self, stage: Any) -> "CacheView":
         """The same laws, re-counted for one pipeline stage
@@ -446,6 +519,53 @@ class CacheView:
                          scales],
         }
 
+    @memo_property
+    def growth_formula_explained(self) -> dict:
+        """The growth formula with definitions for composition popovers."""
+        return self._with_formula_defs(self.growth_formula)
+
+    @memo_property
+    def constant_formula(self) -> dict:
+        """The cache bytes held once per request, independent of its length."""
+        occupancy = self.occupancy()
+        terms: List[Dict[str, Any]] = []
+        for entry, count, *_ in self.entries:
+            tag = entry.variant or entry.label or "attention"
+            for tensor in entry.tensors:
+                fixed = Rate.of(tensor).fixed
+                if not fixed:
+                    continue
+                owners = tensor.positions_over
+                amount = occupancy.fold(
+                    count * float(value_of(tensor.position_bytes))
+                    * fixed / owners)
+                symbolic = (
+                    "n_layers × bytes_per_position × state_positions"
+                    + (" / position_owners" if owners != 1 else ""))
+                substituted = (
+                    f"{occupancy.prefix}{count}"
+                    f" × {float(value_of(tensor.position_bytes)):g} × {fixed}"
+                    + (f" / {owners}" if owners != 1 else ""))
+                terms.append({
+                    "label": f"{tag}.{tensor.name} × {count} layers",
+                    "symbolic": symbolic,
+                    "substituted": substituted,
+                    "result_bytes": amount,
+                    "note": tensor.resolved_format.label(),
+                })
+        total = self.growth_and_floor()[1]
+        if not terms:
+            return self._with_formula_defs({
+                "label": "constant KV state", "symbolic": "0",
+                "substituted": "0", "result_bytes": total})
+        return self._with_formula_defs({
+            "label": "constant KV state",
+            "symbolic": "Σ(n_layers × bytes_per_position × state_positions)",
+            "substituted": " + ".join(f"{t['result_bytes']:.0f}" for t in terms),
+            "result_bytes": total,
+            "subterms": terms,
+        })
+
     def _data_formula(self) -> dict:
         """`growth_formula`'s data term: the leaf law, per rank, with one
         subterm per class when there is more than one."""
@@ -539,7 +659,7 @@ class CacheView:
         inner_val = " + ".join(parts_val)
         substituted = _sub(inner_val) if prefix else inner_val
         return {
-            "label": "n_layers × (Σ_leaf expr) × bpe",
+            "label": "n_layers × (sum of cached tensor elements) × bpe",
             "symbolic": " + ".join(parts_sym),
             "substituted": substituted,
             "result_bytes": total,
