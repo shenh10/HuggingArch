@@ -78,9 +78,11 @@ MINIMAL_DIMS: Dict[str, int] = {
     "d_model": 256,
     "d_ffn": 512,
     # The two widths a q / latent-KV norm pair normalises over. Unequal, so a
-    # kernel that swapped the rows (or sized both by one) does not pass.
-    "d_q_lora": 384,
-    "d_kv_lora": 256,
+    # kernel that swapped the rows (or sized both by one) does not pass; and
+    # as DeepSeek-V4.1's a-norm pair has them, the q-LoRA row a whole number
+    # of MXFP8 groups at 128 and the latent KV row the model's 512-wide head.
+    "d_q_lora": 128,
+    "d_kv_lora": 512,
     "n_vocab": 256,
     "n_experts": 8,
     "n_experts_active": 2,
@@ -94,6 +96,15 @@ MINIMAL_DIMS: Dict[str, int] = {
     # composed over an inner one.
     "n_comm_elems": 256,
     "n_comm_stride": 1,
+    # A routed exchange's fan-out (`routed_all_to_all`): how many
+    # destinations a token's top-k reaches, which is how many copies of it
+    # the dispatch sends. `n_experts_active` above is the top-k width; the
+    # two below are the destinations it draws from and the ones that hold
+    # weights. Unequal, so a cell that confused the denominator with the
+    # weighted count does not pass: 8 of the 10 destinations are experts,
+    # the other 2 a zero-compute reserve.
+    "n_route_targets": 10,
+    "n_route_experts": 8,
     "n_indexer_heads": 4,
     "d_indexer_head": 64,
     "s_sparse_block": 32,
@@ -149,10 +160,6 @@ MINIMAL_DIMS: Dict[str, int] = {
     "d_out": 256,
     "d_rope": 64,
     "d_v_head": 64,
-    # DeepSeek-V4.1's a-norm pair: the q-LoRA row is a whole number of MXFP8
-    # groups at 128, and the latent KV row is the model's 512-wide head.
-    "d_q_lora": 128,
-    "d_kv_lora": 512,
     # Three-axis MRoPE at the minimal rotary width: [11, 11, 10] owns all 32
     # pairs of a 64-channel rotation; smoke takes the interleaved lane layout,
     # the variant whose flag is present rather than absent.

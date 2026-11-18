@@ -153,7 +153,7 @@ class TestDefaultsEndpoint:
             "model_id": "meta-llama/Llama-3.2-3B",
             "gpu_sku": "B300",
             "modes": ["dp_ep", "tp_tp"],
-            "context_len": 1024,
+            "contexts": [1024],
             "gpu_skus": ["B300"],
             "selection_mode": "theoretical_only",
             "avg_output_tokens": 64,
@@ -212,9 +212,10 @@ class TestDefaultsEndpoint:
 
     def test_frontier_view_reads_the_sweeps_cloud(self):
         """`/inference/parallel-sweep/frontier` is a view of the sweep the
-        same body posts: its lines are `decode_frontier` of that sweep's
-        cached `decode_cloud` (kept on the server: the sweep endpoint does
-        not ship it), and a dimension outside the cloud's is refused."""
+        same body posts: its lines are `cloud_view` of that sweep's
+        cached `throughput_cloud` (kept on the server: the sweep endpoint does
+        not ship it) — its frontier by default, its lines along an X when
+        asked — and a dimension outside the cloud's is refused."""
         import asyncio
 
         from fastapi.testclient import TestClient
@@ -222,22 +223,58 @@ class TestDefaultsEndpoint:
         from backend.api import app
         from backend.api._models import InferenceParallelSweepRequest
         from backend.api.sweep_runtime import compute_parallel_sweep_cached
-        from backend.inference.parallel_sweep import decode_frontier
+        from backend.inference.parallel_sweep import cloud_view
 
         client = TestClient(app)
         sweep = {"model_id": "meta-llama/Llama-3.2-3B", "gpu_sku": "B300",
-                 "modes": ["tp_tp"], "context_len": 1024, "gpu_skus": ["B300"],
+                 "modes": ["tp_tp"], "contexts": [1024], "gpu_skus": ["B300"],
                  "selection_mode": "theoretical_only", "avg_output_tokens": 64}
         shipped = client.post("/inference/estimate-parallel-sweep", json=sweep).json()
-        assert "decode_cloud" not in shipped
+        assert "throughput_cloud" not in shipped
         cloud = asyncio.run(compute_parallel_sweep_cached(
-            InferenceParallelSweepRequest(**sweep, sol_only=True)))["decode_cloud"]
+            InferenceParallelSweepRequest(**sweep, sol_only=True)))["throughput_cloud"]
         fix, by = {"num_gpus": [2]}, ["gpu_sku", "batch_key"]
         r = client.post("/inference/parallel-sweep/frontier",
                         json={"sweep": sweep, "fix": fix, "group_by": by})
         assert r.status_code == 200, r.text
-        assert r.json() == decode_frontier(cloud, fix=fix, group_by=by)
+        assert r.json() == cloud_view(cloud, fix=fix, group_by=by)
         assert len(r.json()["series"]) > 1
+        # The same holds as lines along the per-GPU batch: one view of the
+        # one cloud, with the frontier's control values.
+        line = client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "fix": fix, "group_by": ["gpu_sku"],
+            "form": "line", "x": "batch"})
+        assert line.status_code == 200, line.text
+        assert line.json() == cloud_view(cloud, form="line", x="batch",
+                                          fix=fix, group_by=["gpu_sku"])
+        assert line.json()["values"] == r.json()["values"]
+        # The other phase of the same cloud, and an X the decode cloud has
+        # had all along: one more view of one cloud, no second request shape.
+        pre = client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "phase": "prefill", "fix": fix,
+            "group_by": ["gpu_sku"], "form": "line", "x": "context"})
+        assert pre.status_code == 200, pre.text
+        assert pre.json() == cloud_view(cloud, phase="prefill", form="line",
+                                        x="context", fix=fix,
+                                        group_by=["gpu_sku"])
+        drawn = [q for line in pre.json()["series"] for q in line["points"]]
+        assert drawn and all(q["prefill_tok_s_per_gpu"] > 0 for q in drawn)
+        assert pre.json()["axes"]["sol"] == ["prefill_tok_s_per_user",
+                                             "prefill_tok_s_per_gpu"]
+        # Which (phase, form) pairs this cloud answers is its own answer,
+        # the same with every view: prefill runs one request per point, so a
+        # line of it along the decode batch is not a view of it.
+        forms = pre.json()["forms"]
+        assert forms == r.json()["forms"]
+        assert forms["decode"]["batch"] is None
+        assert "batch" in forms["prefill"]["batch"]
+        assert forms["prefill"]["frontier"] is None
+        assert forms["prefill"]["num_gpus"] is None
+        assert client.post("/inference/parallel-sweep/frontier", json={
+            "sweep": sweep, "phase": "encode"}).status_code == 422
+        for missing_x in ({"form": "line"}, {"x": "batch"}):
+            assert client.post("/inference/parallel-sweep/frontier", json={
+                "sweep": sweep, **missing_x}).status_code == 422
         bad = client.post("/inference/parallel-sweep/frontier",
                           json={"sweep": sweep, "group_by": ["layout"]})
         assert bad.status_code == 422

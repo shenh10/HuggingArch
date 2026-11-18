@@ -108,7 +108,7 @@ def test_a_refused_chunk_point_is_dropped_without_replacing_the_walk():
     one-walk call, and especially must not fall back to the endpoint's
     full-sequence geometry.
     """
-    from kernel_bench.plan import _read_group
+    from kernel_bench.plan import _Forward, _read_group
 
     parallel = ParallelConfig(tp_attention=4, dcp=2)
     first = PlanPoint(8192, 0, 1, 1)
@@ -117,7 +117,7 @@ def test_a_refused_chunk_point_is_dropped_without_replacing_the_walk():
 
     def analyze(point):
         walked.append(point)
-        return [[object()]]
+        return [[_Forward(object())]]
 
     def jobs_over_ranks(_ranks, _rows_of, _step_seq):
         return ([{"signature": "gemm"}], [], [])
@@ -138,7 +138,7 @@ def test_a_refused_chunk_point_is_dropped_without_replacing_the_walk():
 def test_the_anchor_is_canonical_not_caller_order(monkeypatch):
     """Two callers listing the same points ask for the same walk family."""
     from backend.inference import batch_sweep
-    from kernel_bench.plan import _read_group
+    from kernel_bench.plan import _Forward, _read_group
 
     class FakeAnalysis:
         def __init__(self):
@@ -154,10 +154,10 @@ def test_the_anchor_is_canonical_not_caller_order(monkeypatch):
 
     def analyze(point):
         walked.append(point)
-        return [[FakeAnalysis()]]
+        return [[_Forward(FakeAnalysis())]]
 
     def jobs_over_ranks(_ranks, rows_of, _step_seq):
-        return ([{"rows": rows_of(FakeAnalysis())}], [], [])
+        return ([{"rows": rows_of(_Forward(FakeAnalysis()))}], [], [])
 
     monkeypatch.setattr(
         batch_sweep, "rows_at",

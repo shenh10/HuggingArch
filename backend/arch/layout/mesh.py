@@ -123,75 +123,9 @@ def region_of(axis: str) -> Optional[str]:
 
 def axis_degrees(pc: "ParallelConfig") -> dict:
     """`{axis: degree}` for every axis the mesh lays out — the argument
-    `alias_map` wants, in `ParallelConfig`'s vocabulary."""
+    `spans` wants, in `ParallelConfig`'s vocabulary."""
     return {axis: _sz(pc, axis)
             for axes in REGION_AXES.values() for axis in axes}
-
-
-def alias_map(degrees: Mapping[str, int]) -> dict:
-    """Which worlds name the SAME process group at these degrees — a map from
-    world to the representative of its alias class (worlds with no alias are
-    absent).
-
-    Two axes are one group when they start at the same STRIDE and span the
-    same number of ranks, because that is what being the same set of ranks
-    means on a mesh whose regions all fill one pipeline stage. Both facts come
-    off `REGION_AXES` inner→outer, so this reads the layout rather than
-    restating it, and an axis in two regions is spaced by the one
-    `region_of` picks.
-
-    It decides whether a state cut on one world and a state cut on another are
-    cut over the same ranks — not whether they are cut the SAME WAY, which the
-    axes then say. Both answers matter and they are different collectives:
-
-      * Same ranks, same axis → nothing to do. This is the three TP worlds,
-        each the innermost of its region (stride 1) and therefore one group
-        whenever the degrees agree — which is also what the frameworks build:
-        vLLM and Megatron have ONE TP group and attention, dense FFN and
-        experts all collectivize in it. The degree is split into three knobs so
-        a deployment CAN differ per region, not to claim three groups when the
-        numbers agree. Under sequence parallelism the residual is sharded
-        across a whole block, meeting attention at one end and the FFN at the
-        other; unaliased, that meeting derived a re-shard — an all_gather per
-        block that moves nothing, on a group that is the same ranks at both
-        ends. At DIFFERENT degrees they are different partitions and the
-        re-shard is real, which is why stride and size both have to match.
-
-      * Same ranks, different axis → one all_to_all. This is the MoE seam.
-        `REGION_AXES` gives the MoE region no token axis, so `ep_moe` starts
-        where the attention region's token axis starts and spans what it
-        spans: the tokens a rank holds cut by POSITION (`cp`) or by REQUEST
-        (`dp_attention`) are the same tokens the expert bank re-cuts by OWNER,
-        over the same ranks. Unaliased, each partitioning looks replicated to
-        the other and the seam derives a pair of gathers — every token to
-        every rank — in place of the exchange that moves each token once.
-
-    The one shape this cannot name is `cp` AND `dp_attention` both above 1
-    alongside `ep_moe` — the `DeepSeek-V3-dpcpep` golden case, where the token
-    cut is two axes at two strides whose spans TOGETHER tile `ep_moe`'s. An
-    equivalence class holds one span, so the three fall in three classes and
-    neither of `ep_moe`'s two sides reads as the exchange it is: the dispatch
-    sees a world nothing names and calls it replicated, which makes acquiring
-    the expert cut a free logical split, and the return sees a lone `ep_moe`
-    shard over a stage that wants none and all_gathers it. One collective
-    instead of two, 4x the payload, 2x the true cost of the pair.
-
-    Both halves are the same missing statement — that a world whose ranks are
-    already cut by OTHER worlds is not replicated over — and it is a
-    containment question, which `contains` answers and an equivalence cannot:
-    `ep_moe` speaks for `cp` and for `dp_attention`, and neither of those
-    speaks for the other. Turning that preorder into the relation `overlay`
-    supersedes by is the fix, and it is a change to the algebra rather than to
-    this table. Until then `contains` keeps the seam from collapsing further:
-    both cuts lie inside `ep_moe`'s span, it says so, and pricing the bank's
-    exit as a local partial-sum reduce would turn a visible over-count into an
-    invisible wrong answer.
-    """
-    classes: dict = {}
-    for axis, span in spans(degrees).items():
-        classes.setdefault(span, []).append(axis)
-    return {axis: members[0]
-            for members in classes.values() for axis in members}
 
 
 def spans(degrees: Mapping[str, int]) -> dict:
@@ -199,9 +133,20 @@ def spans(degrees: Mapping[str, int]) -> dict:
     `REGION_AXES` inner→outer, and how far it reaches. Only axes above 1 are
     listed; an axis of 1 spans one rank and answers nothing.
 
-    The layout fact, once, for the questions asked of it: `alias_map` asks
-    which axes start and reach the same (same ranks), `contains` asks which
-    reach lies inside which (one group's ranks drawn from another's)."""
+    This is the only thing the mesh says about a world's ranks: the resolver
+    (`resolver.families_for`) turns each span into an explicit
+    `ProcessGroupFamily`, and every question of how two worlds relate — the
+    same ranks, one group inside another, interleaved — is asked of those
+    members (`groups.same` / `refines` / `orthogonal` / `overlaps`, and the
+    route seam's `LayoutPropagation._axis_group_invariant`), never of the
+    stride arithmetic here. Membership is what prices a token cut made of
+    TWO worlds at two strides (`cp` and `dp_attention` both above 1 under
+    `ep_moe`): the dispatch joins the token owner cells with the route
+    groups (`LayoutPropagation.routed_rows_layout`) — what varies inside a
+    route group is absorbed, which is the all_to_all exchange, and what
+    varies across route groups survives as a row cut. A
+    stride/size equivalence over spans could only compare one span with one,
+    and read the two-world cut as replicated."""
     out: dict = {}
     for region in sorted(REGION_AXES):
         stride = 1
@@ -211,39 +156,6 @@ def spans(degrees: Mapping[str, int]) -> dict:
                 out[axis] = (stride, size)
             stride *= size
     return out
-
-
-def contains(degrees: Mapping[str, int], outer: str, inner: str) -> bool:
-    """Whether every rank `inner` spans is one `outer` spans too.
-
-    Weaker than `alias_map`'s question and asked when the weaker answer is the
-    one that matters. The MoE seam needs to know whether the tokens arriving at
-    the bank were cut across the ranks that own the experts — cut how, and by
-    which knob, is the axes' business. When the token cut is a single world the
-    two questions coincide; when it is `cp` AND `dp_attention` at once, the
-    cuts fall in two alias classes that each lie INSIDE `ep_moe`'s, and only
-    this question still answers yes. The exchange is real in both shapes, and
-    `alias_map` records what the two-axis one still costs to derive.
-
-    Containment is not the LAST question this seam will ask. The ranks of an
-    expert group hold different tokens whenever the two axes' rank strides
-    interleave at all, which containment sees only when the token cut starts
-    no earlier than the expert cut — true when attention and the bank run at
-    the same TP width, and false for `tp_attention=1` against
-    `tp_moe_expert=4`, where the exchange is real and this answers no. Widening
-    it to the overlap is a two-line change and a one-collective consequence:
-    the legs would then be named on worlds of DIFFERENT sizes, and the pair
-    would be priced as two collectives at two group sizes rather than one
-    round trip. That is the same preorder the DSv3 dp×cp×ep case wants, and it
-    is held for one repair rather than taken in halves."""
-    layout = spans(degrees)
-    if inner not in layout or outer not in layout:
-        return False
-    (inner_stride, inner_size), (outer_stride, outer_size) = (
-        layout[inner], layout[outer])
-    return (inner_stride % outer_stride == 0
-            and inner_stride * (inner_size - 1)
-            <= outer_stride * (outer_size - 1))
 
 
 def group_size(pc: "ParallelConfig", region: str) -> int:

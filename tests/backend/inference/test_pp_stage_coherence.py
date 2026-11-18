@@ -217,7 +217,7 @@ class TestEveryCardBillsItsOwnStage(unittest.TestCase):
     def test_a_second_card_on_another_stage_gets_that_stages_rows(self):
         from backend.inference.capacity import estimate_capacity
         from backend.inference.parallel_config import ParallelConfig
-        from backend.inference.parallel_sweep import _estimate_layout
+        from tests.sweep_parity import layout_at
         from tests.snapshots import shared_loader
 
         config = json.loads(
@@ -228,7 +228,7 @@ class TestEveryCardBillsItsOwnStage(unittest.TestCase):
                       parallel=ParallelConfig(pp=4), num_gpus=4,
                       avg_input_tokens=4096, avg_output_tokens=256,
                       prefill_batch_size=1, decode_batch_size=8)
-        stamped = _estimate_layout({**common, "gpu_skus": list(self.CARDS)})
+        stamped = layout_at({**common, "gpu_skus": list(self.CARDS)})
         direct = {sku: estimate_capacity(gpu_sku=sku, **common)
                   for sku in self.CARDS}
         stages = {sku: d["memory"]["pp_stage"] for sku, d in direct.items()}

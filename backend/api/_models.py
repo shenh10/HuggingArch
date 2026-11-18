@@ -20,7 +20,9 @@ from backend.inference.calibration_overlay import looks_up
 from backend.inference.framework_bindings import DEFAULT_FRAMEWORK
 from backend.inference.defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_DEFAULT
 from backend.measure.scope import NONE as NO_MEASUREMENTS, MeasurementScope
-from backend.inference.parallel_sweep import ALL_MODES, DecodeCloudDim, _resolve_modes
+from backend.inference.frontier import CloudPhase, LineAxis, ViewForm
+from backend.inference.sweep_grid import ROUTINE_SEQ_LENS
+from backend.inference.parallel_sweep import ALL_MODES, CloudDim, _resolve_modes
 from backend.playground import entry_key
 
 
@@ -626,7 +628,10 @@ class InferenceParallelSweepRequest(SweepRequest):
     """
     mode: Optional[str] = None                 # dp_ep | cp_ep | tp_ep | tp_tp
     modes: Optional[List[str]] = None
-    context_len: int                           # fixed sequence length
+    #: The prompt lengths every layout is priced at (one walk per card
+    #: class, the rest by substitution): the throughput cloud's `context`
+    #: coordinate and each chart point's context.
+    contexts: List[int]
     batch: Optional[int] = None                # per-GPU batch; None = each config's max
     gpu_skus: Optional[List[str]] = None       # GPU series; None = curated default
     gpu_sku: str = ""                          # inherited-but-ignored (each point sets its own)
@@ -635,6 +640,23 @@ class InferenceParallelSweepRequest(SweepRequest):
     # no topology determines is carried here; it is not per-point, so it is
     # part of the sweep's cache key.
     ep_load_factor: float = Field(1.0, ge=1.0)
+
+    @field_validator("contexts")
+    @classmethod
+    def _contexts_on_the_routine_grid(cls, v: List[int]) -> List[int]:
+        """A subset of the routine context grid (`ROUTINE_SEQ_LENS`): the
+        work a request asks is bounded, and every context is one a canonical
+        serving record carries (`serving_projection.servingProjectionContexts`),
+        so the sweep can project rather than walk."""
+        if not v:
+            raise ValueError("contexts must be non-empty")
+        off = [c for c in v if c not in ROUTINE_SEQ_LENS]
+        if off:
+            raise ValueError(f"contexts must be on the routine grid "
+                             f"{ROUTINE_SEQ_LENS}; got {off}")
+        if len(set(v)) != len(v):
+            raise ValueError("contexts must not repeat a length")
+        return v
 
     @model_validator(mode="after")
     def _modes_resolved(self) -> "InferenceParallelSweepRequest":
@@ -649,14 +671,31 @@ class InferenceParallelSweepRequest(SweepRequest):
 
 
 class ParallelFrontierRequest(BaseModel):
-    """A decode Pareto frontier off a parallel sweep's point cloud
-    (`parallel_sweep.decode_frontier`): the sweep as the Scaling panel posts
-    it (read as its SOL answer, `sol_only`: the cloud is SOL only), the
-    dimensions held to a set of values, and the ones each drawn line is one
-    value of."""
+    """A view of a parallel sweep's throughput point cloud
+    (`parallel_sweep.cloud_view`): the sweep as the Scaling panel posts it
+    (its answer's cache entry — a `sol_only` body reads the SOL answer, a
+    measured one the measured answer), the phase drawn, the dimensions held
+    to a set of values, the ones each drawn line is one value of, and the
+    form — each line its Pareto frontier (`frontier`), or its points along
+    `x` (`line`: GPU count, per-GPU decode batch or context).
+
+    Which (phase, form) pairs the cloud can actually answer is the cloud's
+    own answer, published with every view (`frontier.view_forms`); this
+    model validates only the vocabulary and the form/x pairing."""
     sweep: InferenceParallelSweepRequest
-    fix: Dict[DecodeCloudDim, List[Union[int, str]]] = Field(default_factory=dict)
-    group_by: List[DecodeCloudDim] = Field(default_factory=lambda: ["gpu_sku"])
+    phase: CloudPhase = "decode"
+    fix: Dict[CloudDim, List[Union[int, str]]] = Field(default_factory=dict)
+    group_by: List[CloudDim] = Field(default_factory=lambda: ["gpu_sku"])
+    form: ViewForm = "frontier"
+    x: Optional[LineAxis] = None
+
+    @model_validator(mode="after")
+    def _x_matches_form(self) -> "ParallelFrontierRequest":
+        if self.form == "line" and self.x is None:
+            raise ValueError("a line view names its X axis (x)")
+        if self.form == "frontier" and self.x is not None:
+            raise ValueError("a frontier view has no X axis; drop x")
+        return self
 
 
 class CompareFrontierRequest(BaseModel):

@@ -190,7 +190,7 @@ def keyable(monkeypatch):
 
 @pytest.mark.parametrize("kind, cls, extra", [
     ("sweep", InferenceEstimateSweepRequest, {"seq_lens": [1024]}),
-    ("parallel", InferenceParallelSweepRequest, {"modes": ["tp_tp"], "context_len": 1024,
+    ("parallel", InferenceParallelSweepRequest, {"modes": ["tp_tp"], "contexts": [1024],
                                                  "gpu_skus": ["H100-SXM"]}),
 ])
 def test_sweep_answers_with_rows_are_never_stored_and_joins_separate_callers(
@@ -212,7 +212,7 @@ def test_sweep_answers_with_rows_are_never_stored_and_joins_separate_callers(
 
 @pytest.mark.parametrize("kind, cls, extra", [
     ("sweep", InferenceEstimateSweepRequest, {"seq_lens": [1024]}),
-    ("parallel", InferenceParallelSweepRequest, {"modes": ["tp_tp"], "context_len": 1024,
+    ("parallel", InferenceParallelSweepRequest, {"modes": ["tp_tp"], "contexts": [1024],
                                                  "gpu_skus": ["H100-SXM"]}),
 ])
 def test_theory_keys_carry_no_scope(keyable, kind, cls, extra):
@@ -227,7 +227,7 @@ def test_theory_keys_carry_no_scope(keyable, kind, cls, extra):
 @pytest.mark.parametrize("path, name, extra", [
     ("/inference/estimate-sweep", "estimate_sweep_response", {"seq_lens": [1024]}),
     ("/inference/estimate-parallel-sweep", "parallel_sweep_response",
-     {"modes": ["tp_tp"], "context_len": 1024, "gpu_skus": ["H100-SXM"]}),
+     {"modes": ["tp_tp"], "contexts": [1024], "gpu_skus": ["H100-SXM"]}),
 ])
 def test_both_sweeps_resolve_before_the_work(client, resolver, service, monkeypatch,
                                              path, name, extra):

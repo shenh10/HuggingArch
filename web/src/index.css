@@ -182,8 +182,27 @@ table[data-resized] [data-cap] { width: auto; max-width: 100%; }
   50% { left: 97%; }
   100% { left: 2%; }
 }
+/* The box of something still being computed — a chart's plot area, a
+ * control that has nothing to offer yet: the shape it will have, with a
+ * sheen crossing it. Quiet on purpose: it stands in for content, it is not
+ * a spinner competing with the text beside it. */
+/* The sheen is the element's own background, not a positioned pseudo-element:
+ * this class sets no `position`, so a box that must be `absolute` (a chart's
+ * plot area, inside its axis frame) stays absolute. */
+.skeleton {
+  background-color: #eef0f3;
+  background-image: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.9), transparent);
+  background-size: 45% 100%;
+  background-repeat: no-repeat;
+  animation: skeleton-sheen 1.6s ease-in-out infinite;
+}
+@keyframes skeleton-sheen {
+  0% { background-position: -50% 0; }
+  100% { background-position: 150% 0; }
+}
 @media (prefers-reduced-motion: reduce) {
   .progress-indeterminate, .progress-rocket-body, .progress-rocket-slide { animation: none; }
+  .skeleton { animation: none; }
 }
 /* vanilla main.css .fade-in — Inspector #results */
 .fade-in {

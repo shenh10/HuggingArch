@@ -133,7 +133,10 @@ triples. The whole sweep is **one cell** (`CapacitySweepPlan.cells`): context
 and batch are both point coordinates.
 
 `capacity._sweep_cell` walks once — at the first context, batch 1 — and reads
-every (context, batch) point off that walk:
+every (context, batch) point off that walk. Which walk a context reads is one
+rule, `capacity.ContextAnchors` (per bound stage, the first walk at a verify
+width walked alike; every later context substitutes its length and prefix),
+which the parallel sweep's layouts read too (§3.3):
 
 1. per context, the capacity ceilings at that length (`capacity_ceilings`);
 2. per batch point, the batch a direct estimate would run
@@ -158,26 +161,52 @@ which is the unit of progress reporting and resumption (§7.4).
 
 ### 3.3 The parallel sweep: one cell per layout
 
-`parallel_sweep.ParallelSweepPlan` enumerates one `LayoutCell` per (mode,
-degree) for the requested modes (`dp_ep`, `cp_ep`, `tp_ep`, `tp_tp`); the card
-series (`DEFAULT_SWEEP_GPUS`) and the cards' batches are points.
-`_estimate_layout` walks once per (card class, bound pipeline stage), restamps
-each card of the class off that walk (§4), re-reads the rows at the card's
-batch (`_point_batches`: the card's ceiling, or a pinned batch clamped to it)
-and returns `{gpu_sku: {"sol", "measures", "ladder"}}`. A card that lists no
-peak for a dtype the step computes in fails alone; a layout the model does not
-deploy under is reported as refused, with the layout's reason
-(`run_layout_cell`).
+`parallel_sweep.ParallelSweepPlan` enumerates one `LayoutCell` per
+deployment the requested modes' ladders reach (`dp_ep`, `cp_ep`, `tp_ep`,
+`tp_tp`, each from one GPU to `SWEEP_MAX_GPUS`); the one-GPU deployment is the
+same config in every mode, so it is one cell every mode reads
+(`LayoutCell.modes`). The card series (`DEFAULT_SWEEP_GPUS`), the request's
+`contexts` and the cards' batches are points. `_estimate_layout` walks once per
+(card class, bound pipeline stage) at the first context that needs it
+(`capacity.ContextAnchors`, the rule §3.2 states), restamps each card of the
+class off that walk (§4), substitutes every other context, re-reads the rows
+at the card's batch (`_point_batches`: the card's ceiling, or a pinned batch
+clamped to it) and returns `{gpu_sku: [{"context", "sol", "measures",
+"ladder"} per context]}`. A card that lists no peak for a dtype the step
+computes in fails alone; a context the layout refuses or fails at is that
+(card, context)'s absent point (`parallel_sweep._absent`, the cloud's refusal
+vocabulary), its other contexts priced; a layout the model does not deploy
+under is reported as refused, with the layout's reason (`run_layout_cell`).
 
-Each layout is also read at every per-GPU decode batch of
-`sweep_grid.SCALING_DECODE_LADDER` (`_decode_ladder`, SOL only). Those points
-form the sweep's decode point cloud (`point_cloud`, the one producer of cloud
-records); a decode Pareto frontier is a view of that cloud
-(`decode_frontier`), computed on the server from the cached answer.
+Each layout is also read, at every context, at every per-GPU decode batch of
+`sweep_grid.SCALING_DECODE_LADDER` that fits and at the card's ceiling
+(`decode_rungs`, `_decode_ladder`; a rung keys no measurement, so the DECODE
+side is SOL only). Those rungs form the sweep's throughput point cloud
+(`point_cloud`, the one producer of cloud records), each carrying its
+deployment's PREFILL too — the sweep prices prefill once per (card, layout,
+context), at one request, so it is the same fact on every rung of that
+layout's ladder and is read onto each after the sweep's one measured fold
+(`point_cloud.parallel_records`). A
+point exists when its requests' cache fits (`capacity.fits`); a context past
+the model's published length keeps its points, flagged `beyond_max_context`,
+in every cloud and view (`capacity.point_served` — in context and fits — is
+what a plan that measures points asks). A point's `mode` is its deployment's
+(`frontier.parallel_mode`: the one-GPU deployment is `tp1`, one point);
+that it is also the first rung of every mode's ladder that has points past
+one GPU is the views' rule (`frontier.mode_ladders`). EVERY throughput chart
+of the Scaling panel — prefill and decode alike — is a view of that one cloud
+(`cloud_view`, computed on the server from the cached answer): a phase of it,
+each line its Pareto front (`frontier.frontier_view`) or its points along GPU
+count, per-GPU batch or context (`frontier.line_view`, the best point where
+several share an X). Which (phase, form) pairs the cloud can answer is derived
+from the cloud and published with every view (`frontier.view_forms`): a phase
+whose value does not MOVE along an axis — prefill along the decode batch — is
+no line view of it, which is why no consumer carries that rule.
 
 `ParallelSweepPlan.assemble` makes the sweep's one lookup (§5.2) over every
-card of every layout, then turns each card into a chart point
-(`parallel_sweep._point`).
+card of every layout at every context, then turns each into a deployment point
+(`parallel_sweep._point`, naming its context): whether that deployment serves,
+and what it is. No throughput is on it.
 
 ### 3.4 The single estimate is a one-point sweep
 
@@ -679,7 +708,7 @@ list.
 |---|---|
 | `/inference/estimate` `phases.<phase>` | `t_measured_s` (null unless complete), `coverage`, and the older `measured_rows` / `total_rows` (the page falls back to these, with no states, when `coverage` is absent) |
 | `/inference/estimate-sweep`, each point's `phases.<phase>` | The same after a measured fold; its SOL projection carries no breakdown row counts |
-| `/inference/estimate-parallel-sweep`, each chart point | `<phase>_tps_per_gpu_measured`, `<phase>_t_measured_s` (null unless complete), `<phase>_measured_coverage` |
+| `/inference/estimate-parallel-sweep`, each point of the throughput cloud (its decode rungs are SOL only) | `prefill_tok_s_per_gpu_measured`, `prefill_tok_s_per_user_measured`, `prefill_t_measured_s` (null unless complete), `prefill_coverage` |
 | `/inference/estimate` and sweep points, `phases.<phase>` | `t_partial_s`, `partial_measured_share`, `throughput.partial` (§5.6; absent until a measured fold reads) |
 | `/gallery/frontier`, each model | `frontier_partial` (every point with a SOL time, blended at the view's floors and K; each carries `partial_measured_share`), `frontier_measured` (through fully measured points only), `measured_track.state` (`reads` / `none` / `unavailable` / `engine_error`) and, when it reads, `measured_track.coverage` per context (points, complete points, best and median share, keys most needed per state) |
 | Per-op rows (`per_op_timing*`, `phases.<phase>.flops_by_module`) | `t_measured_s` (`0` on zero-cost rows, null where not measured), `measured_state`, `measured_key` |
@@ -817,6 +846,16 @@ A Scaling sweep body has two answers, and they are two requests
   server every time and never held in the tab, and it is drawn over the SOL
   curves. A slow or failed measured answer leaves the SOL curves in place.
 
+Which bodies have a measured answer at all follows what is drawn from them.
+The Scaling panel ticks Measured for the PARALLEL sweep, whose cloud carries
+the prefill the fold writes; its views then read that answer's cloud and draw
+the measured rates sitting on those same points (one view request, not two).
+The Context × Batch sweep draws KV storage alone — a capacity fact with no
+step time — so the panel never asks it for a measured answer. A cloud's
+decode rungs key no measurement at all (`parallel_sweep._decode_ladder`), so
+decode stays SOL on every road, and the view says so by publishing only the
+tracks its cloud carries (`frontier._view_payload`).
+
 Plan and Compare ask for measured answers directly. One cache implementation
 owns every request entry and in-flight join (`measure/cache.KeyedCache`); no
 endpoint hand-rolls a dict and a lock.
@@ -896,9 +935,9 @@ the lake serves runs the landing warm, then the full
 one minute, so the API opens first; the landing warm still runs before the
 full grid and folds the current measurement overlay onto the shared H100
 entries. The full warm materializes the public
-Scaling request matrix (`warm.scaling_jobs`: featured models × contexts, the
-parallel sweep over all modes, and Context × Batch over cards × modes ×
-degrees) from the canonical laws, and folds the Gallery's measured tracks
+Scaling request matrix (`warm.scaling_jobs`: per featured model one parallel
+sweep over all modes and every routine context, and Context × Batch over
+cards × modes × degrees) from the canonical laws, and folds the Gallery's measured tracks
 under the lake's real scope. The server process never warms itself: a warm
 inside it would compete with user requests for the GIL and the sweep pool.
 

@@ -6,7 +6,7 @@ import pytest
 from backend.inference.capacity import estimate_capacity
 from backend.inference.row_roofline import ROW, column_names
 from backend.inference.sol_closure import check_closure
-from tests.sweep_parity import Deployment, FixtureBench, diff, report
+from tests.sweep_parity import Deployment, FixtureBench, diff, layout_at, report
 
 
 pytestmark = pytest.mark.regression
@@ -187,7 +187,7 @@ def test_a_parallel_sweep_point_reads_the_direct_schedule():
         avg_input_tokens=ENDS[-1],
         prefill_chunk_size=CHUNK,
     )
-    swept = parallel_sweep._estimate_layout(payload)[deployment.gpu_sku]["sol"]
+    swept = layout_at(payload)[deployment.gpu_sku]["sol"]
     direct = estimate_capacity(
         **deployment.env(),
         avg_input_tokens=ENDS[-1],

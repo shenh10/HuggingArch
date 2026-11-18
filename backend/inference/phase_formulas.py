@@ -896,7 +896,12 @@ def _collective_bytes_formula(
         all_reduce      → 2·(N-1)/N · T  (= RS + AG)
         reduce_scatter  →   (N-1)/N · T
         all_gather      →   (N-1)/N · T
-        all_to_all      →   (N-1)/N · T
+        all_to_all      →   (N-1)/N · T, except a ROUTED exchange, whose
+                            coefficient is its top-k fan-out's (a token
+                            crosses once per distinct destination rank, not
+                            once per pick — `comm_volume.RouteFanout`). The
+                            phases carry their own lines for it, so nothing
+                            here states that coefficient a second time.
 
     When `phases` is multi-entry (hierarchical AR), both lines sum the
     phases term-for-term, each prefixed with its collective primitive so
@@ -927,8 +932,17 @@ def _collective_bytes_formula(
             sym = phases[0]["symbolic"]
             sub = phases[0]["substituted"]
         else:
-            sym = " + ".join(f"{ph['name']} [{ph['symbolic']}]" for ph in phases)
-            sub = " + ".join(f"{ph['name']} [{ph['substituted']}]" for ph in phases)
+            labels = [str(ph["name"]) for ph in phases]
+            if len(set(labels)) != len(labels):
+                # Two phases of ONE collective — a routed exchange's two
+                # placement levels are both `all_to_all` — so the name
+                # cannot tell them apart and the fabric is what differs.
+                labels = [f"{ph['name']} {ph.get('fabric_label') or ph['fabric']}"
+                          for ph in phases]
+            sym = " + ".join(f"{label} [{ph['symbolic']}]"
+                             for label, ph in zip(labels, phases, strict=True))
+            sub = " + ".join(f"{label} [{ph['substituted']}]"
+                             for label, ph in zip(labels, phases, strict=True))
         out: Dict[str, Any] = {"symbolic": sym, "substituted": sub}
         if cnt and cnt != 1:
             total_per_layer_bytes = int(sum(

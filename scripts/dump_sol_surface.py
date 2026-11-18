@@ -216,7 +216,7 @@ def _phase(
     access = int(phase.get("total_bytes") or 0)
     flops = int(phase.get("flops_per_step") or 0)
 
-    return {
+    published = {
         "batch": int(phase.get("batch") or 0),
         "flops_per_step": flops,
         "access_bytes_per_rank": access,
@@ -239,7 +239,19 @@ def _phase(
                     else float(phase["t_sol_s"])),
         "time_unpublished_reason": (
             str(phase.get("time_unpublished_reason") or "") or None),
-    }, normalized
+    }
+    # The same argument the `t_sol_s` line above makes, made for every other
+    # column. A phase with no step states no batch (`capacity.without_step`:
+    # a card whose weights do not load runs no step at any batch), and a
+    # phase with no step measured nothing — not zero of anything. Writing 0
+    # would record "it ran and moved no bytes", which is a sentence about a
+    # step, and would make a step reappearing here read as a cell that grew
+    # from nothing instead of as a withheld cell becoming a measured one.
+    if phase.get("batch") is None:
+        reason = published["time_unpublished_reason"]
+        published = dict.fromkeys(published)
+        published["time_unpublished_reason"] = reason
+    return published, normalized
 
 
 def measure_case(config: dict[str, Any], deployment: dict[str, Any],
@@ -248,12 +260,18 @@ def measure_case(config: dict[str, Any], deployment: dict[str, Any],
     from backend.inference.parallel_config import ParallelConfig
     from backend.inference.sol_closure import check_closure
 
-    # The walk, not the published estimate: a deployment that cannot hold
-    # the weights publishes no step (`capacity.without_step`), and half the
-    # cases here are such deployments of the corpus's largest models. Their
-    # walk is still what every other card and batch is re-priced from, so it
-    # is what this surface pins; the time it withholds is pinned as None
-    # beside its reason, as before.
+    # Half the cells here are deployments of the corpus's largest models that
+    # cannot hold their weights on the card, and such a deployment runs no
+    # phase walk at all (`capacity._capacity_pending`'s `refused_estimate`,
+    # since `d2ab068b`): there is no step, at any batch, for this surface to
+    # pin. This file used to pin the B=1 walk those cards still took, on the
+    # grounds that it was what every other card and batch was re-priced from;
+    # that premise is gone — a card class is re-priced from its own
+    # representative's walk, and a class whose roomiest card refuses has no
+    # card that does not. What a refused cell still pins is everything the
+    # budget answers without a step: its weights, module by module, and its
+    # cache law. Its phases and rows are withheld, named as such rather than
+    # written down as zeroes (`_phase`).
     result = estimate_pending(
         config=config,
         resolved=resolved,

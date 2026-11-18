@@ -57,7 +57,7 @@ def test_a_frontier_layout_returns_plain_laws():
 
 def test_a_scaling_sweep_cell_returns_plain_points():
     requests = (
-        (sweep_runtime._PARALLEL, warm.default_scaling_sweep_request(MODEL, 4096)),
+        (sweep_runtime._PARALLEL, warm.default_scaling_sweep_request(MODEL)),
         (sweep_runtime._ESTIMATE,
          warm.default_scaling_batch_request(MODEL, "B200", "dp_ep", 8)),
     )

@@ -954,11 +954,10 @@ class Analysis:
 
     @memo_property
     def routed(self) -> Dict[int, RoutedLaunch]:
-        """Each MoE dispatch's boundary on the rank this analysis sits on
-        (`RoutedLaunch`: the tokens the rank holds, the rows routed onto its
-        experts, its experts, and the padded launch they make), by the
-        dispatch's uid. Which dispatch a node's buffer came from is
-        `Program.dispatch_of`.
+        """Each leaf on a MoE routed buffer and the launch it runs on the
+        rank this analysis sits on (`RoutedLaunch`: the tokens the rank
+        holds, the routed rows the leaf is handed — gathered rows included —
+        its experts, and the padded launch they make), by the leaf's uid.
 
         Per rank, so the answer is the rule's, as `local_tensors` is: the
         identity `Rule` reads the walk's own shapes, `LayoutPropagation`

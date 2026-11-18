@@ -2100,12 +2100,25 @@ class Evaluator:
                     arrived=got, required=need, collectives=collectives,
                     site=transition_mod.RedistributeSite.STAGE_CLOSE))
                 continue
-            walk.redistributes.append(transition_mod.Redistribute(
+            edge = transition_mod.Redistribute(
                 node=node.uid, input_index=index,
                 producer=producer[0] if producer is not None else -1,
                 arrived=got, required=need,
                 collectives=collectives,
-                producer_port=producer[1] if producer is not None else "out"))
+                producer_port=producer[1] if producer is not None else "out")
+            # The value an edge reads may already have been moved inside its
+            # producer (a dispatch's exchange): the edge's collective then
+            # runs on what that exchange handed out — an ordered chain, as
+            # an internal collective after an edge one is below.
+            edge = replace(edge, dependency=next(
+                (earlier for earlier in reversed(walk.redistributes)
+                 if earlier.site
+                 is transition_mod.RedistributeSite.INTERNAL_OUT
+                 and earlier.node == edge.producer
+                 and earlier.producer_port == edge.producer_port
+                 and earlier.required == got),
+                None))
+            walk.redistributes.append(edge)
         for side, entered, moved in rule.internal(
                 kernel_required, out_state, node=node):
             dependency = None

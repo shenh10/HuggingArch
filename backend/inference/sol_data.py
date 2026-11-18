@@ -30,7 +30,9 @@ from backend.measure.scope import ResultIdentity, of_walk
 #: parallel config beside that graph. v7 names each step term in the graph
 #: (`term_<k>`): the decode floor form is kept per term, so a reader can
 #: swap a measured term out of it (`auto_sweep.blend`).
-walkRecordSchema = "serving-law-v7"
+# v8: a kept bundle carries every card of its class the Scaling series
+# prices (`FrontierView.walk_cards`), not only the Gallery's.
+walkRecordSchema = "serving-law-v8"
 servingContexts = tuple(ROUTINE_SEQ_LENS)
 defaultPrefillChunkSize = 8192
 

@@ -107,10 +107,16 @@ view:
 #   normal layer:        a_in = combine(x, H); p1 = x + attn(norm1(a_in));
 #                        out = p1 + mlp(norm2(combine(p1, H)))
 #   segment start (l % 12 == 0, l > 0): the entry joins the history and the
-#                        prefix sum restarts, so p1 = attn and out = mlp
-#                        (modeling_kimi_linear.py:995-998, 1023-1026, 1041-1044)
+#                        prefix sum restarts (995-998), so p1 = attn
+#                        (1023-1026) and out = p1 + mlp: the restart left
+#                        prefix_sum = attn, so 1041-1044 takes its add
+#                        branch, never the `is None` one. vLLM agrees
+#                        (kimi_k3/nvidia/model.py `_post_attn_norm`: the
+#                        prefix restarts at the attention output and the MLP
+#                        output joins it in the next layer's `attn_res`).
 #   layer 0:             the history is empty — no first combine
-#                        (986-993); its history is the one entry `x`.
+#                        (986-993); its history is the one entry `x`; it is
+#                        a segment start, so out = attn + mlp as well.
 blocks:
   block_kda_dense_first:
     graph:
@@ -128,7 +134,8 @@ blocks:
       mlp_res:                   { op: attn_res_combine, in: [self_attn, block_residual_init, mlp_res_norm.weight, mlp_res_proj.weight] }
       post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
       mlp:                       { op: gated_ffn, params: { act: situ }, in: post_attention_layernorm, dims: { d_model: d_model, d_ffn: d_ffn } }
-    outputs: [mlp]
+      mlp_residual:              { op: add, in: [self_attn, mlp], dim: d_model }
+    outputs: [mlp_residual]
 
   block_kda_moe_start:
     reads: [block_residual]
@@ -145,7 +152,8 @@ blocks:
       mlp_res:                   { op: attn_res_combine, in: [self_attn, block_residual_append, mlp_res_norm.weight, mlp_res_proj.weight] }
       post_attention_layernorm:  { op: rmsnorm, in: mlp_res, dim: d_model, weight_axes: [{ replicated: true }] }
       block_sparse_moe:          { op: kimi_k3_latent_moe, in: post_attention_layernorm }
-    outputs: [block_sparse_moe]
+      mlp_residual:              { op: add, in: [self_attn, block_sparse_moe], dim: d_model }
+    outputs: [mlp_residual]
 
   block_kda_moe:
     reads: [block_residual]

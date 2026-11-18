@@ -1,17 +1,20 @@
 """Parallelism-scaling sweeps for the inference Scaling panel.
 
-Hold model + context + batch fixed and sweep the deployment SCALE (EP/TP
-degree) — one series per GPU type — reporting PER-GPU throughput. Reads how
-per-GPU efficiency scales as you add GPUs and where the compute-bound plateau
-lands per GPU.
+Hold model + batch fixed and sweep the deployment SCALE (EP/TP degree, from
+one GPU) — one series per GPU type, at every context of the request —
+reporting PER-GPU throughput. Reads how per-GPU efficiency scales as you add
+GPUs and where the compute-bound plateau lands per GPU.
 
-Each point is an independent `estimate_capacity`: `parallel` is part of the
-seq-invariant `_capacity_preparation`, so there is no prelude reuse across
-parallel configs (a parallel sweep is contractually N single calls). The
-`backend.measure.pool` gives real multi-core over those N calls.
+Each deployment is one cell: `parallel` is part of the seq-invariant
+`_capacity_preparation`, so there is no prelude reuse across parallel configs
+(a parallel sweep is contractually one cell per config). Inside a cell, one
+walk per card class serves every card and every context by substitution
+(`capacity.ContextAnchors`). The `backend.measure.pool` gives real multi-core
+over the cells.
 
 Config-generation rule (X → ParallelConfig), all `dp_replicas=1`, `num_gpus=X`,
-X over powers of two up to `sweep_grid.SWEEP_MAX_GPUS`; every config is
+X over powers of two from 1 up to `sweep_grid.SWEEP_MAX_GPUS` (one GPU is the
+same config in every mode, so one cell every mode's ladder reads); every config is
 `validate()`-clean, and an EP mode's X divides every expert pool:
   dp_ep : dp_attention=X, ep_moe=X
   cp_ep : cp=X, ep_moe=X, dp_attention=1          (pcp, the default scheme)
@@ -21,12 +24,16 @@ Whether the model deploys at X is the layout's answer, not a cap on heads:
 each degree is solved by the same layout walk an estimate runs
 (`legal_parallel_degrees`), and a refused one says why.
 
-Each layout is also read at every per-GPU decode batch of
-`sweep_grid.SCALING_DECODE_LADDER`
-(`_decode_ladder`, by substitution off the same walk): the sweep's decode
-point cloud (`decode_cloud`), SOL only. A decode Pareto frontier is a view
-of that cloud (`decode_frontier`): some of its dimensions held, the rest
-grouped into lines, each line the points no other point of it beats.
+Each layout is also read, at every context, at every per-GPU decode batch of
+`sweep_grid.SCALING_DECODE_LADDER` that fits (`decode_rungs`, `_decode_ladder`,
+by substitution off the same walk): the sweep's throughput point cloud
+(`throughput_cloud`). Each point is a decode rung that also carries its
+deployment's prefill — the sweep prices prefill once per (card, layout,
+context), at one request, so it is the same fact on every rung
+(`point_cloud.parallel_records`). EVERY throughput chart of the Scaling
+panel, prefill and decode alike, is a view of that one cloud (`cloud_view`):
+some of its dimensions held, the rest grouped into lines, each line its
+Pareto front or its points along GPU count, decode batch or context.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ import logging
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from backend.arch.eval.analysis import MoeFacts
 from backend.arch.eval.program import Program
@@ -48,9 +55,9 @@ from .pipeline import NoPeakForDtype
 from backend.arch.eval.analysis import Point
 from backend.measure.pool import map_cells
 from .card import Card
-from .frontier import POINT_DIMS, PointDim, frontier_view
+from .frontier import POINT_DIMS, PointDim, frontier_view, line_view
 from .point_cloud import parallel_cloud, point_coordinates
-from .gpu_specs import get_gpu, gpus_per_node, hbm_bytes
+from .gpu_specs import get_gpu, gpus_per_node, hbm_bytes, load_gpu_specs
 from .prefill_geometry import PrefillEndpointGeometry, PrefillChunkSchedule
 from .serving_view import servingLawPointView
 from .sweep_grid import (FRONTIER_MAX_GPUS, GALLERY_GPUS,
@@ -60,7 +67,7 @@ from .weight_breakdown import shard_degrades
 from .batch_sweep import measure_points
 from .capacity import (
     CapacityKnobs,
-    _capacity_pending,
+    ContextAnchors,
     _capacity_walk,
     _capacity_preparation,
     _fold_chunked_prefill_sol,
@@ -70,26 +77,21 @@ from .capacity import (
     _restamp_gpu,
     _stamp_gpu_on_result,
     without_step,
-    capacity_ceilings,
-    point_served,
+    fits,
 )
 
 logger = logging.getLogger(__name__)
 
-# Curated GPU series for the scaling charts. All SKUs are peers — consumer and
-# datacenter parts get identical treatment; each card's VRAM + interconnect
-# (from gpu_specs.csv) decide what's feasible, not a category. RTX-4090 (PCIe4
-# intra, 200 Gbps RDMA inter-node) is the card kernel_bench measures on, so
-# this series keeps it: its measured rows are what theory is compared against
-# here, and Kernel Bench coverage counts on it.
-# GB200 is the rack-scale part: its NVLink domain is the 72-GPU rack, so a
-# layout stays on NVLink where an 8-GPU node would cross onto RDMA.
-# The Gallery publishes a NARROWER series (`sweep_grid.GALLERY_GPUS`: these
-# cards less the 4090) — it shows serving frontiers, not measurements — so
-# the picker, `/gallery/frontier` and the gallery warm read that one.
-# WHICH cards each series shows is a product decision and is declared once;
-# that each names a card is the sheet's to say, so every one is resolved
-# against `gpu_specs.csv` at import — a SKU renamed there would otherwise
+# The Scaling panel's card series: every card the sheet lists — the cards the
+# Inference page offers (`/inference/gpus`), so any card a reader picks there
+# is on every Scaling chart, throughput cloud included. All SKUs are peers —
+# consumer and datacenter parts get identical treatment; each card's VRAM +
+# interconnect (from gpu_specs.csv) decide what's feasible, not a category.
+# The cost is one walk per card CLASS (`class_cards`), the rest restamped.
+# The Gallery publishes a NARROWER series (`sweep_grid.GALLERY_GPUS`) — it
+# shows serving frontiers for a curated set — so the picker,
+# `/gallery/frontier` and the gallery warm read that one; it is resolved
+# against the sheet here, at import — a SKU renamed there would otherwise
 # leave a chart axis nothing can be walked on.
 def _series(*skus: str) -> List[str]:
     """The named cards, each resolved against the sheet."""
@@ -101,16 +103,15 @@ def _series(*skus: str) -> List[str]:
     return list(skus)
 
 
-DEFAULT_SWEEP_GPUS = _series("RTX-4090", "H20", "H100-SXM", "H200", "B200",
-                             "B300", "GB200")
+DEFAULT_SWEEP_GPUS = [spec.sku for spec in load_gpu_specs()]
 # The Gallery's cards live beside the other `GALLERY_*` grid constants, which
 # cannot import this module; they are resolved here, by the same rule, because
 # this is where the rule is stated and `class_cards` defaults to them.
 _series(*GALLERY_GPUS)
 
 #: The request / environment fields every sweep point sets for itself: its
-#: own layout and GPU count, the series' cards (`gpu_skus`), and the sweep's
-#: `context_len` as the input length. Whatever the caller passed for these is
+#: own layout and GPU count, the series' cards (`gpu_skus`), and the input
+#: length (each of the sweep's `contexts` in turn). Whatever the caller passed for these is
 #: dropped, so they are the only fields a cached sweep may leave out of its
 #: key (`backend.api.sweep_runtime.sweep_cache_key`).
 PER_POINT_FIELDS = frozenset({"parallel", "gpu_sku", "num_gpus", "avg_input_tokens"})
@@ -360,73 +361,55 @@ def _beyond_cap(mode: str, caps: SweepCaps) -> Optional[dict]:
     return {"cap": SWEEP_MAX_GPUS}
 
 
-def _per_gpu_tput(result: dict, phase: str, track: str = "sol") -> Optional[float]:
-    """Per-GPU throughput of one track (`sol` / `measured`), read off the
-    phase's `throughput` payload (`phases.phase_throughput`, applied once by
-    the estimate and again by the measured fold) — no second formula, no
-    recomputation. `None` when the phase didn't run (OOM / infeasible) or
-    the track has no step time."""
-    p = (result.get("phases") or {}).get(phase) or {}
-    rates = (p.get("throughput") or {}).get(track)
-    return rates.get("per_gpu") if rates else None
+#: What a point of the sweep's throughput cloud is held or grouped by: the
+#: one point-cloud vocabulary (`frontier.POINT_DIMS`). `concurrent_requests`
+#: is a value on each point, not a coordinate.
+CloudDim = PointDim
 
 
-#: What a point of the sweep's decode cloud is held or grouped by: the one
-#: point-cloud vocabulary (`frontier.POINT_DIMS`). `concurrent_requests` is a
-#: value on each point, not a coordinate.
-DecodeCloudDim = PointDim
-
-
-def decode_frontier(cloud: Sequence[dict], *, fix: Mapping[str, Sequence[Any]],
-                    group_by: Sequence[str]) -> dict:
-    """A decode Pareto frontier view of the sweep's `decode_cloud`."""
-    return frontier_view(cloud, dims=POINT_DIMS, fix=fix, group_by=group_by)
+def cloud_view(cloud: Sequence[dict], *, phase: str = "decode",
+               form: str = "frontier", x: Optional[str] = None,
+               fix: Mapping[str, Sequence[Any]],
+               group_by: Sequence[str]) -> dict:
+    """A view of the sweep's `throughput_cloud`: one `phase` of it as a
+    Pareto frontier (`frontier.frontier_view`, `form="frontier"`) or as
+    lines along `x` (`frontier.line_view`, `form="line"`) — the same holds,
+    groups and `values` whichever phase and form, so a page switches either
+    without re-asking which values its controls offer. Which `x` goes with
+    which form is the request's to validate
+    (`api._models.ParallelFrontierRequest`); a line view refuses an axis it
+    does not know, and every view publishes which (phase, form) pairs this
+    cloud can answer (`frontier.view_forms`)."""
+    if form == "line":
+        return line_view(cloud, dims=POINT_DIMS, x=x, fix=fix,
+                         group_by=group_by, phase=phase)
+    return frontier_view(cloud, dims=POINT_DIMS, fix=fix, group_by=group_by,
+                         phase=phase)
 
 
 def _point(x: int, parallel: ParallelConfig, result: Optional[dict],
-           error: Optional[str] = None) -> dict:
+           error: Optional[str] = None, *, context: int) -> dict:
+    """A layout's point on one card at one context: WHETHER this deployment
+    serves, and what it is. No throughput is here — prefill's and decode's
+    alike are values on the sweep's one throughput cloud (`cloud_view`), so
+    a chart of either is a view of that cloud and of nothing else."""
     if not result:
-        point = {"x": x, "parallel": parallel.to_dict(),
-                 "prefill_tps_per_gpu": None,
-                 "decode_tps_per_gpu": None,
-                 "prefill_tps_per_gpu_measured": None,
-                 "decode_tps_per_gpu_measured": None, "feasible": False}
+        point = {"x": x, "context": context, "parallel": parallel.to_dict(),
+                 "feasible": False}
         if error is not None:
             # A crashed estimate is not the same state as "does not fit" —
             # the cell stays out of the series but says why.
             point["error"] = error
         return point
-    def hover_facts(phase: str) -> dict:
-        """The batch a phase ran at and its step times, so a tooltip can say
-        WHY a per-GPU curve flattens (the step reads ~the whole card) instead
-        of leaving the number to look stuck."""
-        p = (result.get("phases") or {}).get(phase) or {}
-        return {
-            f"{phase}_batch_per_gpu": p.get("batch"),
-            f"{phase}_t_sol_s": p.get("t_sol_s"),
-            f"{phase}_t_measured_s": p.get("t_measured_s"),
-            # What the measured time is missing when there is none
-            # (`auto_sweep.MeasuredTrack.coverage`).
-            f"{phase}_measured_coverage": p.get("coverage"),
-        }
-
-    # Both tracks, each read from its own step time. The measured track sits
-    # beside theory: None unless every row of the phase is measured, never
-    # the SOL value in its place.
     feasible = bool((result.get("max_decode_batch_per_gpu") or 0) > 0)
     point = {
         "x": x,
+        "context": context,
         # The deployment this point is, so a page applies it as it stands.
         "parallel": parallel.to_dict(),
         # An axis the layout splits fewer ways than asked: its other ranks
         # hold copies (`layout_verdict`).
         "warnings": list(result.get("parallel_warnings") or ()),
-        "prefill_tps_per_gpu": _per_gpu_tput(result, "prefill"),
-        "decode_tps_per_gpu": _per_gpu_tput(result, "decode"),
-        "prefill_tps_per_gpu_measured": _per_gpu_tput(result, "prefill", "measured"),
-        "decode_tps_per_gpu_measured": _per_gpu_tput(result, "decode", "measured"),
-        **hover_facts("prefill"),
-        **hover_facts("decode"),
         "feasible": feasible,
         # The request (context + output) runs past the model's published
         # context: the point is still estimated, and the page must say so.
@@ -461,50 +444,51 @@ def _resolve_modes(
 
 
 
-def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, dict]:
-    """One ParallelConfig, every GPU in `gpu_skus`.
+def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, List[dict]]:
+    """One ParallelConfig, every GPU in `gpu_skus`, every context in
+    `contexts`.
 
     Walk + prefill/decode evaluation once per CARD CLASS and per pipeline
-    stage the class's cards bind (so once per class, without pp). Each card
-    is a point: the bound stage's rows restamped on its HBM / peaks and
-    re-read at its batch. The graph does not mention the SKU, but it does
-    mention the card's class (`framework_bindings.CardClass`), so the walk
-    a card is priced off is its own class's — the rule
-    `capacity._restamp_gpu` enforces and `class_cards` names, and the one
-    the Gallery's frontier already follows.
+    stage the class's cards bind (so once per class, without pp), at the
+    first context that needs it; every other context and every card is read
+    off that walk by substitution — the rule `capacity.ContextAnchors`
+    states for every sweep that prices several contexts off one walk (the
+    Context × Batch cell reads the same). Each card is a point: the bound
+    stage's rows restamped on its HBM / peaks and re-read at its batch. The
+    graph does not mention the SKU, but it does mention the card's class
+    (`framework_bindings.CardClass`), so the walk a card is priced off is
+    its own class's — the rule `capacity._restamp_gpu` enforces and
+    `class_cards` names, and the one the Gallery's frontier already follows.
 
-    Returns `{gpu_sku: {"sol", "measures"}}`: the
-    point's estimate before any measurement, and its rows' keys there as
-    plain data (`batch_sweep.point_measures`) — the sweep reads every
-    point's measurements in one lookup (`ParallelSweepPlan.assemble`). A
-    card that cannot time the layout maps to `{_LAYOUT_ERROR_KEY: reason}`.
+    Returns `{gpu_sku: [per context, in `contexts` order]}`, each entry
+    `{"context", "sol", "measures", "ladder"}`: the point's estimate before
+    any measurement, its rows' keys there as plain data
+    (`batch_sweep.point_measures`) — the sweep reads every point's
+    measurements in one lookup (`ParallelSweepPlan.assemble`) — and its
+    decode ladder (`_decode_ladder`). A card that cannot time the layout
+    maps every context to its absence (`_absent`, `card`); a context the
+    layout refuses or fails at is its own absence, the others stand.
     Top-level so the sweep pool can pickle it into a spawned worker.
     """
     gpu_skus = list(payload["gpu_skus"])
+    contexts = [int(c) for c in payload["contexts"]]
     # The request axes this payload carries beside the knobs — `estimate_capacity`'s
-    # own explicit parameters plus the sweep's list of cards; an unknown key
-    # is refused rather than dropped.
-    knobs = CapacityKnobs.from_kwargs(payload, envelope=frozenset(['avg_input_tokens', 'avg_output_tokens', 'config', 'decode_batch_size', 'decode_ladder', 'gpu_sku', 'gpu_skus', 'prefill_batch_size', 'prefill_chunk_size']))
-    avg_in = int(payload["avg_input_tokens"])
+    # own explicit parameters plus the sweep's cards and contexts; an
+    # unknown key is refused rather than dropped.
+    knobs = CapacityKnobs.from_kwargs(payload, envelope=frozenset(['avg_output_tokens', 'config', 'contexts', 'decode_batch_size', 'decode_ladder', 'gpu_sku', 'gpu_skus', 'prefill_batch_size', 'prefill_chunk_size']))
     avg_out = int(payload["avg_output_tokens"])
     chunk = payload.get("prefill_chunk_size")
-    # Evaluate the graph at B=1. Each per-op row carries its law in every
-    # workload count and the card (`row_roofline.build_row_exprs`); each
-    # card's max-batch point is that law read there on the card's peaks
-    # (`capacity._point_rows`, `batch_sweep.phase_at`) — the batch
-    # dropdown's reading.
-    pre_b = payload.get("prefill_batch_size") or 1
-    dec_b = payload.get("decode_batch_size") or 1
-    # The chunk schedule every card's prefill is cut by: one schedule for the
-    # series, because a chunk boundary is a workload count and no card moves
-    # it. Its cached prefix is the request's (`CapacityKnobs`), which is also
-    # every preparation's (`_capacity_preparation`), and the engine refuses a
-    # schedule whose prefix is not the preparation's — so this is read off the
-    # knobs rather than off whichever card happens to be prepared first.
-    base_schedule = PrefillChunkSchedule.materialize(
-        PrefillEndpointGeometry(avg_in, knobs.s_prefix_cached, 1, 1),
-        prefill_chunk_size=chunk)
-    # One walk per (card class, pipeline stage the class's cards bind).
+    # The chunk schedule every card's prefill is cut by at each context: one
+    # schedule per context for the series, because a chunk boundary is a
+    # workload count and no card moves it. Its cached prefix is the
+    # request's (`CapacityKnobs`), which is also every preparation's
+    # (`_capacity_preparation`), and the engine refuses a schedule whose
+    # prefix is not the preparation's — so this is read off the knobs rather
+    # than off whichever card happens to be prepared first.
+    schedules = [PrefillChunkSchedule.materialize(
+        PrefillEndpointGeometry(length, knobs.s_prefix_cached, 1, 1),
+        prefill_chunk_size=chunk) for length in contexts]
+    # One walk set per card class (`ContextAnchors`: per bound stage).
     #
     # The class, because a walk's rows depend on the card through its class
     # and nothing else (`framework_bindings.CardClass`), so cards of one
@@ -524,110 +508,141 @@ def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, dict]:
     # The walk card of each class is its roomiest (`class_cards`); the
     # others restamp off it. A class whose walk cannot be prepared or walked
     # fails only its own cards.
-    anchors: Dict[Any, Tuple[str, Any]] = {}
-    pendings: Dict[Tuple[Any, Optional[int]], Any] = {}
-    bases: Dict[Tuple[Any, Optional[int]], dict] = {}
-    out: Dict[str, dict] = {}
+    classes: Dict[Any, Tuple[str, Any, ContextAnchors]] = {}
+    out: Dict[str, List[dict]] = {}
     for sku in gpu_skus:
         card = Card.of(sku)
         klass = card.klass
         # A card that lists no peak for the format a step computes in cannot
-        # time this layout; that is this card's answer, not the layout's —
-        # the other cards of the series still price it. Its class's walk is
-        # prepared here, inside that same isolation.
+        # time this layout; that is this card's answer at every context, not
+        # the layout's — the other cards of the series still price it. Its
+        # class's walk is prepared here, inside that same isolation.
         try:
-            if klass not in anchors:
+            if klass not in classes:
                 walk_card = class_cards(sku, gpu_skus)[0]
-                anchors[klass] = (walk_card, _capacity_preparation(
-                    config=payload["config"], gpu_sku=walk_card, knobs=knobs))
-            walk_card, prep = anchors[klass]
+                classes[klass] = (walk_card, _capacity_preparation(
+                    config=payload["config"], gpu_sku=walk_card, knobs=knobs),
+                    ContextAnchors(avg_output_tokens=avg_out))
+            walk_card, prep, anchors = classes[klass]
             p = prep if sku == walk_card else _restamp_gpu(prep, card)
-            ceilings = capacity_ceilings(
-                p, avg_input_tokens=avg_in, avg_output_tokens=avg_out,
-                prefill_chunk_schedule=base_schedule)
-            if p.refusal_reason is not None:
-                pending = _capacity_pending(
-                    p, avg_input_tokens=avg_in, avg_output_tokens=avg_out,
-                    prefill_chunk_schedule=base_schedule,
-                    fold_prefill_chunks=False, breakdown=False)
-                out[sku] = {"sol": pending.finish(), "measures": {},
-                            "ladder": []}
-                continue
-            walk = (klass, ceilings.pp_stage)
-            if walk not in bases:
-                pending = _capacity_pending(
-                    p,
-                    avg_input_tokens=avg_in,
-                    avg_output_tokens=avg_out,
-                    prefill_batch_override=pre_b,
-                    decode_batch_override=dec_b,
-                    prefill_chunk_schedule=base_schedule,
-                    fold_prefill_chunks=False,
-                    breakdown=False,
-                )
-                pendings[walk] = pending
-                bases[walk] = pending.finish()
-            pending = pendings[walk]
-            base = bases[walk]
-            batches = _point_batches(
-                ceilings,
-                # None when the request said batch="max" (payload omits the
-                # key) → decode uses each card's ceiling. Prefill stays one
-                # interactive request; paired prefill is a measurement axis.
-                prefill_batch_override=payload.get("prefill_batch_size") or 1,
-                decode_batch_override=payload.get("decode_batch_size"))
-            rows = _point_rows(base, p, batches, pending, Point({}),
-                               breakdown=False)
-            rows, keys = pending.keyed_at(rows, gpu_sku=sku)
-            sol = without_step(_stamp_gpu_on_result(
-                base, p, ceilings, pending.walked_on, batches=batches, rows=rows,
-                walks=pending.walk_of_rows, point=Point({}), breakdown=False),
-                pending.walk_of_rows)
-            endpoint_schedule = base_schedule.with_endpoint_batch(
-                batches["per_op_timing"])
-            if not sol.get("infeasibility_reason"):
-                sol = _fold_chunked_prefill_sol(
-                    sol, p, pending, endpoint_schedule)
-            # `p`, not the walk's preparation: this point's chunks are priced
-            # on the card the point is priced on.
-            measures = ({} if keys is None or sol.get("infeasibility_reason")
-                        else _point_measures_with_chunks(
-                            rows, keys, p, pending, sol["phases"],
-                            schedule=endpoint_schedule))
-            out[sku] = {"sol": sol, "measures": measures,
-                        "ladder": _decode_ladder(
-                            payload.get("decode_ladder") or (), sol,
-                            base=base, p=p, ceilings=ceilings, batches=batches,
-                            rows=rows, pending=pending)}
+            out[sku] = [_price_context(payload, p, anchors, length=length,
+                                       schedule=schedule)
+                        for length, schedule in zip(contexts, schedules,
+                                                    strict=True)]
         except NoPeakForDtype as exc:
-            out[sku] = {_LAYOUT_ERROR_KEY: str(exc)}
+            # The card's answer at every context: a format it lists no peak
+            # for is not a fact of the context.
+            out[sku] = [_absent("card", exc) for _ in contexts]
     return {sku: out[sku] for sku in gpu_skus}
+
+
+def _absent(refusal: str, reason: Any) -> dict:
+    """A (card, context) the layout could not price, in the cloud's refusal
+    vocabulary (`frontier.POINT_REFUSALS`): `card` (the card lists no peak
+    for a format the step computes in), `layout` (the deployment refuses
+    this context: a cached prefix it does not model, a sequence cut that
+    does not divide it), `error` (anything else). Its siblings stand."""
+    return {"refused": refusal, "reason": str(reason)}
+
+
+def _price_context(payload: Dict[str, Any], p: Any, anchors: ContextAnchors,
+                   *, length: int, schedule: PrefillChunkSchedule) -> dict:
+    """One card (`p`, its class's walk card or restamped onto it) at one
+    context: `{"context", "sol", "measures", "ladder"}` — the point at the
+    request's batch (each card's ceiling, or a pinned batch clamped to it),
+    its measures and its decode ladder — or the context's absence
+    (`_absent`). A card that loads no weights is the estimate there, with
+    no ladder (`ContextAnchor.refused`)."""
+    try:
+        return {"context": length, **_priced_context(
+            payload, p, anchors, length=length, schedule=schedule)}
+    except (NoPeakForDtype, MeasurementsUnavailable):
+        raise  # the card's answer at every context / the whole sweep's
+    except ValueError as exc:
+        return _absent("layout", exc)
+    except Exception as exc:  # one bad context must not sink its siblings
+        logger.warning("sweep: context %d on %s isolated: %s",
+                       length, p.gpu_sku, exc)
+        return _absent("error", exc)
+
+
+def _priced_context(payload: Dict[str, Any], p: Any, anchors: ContextAnchors,
+                    *, length: int, schedule: PrefillChunkSchedule) -> dict:
+    at = anchors.at(p, length=length, prefix=p.s_prefix_cached,
+                    schedule=schedule)
+    if at.refused:
+        return {"sol": at.anchor, "measures": {}, "ladder": []}
+    ceilings, pending, base, point = (at.ceilings, at.pending, at.base(),
+                                      at.point)
+    batches = _point_batches(
+        ceilings,
+        # None when the request said batch="max" (payload omits the key) →
+        # decode uses each card's ceiling. Prefill stays one interactive
+        # request; paired prefill is a measurement axis.
+        prefill_batch_override=payload.get("prefill_batch_size") or 1,
+        decode_batch_override=payload.get("decode_batch_size"))
+    rows = _point_rows(base, p, batches, pending, point, breakdown=False)
+    rows, keys = pending.keyed_at(rows, gpu_sku=p.gpu_sku)
+    sol = without_step(_stamp_gpu_on_result(
+        base, p, ceilings, pending.walked_on, batches=batches, rows=rows,
+        walks=pending.walk_of_rows, point=point, breakdown=False),
+        pending.walk_of_rows)
+    endpoint_schedule = schedule.with_endpoint_batch(batches["per_op_timing"])
+    if not sol.get("infeasibility_reason"):
+        sol = _fold_chunked_prefill_sol(sol, p, pending, endpoint_schedule)
+    # `p`, not the walk's preparation: this point's chunks are priced on the
+    # card the point is priced on.
+    measures = ({} if keys is None or sol.get("infeasibility_reason")
+                else _point_measures_with_chunks(
+                    rows, keys, p, pending, sol["phases"],
+                    schedule=endpoint_schedule))
+    return {"sol": sol, "measures": measures,
+            "ladder": _decode_ladder(
+                payload.get("decode_ladder") or (), sol, base=base, p=p,
+                ceilings=ceilings, batches=batches, rows=rows,
+                pending=pending, point=point)}
+
+
+def decode_rungs(ladder: Sequence[int], *, ceiling: Any) -> Dict[str, int]:
+    """The per-GPU decode batches a layout's cloud is read at on a card
+    whose KV-bound ceiling is `ceiling`, by batch key: each batch of
+    `ladder` whose requests' cache fits on one GPU, and the ceiling itself
+    (`max`). Nothing when not one request fits.
+
+    A context past the model's published length keeps its rungs: the point
+    is priced and carries `beyond_max_context`, as every drawing of a decode
+    cloud does (`point_cloud.produce_cloud`) — the page says the point
+    extrapolates rather than dropping it. So this asks `capacity.fits`, not
+    `point_served`. The one statement for both roads a layout's ladder is
+    priced on: the direct walk (`_decode_ladder`) and a canonical record's
+    projection (`sweep_runtime._sharedWalkResults`)."""
+    ceiling = int(ceiling or 0)
+    out = {f"b{int(b)}": int(b) for b in ladder
+           if fits(max_batch_per_gpu=ceiling, requests=int(b))}
+    if ceiling >= 1:
+        out["max"] = ceiling
+    return out
 
 
 def _decode_ladder(ladder: Sequence[int], sol: dict, *, base: dict, p: Any,
                   ceilings: Any, batches: Dict[str, int], rows: Dict[str, list],
-                  pending: Any) -> List[dict]:
-    """A card's decode phase at every per-GPU batch of `ladder` this layout
-    serves (`capacity.point_served`), and at its ceiling: the points a
-    decode Pareto frontier is drawn through. Each is read off the layout's
-    one walk by substitution (`capacity._point_rows`) — only the decode row
-    lists move; the point the sweep already priced (`sol`) is reused at its
-    own batch. SOL only: a point keys no measurement (`PendingEstimate.
-    keyed_at` is most of a point's cost), so the frontier has no measured
-    track. Each served (`module_rows.served`), no module table."""
+                  pending: Any, point: Point) -> List[dict]:
+    """A card's decode phase at every per-GPU batch `decode_rungs` names at
+    this context: the rungs the sweep's throughput cloud is drawn through. Each
+    is read off the layout's one walk by substitution (`capacity._point_rows`,
+    at `point`, the context's counts) — only the decode row lists move; the
+    point the sweep already priced (`sol`) is reused at its own batch.
+    Prefill is NOT re-priced per rung: it runs one request whatever the
+    decode batch beside it, so the cloud reads the card's own prefill onto
+    every rung (`point_cloud.parallel_records`). A rung keys no measurement
+    (`PendingEstimate.keyed_at` is most of a point's cost), so the cloud's
+    DECODE rungs are SOL only. Each served (`module_rows.served`), no
+    module table."""
     if sol.get("infeasibility_reason"):
         return []
     beyond = bool(sol.get("beyond_max_context"))
-    ceiling = max(1, int(ceilings.max_batch or 1))
-    wanted: Dict[str, int] = {
-        f"b{int(batch)}": int(batch)
-        for batch in ladder
-        if point_served(max_batch_per_gpu=ceiling,
-                        beyond_max_context=beyond, requests=int(batch))
-    }
-    if not beyond:
-        wanted["max"] = ceiling
     out: List[dict] = []
+    wanted = decode_rungs(ladder, ceiling=ceilings.max_batch)
     for batch_key, b in sorted(wanted.items(), key=lambda item: item[1]):
         if b == batches["per_op_timing_decode"]:
             dec = sol["phases"]["decode"]
@@ -637,11 +652,11 @@ def _decode_ladder(ladder: Sequence[int], sol: dict, *, base: dict, p: Any,
                                 decode_batch_override=b)
             moved = _point_rows(base, p, {k: v for k, v in at.items()
                                           if k != "per_op_timing"},
-                                pending, Point({}), breakdown=False)
+                                pending, point, breakdown=False)
             dec = _stamp_gpu_on_result(
                 base, p, ceilings, pending.walked_on, batches=at,
                 rows={**moved, "per_op_timing": rows["per_op_timing"]},
-                walks=pending.walk_of_rows, point=Point({}),
+                walks=pending.walk_of_rows, point=point,
                 breakdown=False)["phases"]["decode"]
         phase = served({"phases": {"decode": dec}})["phases"]["decode"]
         out.append({"phases": {"decode": {
@@ -651,8 +666,8 @@ def _decode_ladder(ladder: Sequence[int], sol: dict, *, base: dict, p: Any,
     return out
 
 
-# Reserved key: `_estimate_layout` returns `{gpu_sku: estimate}` (a card that
-# cannot time the layout maps to `{key: reason}`) and no GPU is
+# Reserved key: `_estimate_layout_safe` returns `{key: reason}` when the whole
+# layout failed (`_estimate_layout` itself maps each card to a list) and no GPU is
 # named this, so the sweep can tell an error sentinel from a real result.
 _LAYOUT_ERROR_KEY = "__error__"
 
@@ -676,20 +691,26 @@ def _estimate_layout_safe(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 @dataclass(frozen=True)
 class LayoutCell:
-    """One layout of a sweep: its mode, its degree, its config, and the
-    `_estimate_layout` payload that prices it on every card of the series."""
+    """One deployment of a sweep: its config, its GPU count, the modes whose
+    ladders it is a rung of, and the `_estimate_layout` payload that prices
+    it on every card of the series at every context.
 
-    mode: str
+    A cell is one config, not one (mode, degree): several modes can reach
+    the same config — every mode's one-GPU rung is the single GPU — and a
+    deployment is priced once whichever ladders draw it."""
+
+    modes: Tuple[str, ...]
     x: int
     parallel: ParallelConfig
     payload: Dict[str, Any]
 
 
 def run_layout_cell(cell: LayoutCell) -> Dict[str, Any]:
-    """One cell of a parallel sweep, reduced to what the sweep keeps: the
-    point per card, or the layout's refusal, or the failure that sank the
-    estimate. Top-level, so a compute-pool worker can run it; the full
-    per-card estimates never leave the process that computed them.
+    """One cell of a parallel sweep, reduced to what the sweep keeps: each
+    card's points (one per context), or the layout's refusal, or the
+    failure that sank the estimate. Top-level, so a compute-pool worker can
+    run it; the full per-card estimates never leave the process that
+    computed them.
 
     A failed estimate whose layout the model refuses (`layout_verdict`) is a
     refused degree, not a point; any other failure is a point that says
@@ -707,18 +728,17 @@ def run_layout_cell(cell: LayoutCell) -> Dict[str, Any]:
         # Observability: a swallowed point is a real failure. Log it
         # (a systematic regression would show as a burst, not one dead cell).
         logger.warning("sweep: %s@%d isolated (all GPUs): %s",
-                       cell.mode, cell.x, err)
-        return {"error": err,
-                "points": {g: _point(cell.x, cell.parallel, None, error=err)
-                           for g in gpu_skus}}
-    # Each card's point before measurement, reduced to what a chart point
-    # reads (no per-op rows, no module table); a card that could not time
-    # the layout carries its own reason.
+                       "/".join(cell.modes), cell.x, err)
+        return {"error": err}
+    # Each card's point at each context before measurement, reduced to what
+    # a chart point reads (no per-op rows, no module table); a card that
+    # could not time the layout carries its own reason.
     return {"cards": {
-        g: ({"error": blob[g][_LAYOUT_ERROR_KEY]}
-            if _LAYOUT_ERROR_KEY in (blob.get(g) or {})
-            else {"sol": _chart_view(blob[g]["sol"]), "measures": blob[g]["measures"],
-                  "ladder": blob[g]["ladder"]})
+        g: [(entry if "refused" in entry
+             else {"context": entry["context"],
+                   "sol": _chart_view(entry["sol"]),
+                   "measures": entry["measures"], "ladder": entry["ladder"]})
+            for entry in blob[g]]
         for g in gpu_skus}}
 
 
@@ -734,17 +754,20 @@ def _chart_view(estimate: dict) -> dict:
 @dataclass(frozen=True)
 class ParallelSweepPlan:
     """A parallel sweep before its cells run: the modes asked for, the card
-    series, the model's caps, and one `LayoutCell` per (mode, degree). The
-    cells are independent; `assemble` folds their results in cell order."""
+    series, the contexts, the model's caps, and one `LayoutCell` per
+    deployment the modes' ladders reach. The cells are independent;
+    `assemble` folds their results in cell order."""
 
     wanted: Tuple[str, ...]
     gpu_skus: Tuple[str, ...]
     caps: SweepCaps
     skip_ep: Tuple[str, ...]
     cells: Tuple[LayoutCell, ...]
-    #: The coordinates every cell shares. `batch` is the request's rung ("max"
-    #: or an explicit batch); each ladder point still names its own batch_key.
-    context_len: int
+    #: The prompt lengths every cell is priced at, in request order: the
+    #: throughput cloud's `context` coordinate and each chart point's context.
+    contexts: Tuple[int, ...]
+    #: The request's rung ("max" or an explicit batch); each ladder point
+    #: still names its own batch_key.
     batch: Any
     ep_load_factor: Any
     draft_tokens: int
@@ -757,11 +780,11 @@ class ParallelSweepPlan:
         return dict(self.measured_under)
 
     def coordinates(self, mode: str, num_gpus: int, gpu_sku: str, *,
-                    batch_key: Any) -> Dict[str, Any]:
+                    context: int, batch_key: Any) -> Dict[str, Any]:
         """One grid point's every coordinate (`frontier.POINT_DIMS`)."""
         return point_coordinates(
             mode=mode, num_gpus=num_gpus, gpu_sku=gpu_sku,
-            context=self.context_len, batch_key=batch_key,
+            context=int(context), batch_key=batch_key,
             draft_tokens=self.draft_tokens, acceptance=self.acceptance,
             ep_load_factor=self.ep_load_factor)
 
@@ -772,18 +795,13 @@ class ParallelSweepPlan:
             return f"b{int(self.batch)}"
         return "max"
 
-    def absent_coordinates(self, mode: str, num_gpus: int, gpu_sku: str,
-                           *, batch_key: Any) -> Dict[str, Any]:
-        """A cell-level absence's coordinates, at the request's batch rung."""
-        return self.coordinates(mode, num_gpus, gpu_sku, batch_key=batch_key)
-
     @classmethod
     def of(
         cls,
         *,
         mode: Optional[str] = None,
         modes: Optional[Sequence[str]] = None,
-        context_len: int,
+        contexts: Sequence[int],
         batch: Any = "max",
         gpu_skus: Optional[List[str]] = None,
         base_env: Dict[str, Any],
@@ -791,11 +809,18 @@ class ParallelSweepPlan:
     ) -> "ParallelSweepPlan":
         """`base_env` is the `_resolve_estimate_environment` dict; its
         `parallel` / `gpu_sku` / `num_gpus` are ignored (overridden per
-        point). `batch` is the per-GPU batch for BOTH phases, or "max" (each
-        config's own capacity max). `ep_load_factor` (max/mean expert load)
-        is the batch's routing skew, a workload input carried into every
-        point's estimate: the sweep varies topology, not routing."""
+        point). `contexts` are the prompt lengths every layout is priced at
+        (one walk per card class, the rest by substitution). `batch` is the
+        per-GPU batch for BOTH phases, or "max" (each config's own capacity
+        max). `ep_load_factor` (max/mean expert load) is the batch's routing
+        skew, a workload input carried into every point's estimate: the
+        sweep varies topology, not routing.
+
+        Every mode's ladder starts at one GPU; the one-GPU deployment is one
+        config whatever the mode, so it is one cell every mode reads."""
         wanted = _resolve_modes(mode, modes)
+        if not contexts:
+            raise ValueError("contexts must be non-empty")
         series = list(gpu_skus or DEFAULT_SWEEP_GPUS)
         resolved = get_default_loader().match(base_env["config"],
                                               model_id=base_env["model_id"])
@@ -806,20 +831,30 @@ class ParallelSweepPlan:
         if isinstance(batch, int) and batch > 0:
             batch_kw = {"prefill_batch_size": batch, "decode_batch_size": batch}
 
-        # One cell per layout, every GPU inside. The walk is SKU-blind.
+        # One cell per deployment, every GPU and every context inside. The
+        # walk is SKU-blind.
         skip_ep = [m for m in wanted if m in EP_MODES and not caps.moe_enabled]
-        cells = [
-            LayoutCell(mode=m, x=x, parallel=cfg, payload={
-                **shared, "gpu_skus": series, "num_gpus": cfg.cluster_size,
-                "parallel": cfg, "avg_input_tokens": context_len, **batch_kw,
-                "ep_load_factor": ep_load_factor, "decode_ladder": SCALING_DECODE_LADDER,
-            })
-            for m in wanted if m not in skip_ep
-            for x, cfg in parallel_configs_for_mode(m, caps)
-        ]
+        cells: List[LayoutCell] = []
+        for m in wanted:
+            if m in skip_ep:
+                continue
+            for x, cfg in parallel_configs_for_mode(m, caps, x_min=1):
+                same = next((i for i, c in enumerate(cells)
+                             if c.parallel == cfg), None)
+                if same is not None:
+                    cells[same] = replace(cells[same],
+                                          modes=(*cells[same].modes, m))
+                    continue
+                cells.append(LayoutCell(modes=(m,), x=x, parallel=cfg, payload={
+                    **shared, "gpu_skus": series,
+                    "num_gpus": cfg.cluster_size, "parallel": cfg,
+                    "contexts": [int(c) for c in contexts], **batch_kw,
+                    "ep_load_factor": ep_load_factor,
+                    "decode_ladder": SCALING_DECODE_LADDER,
+                }))
         return cls(wanted=tuple(wanted), gpu_skus=tuple(series), caps=caps,
                    skip_ep=tuple(skip_ep), cells=tuple(cells),
-                   context_len=int(context_len), batch=batch,
+                   contexts=tuple(int(c) for c in contexts), batch=batch,
                    ep_load_factor=ep_load_factor,
                    draft_tokens=max(0, int(base_env.get("s_verify", 1)) - 1),
                    acceptance=float(base_env.get("acceptance_rate", 1.0)),
@@ -829,27 +864,41 @@ class ParallelSweepPlan:
                        "calibration_rows": base_env.get("calibration_rows"),
                        "kernel_mix": base_env.get("kernel_mix")})
 
+    def _chart_points(self, cell: LayoutCell, result: Dict[str, Any]
+                      ) -> Dict[str, List[dict]]:
+        """A cell's chart points per card, one per context."""
+        if result.get("error"):
+            return {g: [_point(cell.x, cell.parallel, None,
+                               error=result["error"], context=ctx)
+                        for ctx in self.contexts]
+                    for g in self.gpu_skus}
+        return {g: [(_point(cell.x, cell.parallel, None, error=entry["reason"],
+                            context=ctx) if "refused" in entry
+                     else _point(cell.x, cell.parallel, entry["sol"],
+                                 context=ctx))
+                    for ctx, entry in zip(self.contexts, entries, strict=True)]
+                for g, entries in result["cards"].items()}
+
     def assemble(self, results: Sequence[Dict[str, Any]]) -> dict:
         """The sweep's answer from `run_layout_cell` over `cells`, in order.
 
         One mode (legacy `mode=`): `{"mode", "moe_enabled", "series": [...]}`
         plus `by_mode` with that one entry. Several modes: the same per-mode
-        blobs under `by_mode`."""
+        blobs under `by_mode`. A series' points are every degree at every
+        context, each naming its `context`."""
         moe = self.caps.moe_enabled
-        # Every card's point of every layout reads its measurements from the
-        # sweep's ONE lookup, then becomes a chart point.
-        cards = [c for r in results for c in (r.get("cards") or {}).values()
-                 if "sol" in c]
-        measure_points(cards, **self.measurement())
-        # The decode point cloud: every layout on every card at every batch
-        # of its ladder (`_decode_ladder`); frontiers are views of it
-        # (`decode_frontier`).
+        # Every card's point of every layout at every context reads its
+        # measurements from the sweep's ONE lookup, then becomes a chart
+        # point.
+        measure_points([entry for r in results
+                        for entries in (r.get("cards") or {}).values()
+                        for entry in entries if "sol" in entry],
+                       **self.measurement())
+        # The throughput point cloud: every layout on every card at every
+        # context and every batch of its ladder (`_decode_ladder`), each
+        # point carrying its deployment's prefill too; every throughput
+        # chart of the panel is a view of it (`cloud_view`).
         cloud = parallel_cloud(self, results, layout_label).points
-        results = [r if "cards" not in r else {"points": {
-            g: (_point(cell.x, cell.parallel, None, error=c["error"]) if "error" in c
-                else _point(cell.x, cell.parallel, c["sol"]))
-            for g, c in r["cards"].items()}}
-            for cell, r in zip(self.cells, results, strict=True)]
         buckets: Dict[str, Dict[str, List[dict]]] = {
             m: {g: [] for g in self.gpu_skus}
             for m in self.wanted if m not in self.skip_ep
@@ -863,14 +912,16 @@ class ParallelSweepPlan:
         # a point whose estimate failed for another reason.
         refused: Dict[str, List[dict]] = {m: [] for m in buckets}
         for cell, result in zip(self.cells, results, strict=True):
-            m = cell.mode
             if "refused" in result:
-                refused[m].append({"x": cell.x, "reason": result["refused"]})
+                for m in cell.modes:
+                    refused[m].append({"x": cell.x, "reason": result["refused"]})
                 continue
-            if result.get("error") and mode_error.get(m) is None:
-                mode_error[m] = result["error"]
-            for gpu in self.gpu_skus:
-                buckets[m][gpu].append(result["points"][gpu])
+            points = self._chart_points(cell, result)
+            for m in cell.modes:
+                if result.get("error") and mode_error.get(m) is None:
+                    mode_error[m] = result["error"]
+                for gpu in self.gpu_skus:
+                    buckets[m][gpu].extend(points[gpu])
 
         by_mode: Dict[str, dict] = {}
         for m in self.wanted:
@@ -880,8 +931,11 @@ class ParallelSweepPlan:
             # Every attempted point failed → the mode does not apply to this
             # model (a recurrent mixer under CP, etc.). Collapse to an
             # empty series carrying the reason rather than a series of
-            # error-only cells.
-            pts = [p for g in self.gpu_skus for p in buckets[m][g]]
+            # error-only cells. Asked of the deployments that use the mode's
+            # parallelism: the one-GPU rung every ladder shares runs none of
+            # it, so it says nothing about whether the mode applies.
+            pts = [p for g in self.gpu_skus for p in buckets[m][g]
+                   if p["x"] > 1]
             all_failed = bool(pts) and all(p.get("error") for p in pts)
             if not pts and refused[m]:
                 # Every degree refused: the mode does not apply, and the first
@@ -904,8 +958,9 @@ class ParallelSweepPlan:
             by_mode[m] = entry
 
         out: Dict[str, Any] = {
-            "moe_enabled": moe, "modes": list(self.wanted), "by_mode": by_mode,
-            "decode_cloud": cloud,
+            "moe_enabled": moe, "modes": list(self.wanted),
+            "contexts": list(self.contexts), "by_mode": by_mode,
+            "throughput_cloud": cloud,
         }
         if len(self.wanted) == 1:
             out.update(by_mode[self.wanted[0]])
@@ -916,18 +971,18 @@ def estimate_parallel_sweep(
     *,
     mode: Optional[str] = None,
     modes: Optional[Sequence[str]] = None,
-    context_len: int,
+    contexts: Sequence[int],
     batch: Any = "max",
     gpu_skus: Optional[List[str]] = None,
     base_env: Dict[str, Any],
     ep_load_factor: float = 1.0,
 ) -> dict:
-    """Sweep deployment degree for one or more parallel layouts, in this
-    process: the plan, its cells across the pool when this process fans
-    sweeps out (`map_cells`), the assembled answer. The API server drives
-    the same three steps itself so the cells spread across its compute
-    workers (`backend.api.sweep_runtime`)."""
+    """Sweep deployment degree for one or more parallel layouts at every
+    context of `contexts`, in this process: the plan, its cells across the
+    pool when this process fans sweeps out (`map_cells`), the assembled
+    answer. The API server drives the same three steps itself so the cells
+    spread across its compute workers (`backend.api.sweep_runtime`)."""
     plan = ParallelSweepPlan.of(
-        mode=mode, modes=modes, context_len=context_len, batch=batch,
+        mode=mode, modes=modes, contexts=contexts, batch=batch,
         gpu_skus=gpu_skus, base_env=base_env, ep_load_factor=ep_load_factor)
     return plan.assemble(map_cells(run_layout_cell, list(plan.cells)))

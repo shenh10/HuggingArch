@@ -10,9 +10,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from backend.arch.layout.comm_volume import RouteFanout, ring_factor
 from backend.inference.comm_cost import (
-    COMM_OPS, Fabric, collective_latency, collective_per_rank_bytes,
-    collective_phases, price_collective,
+    COMM_OPS, Fabric, PlacementLevel, collective_latency,
+    collective_per_rank_bytes, collective_phases, members_per_node,
+    placement_levels, price_collective, routed_shares,
 )
 
 
@@ -689,6 +691,235 @@ class TestBlackwellAndFusionArchitectures(TestTheFrameworkPicksTheAllReduce):
         self.assertEqual(
             self._one("H100-SXM", 8, self.T, framework="sglang",
                       architectures=dsv3)[1][0][0], "nvls")
+
+
+class TestRoutedExchangeLevels(unittest.TestCase):
+    """A routed exchange's bytes are the exchange's; the card's levels only
+    say which fabric they cross.
+
+    The total is "how many distinct destination RANKS does a token reach",
+    which needs no card fact and is what the layer publishes
+    (`comm_volume.ring_factor`). `placement_levels` partitions it: a level
+    whose destination is a node counts its own destinations (the RDMA
+    sends), the level whose destination is a rank takes the remainder. So
+    the phases always sum to the row's own bytes, and a group spread over
+    more nodes cannot become cheaper — only slower.
+
+    What is here is the law's own properties, asserted: the partition, the
+    degeneracies, the hop counts, which levels a card makes. The
+    independent derivations of the same numbers are the enumeration in
+    `tests/backend/arch/layout/test_route_fanout.py` and the simulation in
+    `tests/backend/inference/test_route_dedup_oracle.py`.
+
+    The degeneracies fall out of that one law: a level with one destination
+    is not a level, so a single node has only the exchange inside it and a
+    group with one member per node only the one between nodes.
+    """
+
+    #: DeepSeek-V3's bank: 256 experts, every one weighted, top-8.
+    F = RouteFanout(picks=8, targets=256, placed=256)
+    T = 121110528.0
+
+    def _phases(self, world, gpus_per_node, base_stride=1, fanout=None):
+        return collective_phases(
+            "all_to_all", world, self.T, gpus_per_node=gpus_per_node,
+            base_stride=base_stride,
+            fanout=self.F if fanout is None else fanout)
+
+    def _shares(self, world, gpus_per_node, base_stride=1, fanout=None):
+        fanout = self.F if fanout is None else fanout
+        return routed_shares(fanout, world,
+                             placement_levels(world, gpus_per_node,
+                                              base_stride))
+
+    # -- the total, and its partition ------------------------------------
+
+    def test_the_levels_partition_the_exchanges_own_bytes(self):
+        """The conservation ASSERTION, over every placement a card can make.
+
+        Not an oracle: both sides go through `RouteFanout.remote_factor`,
+        so this is the structural property stated as a test — the levels
+        add up to the exchange's total — and not a second derivation of it.
+        The second routes are elsewhere and are two: the enumeration over
+        every top-k draw (`test_route_fanout`) and the Monte Carlo over
+        real rank placements (`test_route_dedup_oracle`).
+
+        It is worth having anyway, because the property it states is the
+        one the first form of this model broke: a term charged to nobody
+        (the receiving node's fan-out) fails here at every placement, over
+        every routing shape, in a second.
+        """
+        for picks, targets, placed in ((8, 256, 256), (1, 256, 256),
+                                       (8, 8, 8), (3, 24, 16),
+                                       (6, 384, 384), (2, 128, 128)):
+            fanout = RouteFanout(picks=picks, targets=targets, placed=placed)
+            for world in (2, 4, 8, 16, 32, 64, 128):
+                if placed % world:
+                    continue
+                for node, stride in ((4, 1), (8, 1), (8, 2), (72, 1),
+                                     (72, 2), (8, 8)):
+                    shares = self._shares(world, node, stride, fanout)
+                    self.assertAlmostEqual(
+                        sum(share for _level, share in shares),
+                        float(ring_factor("all_to_all", world, fanout)),
+                        places=12,
+                        msg=f"k={picks} T={targets} E={placed} world={world} "
+                            f"node={node} stride={stride}")
+
+    def test_the_phases_sum_to_the_bytes_the_row_publishes(self):
+        """The same conservation read where a user sees it: the per-phase
+        rows a popover adds up against the per-rank bytes the layer states
+        for the same collective. These disagreed by 1.56x."""
+        for world, node in ((8, 8), (8, 4), (32, 8), (64, 8), (16, 4)):
+            phases = self._phases(world, node)
+            self.assertAlmostEqual(
+                sum(ph["bytes_per_rank"] for ph in phases),
+                collective_per_rank_bytes("all_to_all", world, self.T,
+                                          self.F),
+                delta=1e-6 * self.T, msg=f"world={world} node={node}")
+
+    def test_a_worse_topology_is_never_cheaper(self):
+        """One group of eight, one node of eight against two nodes of four:
+        the same bytes, more of them on the slower fabric. It used to cost
+        0.579 of the payload on one node and 0.373 on two."""
+        one, two = self._shares(8, 8), self._shares(8, 4)
+        self.assertAlmostEqual(sum(s for _l, s in one),
+                               sum(s for _l, s in two), places=12)
+        self.assertEqual([level.fabric for level, _s in two],
+                         ["intra", "inter"])
+        self.assertGreater(dict((l.fabric, s) for l, s in two)["inter"], 0.0)
+
+    # -- the levels a card makes -----------------------------------------
+
+    def test_a_single_node_has_one_level_and_the_flat_hop_count(self):
+        """Every member in one node: the exchange between nodes has one
+        destination, so there is no second phase — and deduping inside the
+        node forwards nothing further, so the hops are the flat
+        `ceil(log2 world)` they were."""
+        self.assertEqual(placement_levels(8, 8, 1),
+                         (PlacementLevel("intra", 8, 1),))
+        (ph,) = self._phases(8, 8)
+        self.assertEqual((ph["fabric"], ph["world"], ph["hops"]),
+                         ("intra", 8, 3))
+        self.assertEqual(
+            ph["hops"],
+            collective_phases("all_to_all", 8, self.T,
+                              gpus_per_node=8)[0]["hops"])
+        self.assertAlmostEqual(ph["bytes_per_rank"] / self.T,
+                               float(self.F.remote_factor(8)))
+
+    def test_one_member_per_node_has_only_the_node_level(self):
+        """The group's stride puts every member on its own node: there is
+        no exchange inside a node, and the one phase carries the whole
+        total on the inter fabric."""
+        self.assertEqual(placement_levels(8, 8, 8),
+                         (PlacementLevel("inter", 8, 1),))
+        (ph,) = self._phases(8, 8, base_stride=8)
+        self.assertEqual((ph["fabric"], ph["world"], ph["hops"]),
+                         ("inter", 8, 3))
+        self.assertAlmostEqual(ph["bytes_per_rank"] / self.T,
+                               float(self.F.remote_factor(8)))
+
+    def test_both_levels_split_the_hops_and_the_bytes(self):
+        """Four nodes of eight: the ranks inside a node over NVLink, the
+        nodes over RDMA, and the hops are the two exchanges' —
+        `ceil(log2 4) + ceil(log2 8)`, the flat `ceil(log2 32)`."""
+        intra, inter = self._phases(32, 8)
+        self.assertEqual((intra["fabric"], intra["world"]), ("intra", 8))
+        self.assertEqual((inter["fabric"], inter["world"]), ("inter", 4))
+        self.assertEqual(intra["hops"] + inter["hops"], 5)
+        # The node level counts its own destinations; the rank level takes
+        # what is left of the exchange's total.
+        self.assertAlmostEqual(
+            inter["bytes_per_rank"] / self.T,
+            float(self.F.remote_factor(32, scope_members=32, dest_members=8)))
+        self.assertAlmostEqual(
+            (intra["bytes_per_rank"] + inter["bytes_per_rank"]) / self.T,
+            float(self.F.remote_factor(32)))
+
+    def test_a_world_that_is_not_whole_nodes_is_one_level(self):
+        """64 ranks of an NVL72 node, two ranks of expert tensor
+        parallelism beneath them: 36 of the group's members fit in a node
+        and 64 is not a whole number of those, so no node level's
+        destination count applies. One level then, carrying the whole
+        total on the inter fabric — pessimistic in the FABRIC, and not in
+        the bytes."""
+        self.assertEqual(placement_levels(64, 72, 2),
+                         (PlacementLevel("inter", 64, 1),))
+        (ph,) = self._phases(64, 72, base_stride=2)
+        self.assertEqual((ph["fabric"], ph["world"]), ("inter", 64))
+        self.assertAlmostEqual(ph["bytes_per_rank"] / self.T,
+                               float(self.F.remote_factor(64)))
+
+    def test_without_a_fan_out_nothing_changes(self):
+        """A Ulysses CP exchange carries no fan-out and is priced exactly
+        as a flat all-to-all — bit for bit the phases of an unrouted
+        world."""
+        for world, node, stride in ((8, 8, 1), (32, 8, 1), (12, 8, 1),
+                                    (4, 8, 8)):
+            self.assertEqual(
+                collective_phases("all_to_all", world, self.T,
+                                  gpus_per_node=node, base_stride=stride,
+                                  fanout=None),
+                collective_phases("all_to_all", world, self.T,
+                                  gpus_per_node=node, base_stride=stride),
+                f"world={world} node={node} stride={stride}")
+
+    def test_nothing_to_dedup_is_the_flat_ring_at_both_levels(self):
+        """The two degeneracies, end to end. One pick per token, and every
+        pick to every destination: in both there is nothing to dedup, so
+        the levels must sum to the flat ring's bytes exactly — and they do
+        at every placement, not only on one node.
+
+        This is what a model that charged the receiving node's fan-out to
+        nobody could not do: with `k = T = E` it came out 1.75x cheaper
+        than the ring.
+        """
+        for fanout in (RouteFanout(picks=1, targets=256, placed=256),
+                       RouteFanout(picks=8, targets=8, placed=8),
+                       RouteFanout(picks=4, targets=4, placed=4)):
+            for world, node in ((8, 8), (8, 4), (32, 8), (16, 4), (64, 8)):
+                if fanout.placed % world:
+                    continue
+                phases = self._phases(world, node, fanout=fanout)
+                self.assertAlmostEqual(
+                    sum(ph["bytes_per_rank"] for ph in phases) / self.T,
+                    (world - 1) / world, places=12,
+                    msg=f"{fanout} world={world} node={node}")
+                self.assertEqual(
+                    sum(ph["hops"] for ph in phases),
+                    sum(ph["hops"] for ph in collective_phases(
+                        "all_to_all", world, self.T, gpus_per_node=node)),
+                    f"{fanout} world={world} node={node}")
+
+    def test_the_levels_are_read_off_the_card(self):
+        """The same group on a 4-GPU node is placed differently: two nodes
+        of four instead of one node of eight. The levels are computed where
+        the card is known, so a row re-read on another card re-levels."""
+        self.assertEqual(placement_levels(8, 4, 1),
+                         (PlacementLevel("intra", 4, 1),
+                          PlacementLevel("inter", 8, 4)))
+        self.assertEqual(len(self._phases(8, 4)), 2)
+        self.assertEqual(len(self._phases(8, 8)), 1)
+
+    def test_a_routed_exchange_runs_nccls_schedule(self):
+        """A framework's own all-reduce kernels do not run a dispatch, at
+        any placement — the non-divisible one included, which used to
+        decline to say so."""
+        for world, node, stride in ((8, 8, 1), (32, 8, 1), (64, 72, 2)):
+            with self.assertRaises(ValueError):
+                collective_phases("all_to_all", world, self.T,
+                                  gpus_per_node=node, base_stride=stride,
+                                  fanout=self.F, algorithm="one_shot")
+
+    def test_members_per_node_has_one_statement(self):
+        """The rung dispatch, the fabric split and the levels read one
+        number (`members_per_node`), not three spellings of it."""
+        for world, node, stride, want in ((8, 8, 1, 8), (8, 8, 2, 4),
+                                          (32, 8, 1, 8), (4, 8, 8, 1),
+                                          (8, 72, 1, 8), (2, 8, 4, 2)):
+            self.assertEqual(members_per_node(world, node, stride), want,
+                             f"{world}/{node}/{stride}")
 
 
 class TestCardFabricHasOneStatement(unittest.TestCase):

@@ -31,6 +31,7 @@ from backend.arch.eval.refusal import node_context
 from backend.arch.eval.routed import RoutedLaunch
 from backend.arch.eval.storage import is_expert_axis
 from backend.arch.eval.formats import known_dtype_bytes
+from backend.arch.layout.comm_volume import RouteFanout
 from backend.arch.spec_migrate import measured_row_migration
 
 import hashlib
@@ -605,6 +606,13 @@ class CommLaunch:
     #: say which, which is why this cannot be turned into a dtype
     #: environment and a disagreement is refused instead (`from_row`).
     payload_dtype_bytes: float
+    #: A routed MoE exchange's top-k fan-out, as the row states it
+    #: (`comm_route_fanout`): the picks, the destinations they are drawn
+    #: from and the ones that hold weights. None for every exchange that is
+    #: not a dispatch — a declared fact about the launch, since a flat
+    #: `all_to_all_single` and a deduped ragged dispatch are not one kernel
+    #: and must not be one cell.
+    route_fanout: Optional[RouteFanout] = None
 
     @classmethod
     def from_row(cls, row: Dict[str, Any]) -> Optional["CommLaunch"]:
@@ -658,7 +666,11 @@ class CommLaunch:
         act = DTYPE_BYTES.get(str(row.get("act_dtype") or "").strip().upper())
         if not width or act is None or float(width) != act:
             return None
-        return cls(tuple(shape), world, stride, float(width))
+        # The routing a dispatch deduped by, where the row states one. Read
+        # and not derived: the row carries the fan-out the walk priced.
+        fanout = row.get("comm_route_fanout")
+        return cls(tuple(shape), world, stride, float(width),
+                   RouteFanout.from_dict(fanout) if fanout else None)
 
     @property
     def elements(self) -> int:
@@ -672,6 +684,14 @@ def _collective_identity(comm: Optional[CommLaunch],
     """`{n_comm_elems, n_comm_ranks, n_comm_stride}` — the buffer one launch
     moves, the group it moves it over, and that group's spacing on the mesh.
 
+    A ROUTED exchange states three more (`routed_all_to_all`): the top-k
+    picks, the destinations they are drawn from, and the ones that hold
+    weights. What its kernel moves is not the flat equal split those first
+    three describe — a token goes once to each distinct destination its
+    picks land on, so the per-peer message sizes are ragged and their total
+    is a fraction of the buffer. That is a different measurement, so it is
+    a different cell.
+
     One axis per published fact, and only the axes the signature's cell
     declares: a signature asking for an axis no comm fact answers gets no
     cell, so the row is dropped and named instead of keyed on a guess.
@@ -681,6 +701,10 @@ def _collective_identity(comm: Optional[CommLaunch],
     facts = {"n_comm_elems": comm.elements,
              "n_comm_ranks": comm.world,
              "n_comm_stride": comm.stride}
+    if comm.route_fanout is not None:
+        facts.update({"n_experts_active": comm.route_fanout.picks,
+                      "n_route_targets": comm.route_fanout.targets,
+                      "n_route_experts": comm.route_fanout.placed})
     dims: Dict[str, int] = {}
     for axis in sig.cell_dims:
         value = facts.get(axis)
@@ -1423,15 +1447,19 @@ class RowIdentity:
         The engine calls every attention op `flash_attention`; the true
         variant reads off the cache slots its keys come from
         (`KVAccess.key_slots`), the program's routedness of the row's node
-        (`_node_of`), and the operand rank — never the node id's spelling.
+        (`_node_of`), the dispatch fan-out the row's collective carries,
+        and the operand rank — never the node id's spelling.
         """
+        fanout = bool(row.get("comm_route_fanout"))
         if node is None:
-            return resolve_op(str(row.get("op", "") or ""), row.get("shape_in"))
+            return resolve_op(str(row.get("op", "") or ""),
+                              row.get("shape_in"), route_fanout=fanout)
         access = self._result.kv_access.get(node)
         return resolve_op(
             str(row.get("op", "") or ""), row.get("shape_in"),
             key_slots=access.key_slots if access is not None else frozenset(),
-            routed=self._program.node_is_routed(node))
+            routed=self._program.node_is_routed(node),
+            route_fanout=fanout)
 
     def of(self, row: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         """`(op, shape_json)` — the row's kernel and its identity shape.
@@ -2135,7 +2163,8 @@ def _dsa_identity(sig: Optional[OpSignature], shape_in: Any, shape_out: Any,
 
 def resolve_op(op: str, shape_in: Any = None, *,
                key_slots: FrozenSet[str] = frozenset(),
-               routed: bool = False) -> str:
+               routed: bool = False,
+               route_fanout: bool = False) -> str:
     """The kernel behind the engine's op label, from facts the caller reads
     off the analysis — never from the node id's spelling.
 
@@ -2150,7 +2179,14 @@ def resolve_op(op: str, shape_in: Any = None, *,
     GROUPED gemm kernel (DeepGEMM m_grouped), not the dense GEMM. Both the
     write side (plan) and the lookup side (overlay) go through
     `RowIdentity.op_of`, so the physical key agrees by construction.
+    `route_fanout` says the row's collective carries a dispatch's top-k
+    fan-out (`comm_route_fanout`): a routed exchange's per-peer messages are
+    ragged and their total a fraction of the buffer, which a flat
+    `all_to_all_single` measurement does not describe, so it is its own
+    kernel (`routed_all_to_all`).
     """
+    if route_fanout and op_signature(op) == "all_to_all":
+        return _rewrite(op, "routed_all_to_all")
     kernels = {k.name: k.kernel for k in slot_kinds().values()}
     if key_slots and op_signature(op) in set(kernels.values()):
         named = {kernels.get(kind) for kind in key_slots}

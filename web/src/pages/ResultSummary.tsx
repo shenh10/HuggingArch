@@ -181,6 +181,11 @@ export type ModuleFoldRow = {
   /** Output shapes of a multi-output leaf — a list of shape lists from
    *  per-op timing, or a port-name → shape map from the shape layer. */
   shape_outs?: unknown[] | Record<string, unknown>;
+  /** Each tensor's element dtype (see PerOpRow). */
+  input_dtypes?: (string | null)[] | null;
+  port_dtypes?: (string | null)[] | null;
+  output_dtype?: string | null;
+  weights?: WeightOperand[] | null;
   /** Unsharded global shapes, when TP/EP makes per-rank differ. */
   shape_in_full?: unknown;
   shape_out_full?: unknown;
@@ -303,6 +308,14 @@ export type PerOpRow = {
   shape_outs?: unknown[] | Record<string, unknown>;
   shape_in_full?: unknown;
   shape_out_full?: unknown;
+  /** Each tensor's element dtype, as the walk billed it: one per `shape_in`
+   *  input, one per `shape_outs` port; `output_dtype` is `shape_out`'s. */
+  input_dtypes?: (string | null)[] | null;
+  port_dtypes?: (string | null)[] | null;
+  output_dtype?: string | null;
+  /** The stored tensors the kernel streams that arrive on no input (its own
+   *  weight, bias, a tie's target), as one rank holds them. */
+  weights?: WeightOperand[] | null;
   derived_group?: DerivedGroup;
   /** A hop across a pipeline cut: sent by stage `cut`, from the occurrence
    * that produced the value to the ones that read it past the cut. */
@@ -310,6 +323,10 @@ export type PerOpRow = {
   source_occurrence?: Occurrence | null;
   sink_occurrences?: Occurrence[];
 };
+
+/** One stored tensor a kernel streams: its checkpoint name, one rank's
+ *  shape of it, its resident dtype. */
+export type WeightOperand = { name: string; shape: number[]; dtype: string | null };
 
 export type Occurrence = { node: string; iteration: number | null };
 

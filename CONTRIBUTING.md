@@ -178,9 +178,10 @@ public analysis surface, so we can agree on the shape before you build it.
 
 ## Coding conventions
 
-- **Lint gate.** CI runs `ruff check backend/` with the bug-oriented families
-  (`F`/`B`/`PLE`/`PLW`/`SIM`/`PERF`/`PIE`/`RUF`) — it catches defects, not
-  style. Run `uv run ruff check backend/` locally.
+- **Lint gate.** CI runs `ruff check .` — the whole repository, `kernel_bench/`,
+  `tools/`, `scripts/` and `tests/` included — with the bug-oriented families
+  (`F`/`B`/`PLE`/`PLW`/`SIM`/`PERF`/`PIE`/`RUF`): it catches defects, not
+  style. Run `uv run ruff check .` locally.
 - **Core vs. service boundary.** The OSS analyzer + planner (everything except
   `backend/service/` and the account / admin / sign-in pages in `web/src/pages/`) must **never import the service
   layer**. `tests/meta/test_service_layout.py` enforces this — keep identity / auth /

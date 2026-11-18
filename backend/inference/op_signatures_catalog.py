@@ -1412,12 +1412,33 @@ register_signature(OpSignature(
     structural_axes=("n_comm_ranks", "n_comm_stride"),
     doc=("all-to-all: every rank sends a distinct slice to every other, "
          "swapping which axis the tensor is sharded on — torch's "
-         "`all_to_all_single` with a flat `sendcount`, DeepEP's "
-         "dispatch/combine. The expert-parallel dispatch primitive: tokens "
-         "leave the rank that embedded them for the rank that holds their "
-         "expert, and come back the same way. The equal-slice form is what "
-         "this cell states; the ragged one (per-peer split lists) is the "
-         "imbalance declared out of the cell above."),
+         "`all_to_all_single` with a flat `sendcount`. The EQUAL-slice form, "
+         "which is what the sequence-parallel exchange is (Ulysses: the "
+         "heads of a sequence-cut tensor for the sequence of a head-cut "
+         "one). A MoE dispatch is the ragged form and is its own cell "
+         "(`routed_all_to_all`): it sends a token once per distinct "
+         "destination its top-k reaches, so its per-peer messages are "
+         "unequal and their total is a fraction of the buffer."),
+))
+
+register_signature(OpSignature(
+    name="routed_all_to_all",
+    binds_ops=('routed_all_to_all',),
+    shape_projection="collective",
+    inputs=(TensorLayout("payload", ("n_comm_elems",)),),
+    structural_axes=("n_comm_ranks", "n_comm_stride", "n_experts_active",
+                     "n_route_targets", "n_route_experts"),
+    doc=("The MoE dispatch's own exchange: DeepEP's dispatch and combine, "
+         "which send a token ONCE per distinct destination its top-k picks "
+         "land on and fan the copy out at the receiver. Not the signature "
+         "above: that one's cell states an equal split of the buffer between "
+         "peers, and this one's per-peer messages are ragged and their total "
+         "a fraction of it — the fraction the three routing axes give "
+         "(`comm_volume.RouteFanout`: `n_experts_active` picks drawn from "
+         "`n_route_targets` destinations of which `n_route_experts` hold "
+         "weights). A row is this cell when it carries that fan-out, which "
+         "is a fact of the graph (`comm_route_fanout`, off the dispatch) and "
+         "not of the model's name or the framework's."),
 ))
 
 register_signature(OpSignature(

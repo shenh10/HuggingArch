@@ -162,23 +162,16 @@ _CASES = [
     #     two distinct collectives, not fused.
     #   * reduce-after-combine still merges to one [B·S,H] all_reduce (tp_moe=2).
     #
-    # The MoE seam's two cells are pinned at a KNOWN OVER-COUNT (+5.1%/+3.2%
-    # prefill, +1.4%/+0.2% decode), and this is the one case in the set that
-    # got worse rather than better when expert parallelism stopped being
-    # spelled on the token axis. The conflated spelling was right here by
-    # accident: `ep_moe`'s cut and the residual's named the same symbol, so
-    # they compared as one and derived the symmetric all_to_all pair the
-    # deployment really performs. Separated, they are three worlds — `cp`
-    # {0,2}, `dp_attention` {0,4}, `ep_moe` {0,2,4,6} — and the first two tile
-    # the third without equalling it, which an alias EQUIVALENCE cannot say.
-    # So the dispatch reads `ep_moe` as a world nothing cuts, and acquiring the
-    # expert layout comes out free; the return reads a lone `ep_moe` shard and
-    # all_gathers it at 4x the payload. Net 2x the pair.
-    #
-    # Pinned rather than deferred because the alternative is not pinning the
-    # right number — it is leaving the wrong one unwatched. The fix is the
-    # containment preorder in `mesh.alias_map`'s docstring, and this cell is
-    # the one that will move when it lands.
+    # The MoE seam is the all_to_all pair — dispatch and combine over the
+    # `ep_moe` world of 4, each routed row moved once. The token cut here is
+    # two worlds, `cp` {0,2} and `dp_attention` {0,4}, which together tile
+    # the expert world `ep_moe` {0,2,4,6} without either equalling it; the
+    # dispatch joins the token owner cells with the route groups by
+    # membership (`routed_rows_layout`), the join is every rank, and both
+    # cuts are absorbed into the exchange. Per token the pair moves exactly what the
+    # dp_ep and cp_ep deployments at the same `ep_moe` move
+    # (`test_moe_ordered_collectives::
+    # test_two_world_token_cut_exchanges_like_one_world`).
     ("DeepSeek-V3-dpcpep", "deepseek-ai__DeepSeek-V3.json", "B200", AS_SHIPPED,
      dict(tp_attention=2, tp_dense_ffn=2, tp_moe_expert=2, ep_moe=4,
           cp=2, pp=1, dp_attention=2, dp_replicas=1)),

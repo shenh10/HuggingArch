@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -9,8 +10,12 @@ import tempfile
 import threading
 from typing import List, Optional
 
+import httpx
+
 from .base import AgentBackend
 from .usage import extract_usage_events
+
+logger = logging.getLogger(__name__)
 
 
 class KimiBackend(AgentBackend):
@@ -52,6 +57,7 @@ class KimiBackend(AgentBackend):
     def _launch(self, argv: list, prompt: str, env: Optional[dict],
                 workspace: Optional[str]) -> subprocess.Popen:
         run_cwd, child_env = self._run_cwd_and_env(env, workspace)
+        child_env = self._with_context_window(child_env)
         part_paths = self._write_prompt_parts(prompt)
         proc = subprocess.Popen(
             self._argv_with_prompt(argv, self._reading_order(part_paths)),
@@ -71,6 +77,44 @@ class KimiBackend(AgentBackend):
             target=self._reap_prompt_files, args=(proc, part_paths), daemon=True,
         ).start()
         return proc
+
+    @staticmethod
+    def _with_context_window(env: dict) -> dict:
+        """`env` with the context window of the model it names.
+
+        A model given by `KIMI_MODEL_NAME` (every BYOK run) takes its window
+        from `KIMI_MODEL_MAX_CONTEXT_SIZE` and otherwise is assumed to have
+        262144 tokens (kimi-code 2.1.1 `applyEnvModelConfig`). Its login path
+        reads the window from the endpoint's `/models` (`context_length`),
+        which lists `k3` at 1048576: without it a k3 run compacts at a
+        quarter of its window and the summary drops the review's progress.
+        The endpoint is the window's owner, so it is read there, once per
+        launch; an endpoint that does not list the model leaves kimi-code's
+        own assumption, and says so."""
+        model = (env.get("KIMI_MODEL_NAME") or "").strip()
+        base = (env.get("KIMI_MODEL_BASE_URL") or "").strip().rstrip("/")
+        if not model or env.get("KIMI_MODEL_MAX_CONTEXT_SIZE"):
+            return env
+        if not base:
+            logger.warning("Kimi model %r has no KIMI_MODEL_BASE_URL to read its "
+                           "context window from; kimi-code assumes 262144", model)
+            return env
+        try:
+            r = httpx.get(f"{base}/models", timeout=15.0, headers={
+                "Authorization": f"Bearer {env.get('KIMI_MODEL_API_KEY') or ''}"})
+            r.raise_for_status()
+            listed = {m.get("id"): m.get("context_length")
+                      for m in r.json().get("data") or [] if isinstance(m, dict)}
+        except (httpx.HTTPError, ValueError, AttributeError) as exc:
+            logger.warning("Kimi %s/models unreadable (%s); kimi-code assumes "
+                           "262144 for %r", base, exc, model)
+            return env
+        window = listed.get(model)
+        if not isinstance(window, int) or window <= 0:
+            logger.warning("Kimi %s/models lists no context_length for %r; "
+                           "kimi-code assumes 262144", base, model)
+            return env
+        return {**env, "KIMI_MODEL_MAX_CONTEXT_SIZE": str(window)}
 
     @staticmethod
     def _argv_with_prompt(argv: list, reading_order: str) -> list:

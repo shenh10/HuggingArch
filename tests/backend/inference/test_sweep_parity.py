@@ -76,7 +76,8 @@ def _parallel_cell(dep: Deployment, cards=CARDS, context: int = CTX) -> dict:
     payload.update(gpu_skus=list(cards), num_gpus=env["parallel"].cluster_size,
                    parallel=env["parallel"], avg_input_tokens=context)
     from backend.inference.batch_sweep import measure_points
-    out = ps._estimate_layout(payload)
+    from tests.sweep_parity import layout_at
+    out = layout_at(payload)
     measure_points([pt for pt in out.values() if "sol" in pt],
                    selection_mode=env["selection_mode"],
                    measurement_scope=env["measurement_scope"])

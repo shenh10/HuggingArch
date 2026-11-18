@@ -26,7 +26,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.arch.ops import OP_REGISTRY
 from backend.inference.benchmark_identity import (
-    CommLaunch, identity_shape_from_shape_in, row_invocation_dims,
+    CommLaunch, identity_shape_from_shape_in, resolve_op, row_invocation_dims,
 )
 from backend.inference.op_signatures import all_signatures, get_signature
 from kernel_bench.signatures import op_to_signature
@@ -230,6 +230,36 @@ class TestTheChannelDisturbsNothingElse(unittest.TestCase):
                                                  shape_out=shape_out,
                                                  comm=launch))
 
+    def test_a_routed_exchange_is_its_own_cell(self):
+        """A dispatch's exchange is not the flat `all_to_all_single` the
+        plain cell describes: it sends a token once per distinct destination
+        its top-k picks reach, so its per-peer messages are ragged and their
+        total a fraction of the buffer. The row says so (`comm_route_fanout`,
+        a fact of the graph), so it keys as its own kernel with the three
+        routing axes beside the buffer and the group."""
+        fanout = {"picks": 8, "targets": 256, "placed": 256}
+        row = _row(comm_route_fanout=fanout)
+        self.assertEqual(resolve_op("all_to_all", route_fanout=True),
+                         "routed_all_to_all")
+        cell = json.loads(identity_shape_from_shape_in(
+            "routed_all_to_all", [8, 1, 2880],
+            comm=CommLaunch.from_row(row)))
+        self.assertEqual(cell, {"n_comm_elems": 8 * 2880, "n_comm_ranks": 8,
+                                "n_comm_stride": 1, "n_experts_active": 8,
+                                "n_route_targets": 256,
+                                "n_route_experts": 256})
+
+    def test_an_exchange_with_no_fan_out_keys_as_it_did(self):
+        """A Ulysses CP exchange carries no fan-out: the same kernel, the
+        same cell, the same three axes as before — the routed cell takes
+        nothing that was already keyed."""
+        self.assertEqual(resolve_op("all_to_all"), "all_to_all")
+        self.assertIsNone(CommLaunch.from_row(_row()).route_fanout)
+        cell = json.loads(identity_shape_from_shape_in(
+            "all_to_all", [8, 1, 2880], comm=CommLaunch.from_row(_row())))
+        self.assertEqual(cell, {"n_comm_elems": 8 * 2880, "n_comm_ranks": 8,
+                                "n_comm_stride": 1})
+
     def test_only_the_collective_signatures_declare_the_projection(self):
         """The projection name is the declaration the rest of the code asks
         — the ref registry builds payload buffers for exactly these — so it
@@ -238,7 +268,8 @@ class TestTheChannelDisturbsNothingElse(unittest.TestCase):
                                if s.shape_projection == "collective")
         self.assertEqual(by_projection,
                          ["all_gather", "all_reduce", "all_to_all",
-                          "reduce_scatter", "send_recv"])
+                          "reduce_scatter", "routed_all_to_all",
+                          "send_recv"])
 
 
 if __name__ == "__main__":

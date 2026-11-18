@@ -117,6 +117,27 @@ class SpeculativeDraft:
         return cls(draft_style, int(draft_tokens), cls.stacks_of(program))
 
     @classmethod
+    def drafted_by(cls, program: Any, *, style: str, draft_tokens: int
+                   ) -> Optional["SpeculativeDraft"]:
+        """The draft a step of this model drafting `draft_tokens` tokens
+        runs — or None when it runs none, because this model declares no
+        draft graph or because nothing is drafted (`refusal`).
+
+        The two callers ask different questions of the same statement. A
+        REQUEST that names a draft asks `of`, and a deployment that cannot
+        run one is refused with the reason. A caller that only states a
+        verify width — a step may verify K + 1 positions against an
+        external drafter or an n-gram proposer, neither of them this
+        model's graph — asks here, and gets the forwards there are to
+        price: the verify forward alone when the model has no draft graph.
+        Asking `of` for that was the plan's bug: it read a verify width as
+        a declaration that this model drafts, and crashed on every model
+        without an MTP stack."""
+        if cls.refusal(program, draft_tokens=draft_tokens) is not None:
+            return None
+        return cls.of(program, style=style, draft_tokens=draft_tokens)
+
+    @classmethod
     def from_wire(cls, wire: Mapping[str, Any]) -> "SpeculativeDraft":
         return cls(DraftStyle(wire["style"]), int(wire["draft_tokens"]),
                    tuple(wire["stacks"]))
@@ -144,9 +165,18 @@ class SpeculativeDraft:
     @property
     def tokens_per_forward(self) -> int:
         """Tokens per sequence each draft forward runs over."""
-        if self.style is DraftStyle.RECURSIVE:
-            return 1
-        return self.draft_tokens
+        return self.forward_width(self.draft_tokens)
+
+    def forward_width(self, draft_tokens: int) -> int:
+        """Tokens per sequence one forward of THIS style runs over when the
+        step drafts `draft_tokens` of them — the verify width of the draft
+        forward's own walk, which is not the step's.
+
+        A reader that moves a draft forward's rows to another point of the
+        step's cell reads it here: a recursive draft forward is one token
+        per sequence whatever K the step verifies, so its walk is the same
+        walk at every K, while a parallel draft's widens with K."""
+        return 1 if self.style is DraftStyle.RECURSIVE else int(draft_tokens)
 
     def step(self, resolved: Any, parallel: Any, *,
              batch: int, avg_input_tokens: int, avg_output_tokens: int,

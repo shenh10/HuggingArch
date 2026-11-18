@@ -1,9 +1,9 @@
-"""The one filling producer for decode point clouds.
+"""The one filling producer for throughput point clouds.
 
 Every cloud states the same coordinates and keeps the same absence records.
 Context×batch, parallel-layout and Gallery code enumerate their own questions
 and yield `CloudRecord`s; this module is the one place that decides whether a
-record becomes a served point or an absent one, and it alone calls the decode
+record becomes a served point or an absent one, and it alone calls the point
 and absence constructors.
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
-from .frontier import POINT_DIMS, PointRefusal, absent_point, decode_point
+from .frontier import POINT_DIMS, PointRefusal, absent_point, cloud_point
 
 
 def _held_coordinates(coordinates: Mapping[str, Any]) -> None:
@@ -87,10 +87,11 @@ def produce_cloud(records: Sequence[CloudRecord]) -> PointCloud:
     """Fill one cloud from records, served or absent.
 
     This is the only point-cloud filling path. A record that already knows it
-    is refused stays absent. A readable record is decoded here; a point past
-    the model's published context keeps its values and warning, an unserved
-    point is capacity-refused, and no decode time is the source's stated card
-    or capacity refusal.
+    is refused stays absent. A readable record is read here (`cloud_point`:
+    both phases of the one estimate); a point whose requests do not fit is
+    capacity-refused, a point past the model's published context keeps its
+    values and is flagged, and no decode time is the source's stated card or
+    capacity refusal.
     """
     cloud = PointCloud()
     for record in records:
@@ -99,14 +100,14 @@ def produce_cloud(records: Sequence[CloudRecord]) -> PointCloud:
         if record.refusal is not None:
             point = absent_point(coordinates, record.refusal, record.reason)
         else:
-            drawn = decode_point(record.estimate)
+            drawn = cloud_point(record.estimate)
             provenance = dict(record.provenance)
-            if record.beyond_max_context and drawn is not None:
-                point = {**drawn, **coordinates, **provenance,
-                         "beyond_max_context": True}
-            elif not record.served:
+            if not record.served:
                 point = absent_point(coordinates, "capacity",
                                      record.capacity_reason)
+            elif record.beyond_max_context and drawn is not None:
+                point = {**drawn, **coordinates, **provenance,
+                         "beyond_max_context": True}
             elif drawn is None:
                 point = absent_point(coordinates, record.no_step_refusal,
                                      record.no_step_reason)
@@ -128,12 +129,15 @@ def estimate_records(
     num_gpus: int,
     acceptance_rate: float,
     ep_load_factor: Any,
-    served: Callable[..., bool],
+    fits: Callable[..., bool],
 ) -> Iterable[CloudRecord]:
     """The context×batch cloud from a `CapacitySweepPlan`'s finished points.
 
-    `served` is capacity's `point_served`, passed by the caller to keep this
-    module below capacity's preparation layer.
+    `fits` is capacity's `fits` (the KV capacity fact), passed by the caller
+    to keep this module below capacity's preparation layer: a point whose
+    requests do not fit is capacity-refused; one that fits past the model's
+    published context keeps its values, flagged — the parallel cloud's rule
+    (`parallel_sweep.decode_rungs`).
     """
     from .frontier import parallel_mode
 
@@ -151,16 +155,12 @@ def estimate_records(
                 yield CloudRecord.unanswered(
                     coordinates, "error", "the sweep returned no point")
                 continue
-            is_served = served(
-                max_batch_per_gpu=est.get("max_batch_per_gpu"),
-                beyond_max_context=bool(est.get("beyond_max_context")),
-                requests=decode or 1)
             beyond = bool(est.get("beyond_max_context"))
-            if not is_served and not beyond:
+            if not fits(max_batch_per_gpu=est.get("max_batch_per_gpu"),
+                        requests=decode or 1):
                 ceiling = int(est.get("max_batch_per_gpu") or 0)
                 yield CloudRecord(
                     coordinates=coordinates, estimate=est, served=False,
-                    beyond_max_context=beyond,
                     capacity_reason=(
                         f"this GPU serves {ceiling} request"
                         f"{'s' if ceiling != 1 else ''} at this context"))
@@ -177,50 +177,76 @@ def estimate_cloud(**kwargs: Any) -> PointCloud:
 def parallel_records(plan: Any, results: Sequence[Any],
                      layout_label: Callable[[Any], str]
                      ) -> Iterable[CloudRecord]:
-    """The Parallelism sweep's cloud from every layout/card/batch answer.
+    """The Parallelism sweep's cloud from every layout/card/context/batch
+    answer — each point a decode rung that also carries its deployment's
+    prefill.
 
-    `plan` is the caller-side `ParallelSweepPlan`; only its published coordinate
-    and absence interface is read here, so this module owns the cloud without
-    owning layout enumeration.
+    `plan` is the caller-side `ParallelSweepPlan`; only its published
+    coordinate and absence interface is read here (`coordinates`,
+    `contexts`, `gpu_skus`, `requested_batch_key`), so this module owns the
+    cloud without owning layout enumeration. A point's mode is its
+    deployment's (`frontier.parallel_mode`), one point per deployment: that
+    the one-GPU deployment is every ladder's first rung is the views' rule
+    (`frontier.mode_ladders`).
     """
+    from .frontier import parallel_mode
+
     for cell, result in zip(plan.cells, results, strict=True):
-        if "refused" in result:
+        mode, num_gpus = parallel_mode(cell.parallel), cell.parallel.cluster_size
+
+        def at(gpu: str, context: int, batch_key: Any = None) -> dict:
+            return plan.coordinates(
+                mode, num_gpus, gpu, context=context,
+                batch_key=(plan.requested_batch_key if batch_key is None
+                           else batch_key))
+
+        if "refused" in result or result.get("error"):
+            refusal, reason = (("layout", str(result["refused"]))
+                               if "refused" in result
+                               else ("error", str(result["error"])))
             for gpu in plan.gpu_skus:
-                yield CloudRecord.unanswered(
-                    plan.absent_coordinates(
-                        cell.mode, cell.parallel.cluster_size, gpu,
-                        batch_key=plan.requested_batch_key),
-                    "layout", str(result["refused"]))
+                for context in plan.contexts:
+                    yield CloudRecord.unanswered(at(gpu, context), refusal, reason)
             continue
-        if result.get("error"):
-            for gpu in plan.gpu_skus:
-                yield CloudRecord.unanswered(
-                    plan.absent_coordinates(
-                        cell.mode, cell.parallel.cluster_size, gpu,
-                        batch_key=plan.requested_batch_key),
-                    "error", str(result["error"]))
-            continue
-        for gpu, card in (result.get("cards") or {}).items():
-            if "error" in card:
-                yield CloudRecord.unanswered(
-                    plan.absent_coordinates(
-                        cell.mode, cell.parallel.cluster_size, gpu,
-                        batch_key=plan.requested_batch_key),
-                    "card", str(card["error"]))
-                continue
-            for point in card.get("ladder") or ():
-                coordinates = plan.coordinates(
-                    cell.mode, cell.parallel.cluster_size, gpu,
-                    batch_key=point.get("batch_key", "max"))
-                beyond = ({"beyond_max_context": True}
-                          if point.get("beyond_max_context") else {})
-                yield CloudRecord(
-                    coordinates=coordinates, estimate=point,
-                    provenance={
-                        "layout": layout_label(cell.parallel), "x": cell.x,
-                        "parallel": cell.parallel.to_dict(), **beyond},
-                    no_step_refusal="capacity",
-                    no_step_reason="this card serves no decode step")
+        for gpu, entries in (result.get("cards") or {}).items():
+            for context, card in zip(plan.contexts, entries, strict=True):
+                # A card or a context that could not be priced is its own
+                # absence, in the cloud's refusal vocabulary
+                # (`parallel_sweep._absent`); the rest stand.
+                if "refused" in card:
+                    yield CloudRecord.unanswered(at(gpu, context),
+                                                 card["refused"],
+                                                 str(card["reason"]))
+                    continue
+                # The card's prefill, on every rung of its ladder. The sweep
+                # prices prefill once per (card, layout, context) — one
+                # request, whatever the decode batch beside it
+                # (`parallel_sweep._decode_ladder` moves the decode rows
+                # alone) — so it is the same fact at every rung rather than
+                # a fact of the rung. It is read here, after the sweep's one
+                # measured fold has written into `card["sol"]`, so prefill
+                # carries its measured track where the request asked for
+                # one. That a prefill line along the decode batch would be
+                # flat is then the cloud's own answer (`frontier.view_forms`),
+                # not a rule a consumer remembers.
+                prefill = ((card.get("sol") or {}).get("phases")
+                           or {}).get("prefill")
+                for point in card.get("ladder") or ():
+                    phases = dict(point.get("phases") or {})
+                    if prefill:
+                        phases["prefill"] = prefill
+                    yield CloudRecord(
+                        coordinates=at(gpu, context,
+                                       point.get("batch_key", "max")),
+                        estimate={**point, "phases": phases},
+                        provenance={
+                            "layout": layout_label(cell.parallel),
+                            "x": cell.x,
+                            "parallel": cell.parallel.to_dict()},
+                        beyond_max_context=bool(
+                            point.get("beyond_max_context")),
+                        no_step_refusal="capacity",
+                        no_step_reason="this card serves no decode step")
 
 
 def parallel_cloud(plan: Any, results: Sequence[Any],

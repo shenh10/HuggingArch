@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, List, Sequence, Tuple
 
 from backend.arch import dims as dim_registry
-from backend.arch.eval.dim import (Dim, ceiling, expr_of, value_of,
+from backend.arch.eval.dim import (Dim, ceil_div, expr_of, value_of,
                                    whole_count)
 
 from .materialize_comm import RewriteTarget
@@ -78,23 +78,24 @@ def physical_extent(mat: Any, extent: Any, layout: Any) -> Any:
 def routed_flow_shape(mat: Any,
     uid: int,
     state: Any,
-    local_experts: int,
     port: str = "out",
 ) -> List[Any]:
-    """Materialize a route exchange as one packed per-rank row buffer,
-    `[E_local · M, D]`.
+    """Materialize a routed collective's buffer as one packed per-rank row
+    buffer, `[E_local · M, D]`, read off the routed state it moves.
 
     The routed tensor is `[n_expert_copies, M, D]`; a rank sends and receives
-    its own experts' rows. `M` is the routed-load evidence's mean
-    (`RoutedLaunch.routed_rows` over the experts) and may be rational — the mean of row counts that
-    differ per expert — and so may the rank's total `E_local · M`: what an
-    attention replica sends is whole (`B·s·k`), but under attention tensor
-    parallelism a replica is `t` ranks, and the `B·s·k·dp/ep = B·s·k/t` rows
-    a rank receives on average need not be (one token, top-6, `t = 4`: 1.5).
-    The exchange moves the rows a rank receives, so it is spelled as the
-    whole rows its buffer holds — the next whole row above the busiest
-    rank's expectation — and per-expert padding belongs to the kernel
-    boundary that declares it.
+    its own experts' rows. `M` is the state's own routed-load evidence
+    (`physical.local_dims`: the mean times the busiest rank's factor, times
+    the rows a gather stacked, `ExpectedRoutedLoad.row_replication`) and may
+    be rational — the mean of row counts that differ per expert — and so may
+    the rank's total `E_local · M`: what an attention replica sends is whole
+    (`B·s·k`), but under attention tensor parallelism a replica is `t`
+    ranks, and the `B·s·k·dp/ep = B·s·k/t` rows a rank receives on average
+    need not be (one token, top-6, `t = 4`: 1.5). A rank's buffer holds whole
+    rows — the next whole row above its expectation — and a gathered buffer
+    is the gathered ranks' whole-row buffers stacked, so the ceiling is
+    taken per stacked copy. Per-expert padding belongs to the kernel
+    boundary that declares it (`RoutedLaunch.launch_rows`).
     """
     shape = mat.analysis.shapes.values.get(uid)
     axes = _output_axes(shape, port)
@@ -103,27 +104,21 @@ def routed_flow_shape(mat: Any,
         raise ValueError(
             f"{where}: routed communication needs the routed tensor's shape "
             "and layout")
+    if state.workload is None:
+        raise ValueError(
+            f"{where}: routed communication needs the routed state's "
+            "load evidence")
     expert = axis_of_kind(mat, uid, "expert_copies", port)
     if expert + 3 != len(axes):
         raise ValueError(
             f"{where}: routed communication moves an `[n_expert_copies, M, "
             f"D]` buffer, and {list(axes)!r} does not end in one")
-    # The busiest rank's exchange: the rows routed onto its experts — the
-    # dispatch's own boundary on the rank (`Analysis.routed`,
-    # `RoutedLaunch.routed_rows`), the same fact the kernels launch from —
-    # in whole rows: the rank receives rows, and its busiest share is an
-    # expectation, so the buffer holds the next whole row above it. The
-    # exchange moves no per-expert padding; that is the kernel's
-    # (`RoutedLaunch.launch_rows`).
-    program = mat.analysis.program
-    launch = mat.analysis.routed[program.dispatch_of(program.by_uid(uid))]
-    if launch.local_experts != local_experts:
-        raise ValueError(
-            f"{where}: the exchange holds {local_experts} experts and the "
-            f"dispatch's boundary {launch.local_experts}")
-    total = ceiling(value_of(launch.routed_rows))
+    local = local_dims(axes, state, mat.analysis.rule, where)
+    exact_rows = value_of(local[expert]) * value_of(local[expert + 1])
+    copies = state.workload.row_replication
+    total = ceil_div(exact_rows, copies) * copies
     mean = axes[expert + 1]
-    rows = (Dim(expr_of(axes[expert]) * expr_of(mean), total)
+    rows = (Dim(expr_of(axes[expert]) * expr_of(mean) * copies, total)
             if isinstance(mean, Dim) else total)
     feature = physical_extent(mat, axes[-1], state.layout[-1])
     return [rows, feature]

@@ -77,8 +77,7 @@ from backend.inference.sweep_grid import (
     GALLERY_LANDING_GPU,
     ROUTINE_OUTPUT_TOKENS,
     ROUTINE_SEQ_LENS,
-    SCALING_BATCH_GRID,
-    SCALING_CONTEXTS,
+    SCALING_PANEL_BATCH_GRID,
     SCALING_DEGREES,
 )
 
@@ -131,9 +130,10 @@ def _gpu_list(
 # request naming as shipped and one naming nothing share one entry.
 _SCALING_FRAC = 0.9                  # Inference.tsx useState(0.9)
 _SCALING_SELECTION_MODE = "envelope"  # Inference.tsx useState("envelope")
-_SCALING_OUTPUT_TOKENS = ROUTINE_OUTPUT_TOKENS  # compare.ts SWEEP_OUTPUT_TOKENS
-# The parallel POST sends Plan's output length, not the batch grid's: the
-# request length `in + out` sizes the KV, so it is a keyed field there.
+# Both Scaling POSTs send Plan's output length (one per panel): the request
+# length `in + out` sizes the KV, so it is a keyed field. Its default is the
+# routine grid's, which is also the canonical serving records' — another
+# output length is not projected and walks its own cells.
 _PLAN_OUTPUT_TOKENS = ROUTINE_OUTPUT_TOKENS  # Inference.tsx useState(SWEEP_OUTPUT_TOKENS) (outTok)
 
 
@@ -147,16 +147,18 @@ def _scaling_models(models: list[str] | None) -> list[str]:
     return [DEFAULT_INFER_MODEL] + [m for m in featured if m != DEFAULT_INFER_MODEL]
 
 
-def default_scaling_sweep_request(model_id: str, context_len: int):
+def default_scaling_sweep_request(model_id: str):
     """The exact `InferenceParallelSweepRequest` a first visitor to the Scaling
-    panel produces for (model, context) — so warm writes the key the endpoint
-    reads. See the field-source comment above; `gpu_sku` is inherited-but-ignored
+    panel produces for a model — so warm writes the key the endpoint reads.
+    One request serves every context the panel draws: the sweep prices the
+    routine context grid (`ROUTINE_SEQ_LENS`, the throughput cloud's contexts and
+    the Prefill chart's) whichever context the panel's dropdown shows. See the field-source comment above; `gpu_sku` is inherited-but-ignored
     in the parallel key, and `gpu_skus=None` matches the panel (which does not
     send it → the server's curated default series)."""
     return InferenceParallelSweepRequest(
         model_id=model_id,
         gpu_sku="",
-        context_len=context_len,
+        contexts=list(ROUTINE_SEQ_LENS),
         modes=list(ALL_MODES),
         gpu_memory_fraction=_SCALING_FRAC,
         avg_output_tokens=_PLAN_OUTPUT_TOKENS,
@@ -175,8 +177,8 @@ def default_scaling_batch_request(
         model_id=model_id,
         gpu_sku=gpu,
         seq_lens=list(ROUTINE_SEQ_LENS),
-        batch_grid=[BatchPoint(**bp) for bp in SCALING_BATCH_GRID],
-        avg_output_tokens=_SCALING_OUTPUT_TOKENS,
+        batch_grid=[BatchPoint(**bp) for bp in SCALING_PANEL_BATCH_GRID],
+        avg_output_tokens=_PLAN_OUTPUT_TOKENS,
         parallel_preset={"mode": mode, "degree": degree},
         gpu_memory_fraction=_SCALING_FRAC,
         selection_mode=_SCALING_SELECTION_MODE,
@@ -184,41 +186,26 @@ def default_scaling_batch_request(
     )
 
 
-def sweep_jobs(
-    models: list[str] | None = None, contexts: list[int] | None = None
-) -> list[tuple[str, int]]:
-    """(model_id, context_len) pairs for the parallel-sweep half. Default: the
-    featured model set × the panel's context grid (`SCALING_CONTEXTS`)."""
-    ctxs = contexts or list(SCALING_CONTEXTS)
-    return [(mid, ctx) for mid in _scaling_models(models) for ctx in ctxs]
-
-
 def scaling_jobs(
     models: list[str] | None = None,
-    contexts: list[int] | None = None,
     gpus: list[str] | None = None,
     modes: list[str] | None = None,
     degrees: list[int] | None = None,
 ) -> list[tuple[str, str, object]]:
-    """Every Scaling-panel POST as shipped: parallel (model × ctx) plus
-    Context × Batch (model × gpu × mode × degree). KV storage reads the batch
+    """Every Scaling-panel POST as shipped: parallel (one per model, every
+    context inside) plus Context × Batch (model × gpu × mode × degree). KV storage reads the batch
     payload, so it is not a separate job.
 
     `kind` is `parallel` / `batch`. GPU default is the parallel-chart series
     (`DEFAULT_SWEEP_GPUS`); pass `--all-gpus` / `--gpu` to expand.
     """
     mids = _scaling_models(models)
-    ctxs = contexts or list(SCALING_CONTEXTS)
     sku = gpus or list(DEFAULT_SWEEP_GPUS)
     par = modes or list(ALL_MODES)
     deg = degrees or list(SCALING_DEGREES)
     jobs: list[tuple[str, str, object]] = []
     for mid in mids:
-        jobs.extend(
-            ("parallel", f"{mid} · ctx={ctx}",
-             default_scaling_sweep_request(mid, ctx))
-            for ctx in ctxs
-        )
+        jobs.append(("parallel", mid, default_scaling_sweep_request(mid)))
         jobs.extend(
             ("batch", f"{mid} · {gpu} · {mode}@{n}",
              default_scaling_batch_request(mid, gpu, mode, n))
@@ -261,7 +248,6 @@ async def ensureSharedWalks(models: list[str] | None,
 
 async def warm_sweeps(
     models: list[str] | None = None,
-    contexts: list[int] | None = None,
     gpus: list[str] | None = None,
     modes: list[str] | None = None,
     degrees: list[int] | None = None,
@@ -279,7 +265,7 @@ async def warm_sweeps(
     if poolOnly:
         print("SOL answer cache disabled: canonical walks kept only", flush=True)
         return int(walks > 0)
-    jobs = scaling_jobs(models, contexts, gpus, modes, degrees)
+    jobs = scaling_jobs(models, gpus, modes, degrees)
     n_par = sum(1 for k, _, _ in jobs if k == "parallel")
     n_batch = sum(1 for k, _, _ in jobs if k == "batch")
     print(f"sweep engine version: {engine_version()}", flush=True)

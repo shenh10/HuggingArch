@@ -161,6 +161,21 @@ inter-node exchange over the slower link, then an all-gather inside each node
 depending on where its group sits. Communication volumes live in
 `arch/layout/comm_volume.py`.
 
+The MoE exchange is the one collective whose bytes are not a function of the
+group's size alone. A token is sent once per **distinct destination rank** its
+top-k picks land on, not once per pick — two experts on one rank share one
+copy, and the receiver fans the copy out to the experts it holds. That count
+is the exchange's total (`comm_volume.RouteFanout`), and the card's placement
+levels only say which fabric those copies cross
+(`comm_cost.placement_levels`, `routed_shares`): one RDMA send per distinct
+remote node, every other copy on NVLink. The levels are computed where the
+card is known, because the same group of eight ranks is one node on an SXM
+board and two nodes of four on PCIe cards — and because the total is the
+exchange's rather than a level's, a group spread over more nodes is slower,
+never cheaper. What the group-limited routers of DeepSeek and Kimi do to those
+counts is **not** modelled, and the gap is pessimistic; it is written up in
+[the cost model](inference_cost_model.md#the-moe-exchange-sends-a-token-once-per-destination).
+
 Pipeline parallelism is placement. The canonical balanced partition cuts the
 backbone's iteration space (the repeated layers of every stack that is not an
 aux stack) into contiguous stages, ⌊n/pp⌋ layers each with the remainder from
@@ -257,6 +272,27 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
   `all_to_all` dispatches tokens to their experts and another gathers the
   results; the router weights are never sharded.
 
+  The exchange moves rows only inside a route (`ep_moe`) group, so after it
+  a rank holds the tokens its route group held: the token owner cells
+  joined with the route groups (`LayoutPropagation.routed_rows_layout`).
+  What of the token cut varies inside a route group is absorbed; what varies
+  across route groups survives as a row cut. Under expert tensor
+  parallelism (`tp_moe_expert > 1`) with attention TP below it, that cut is
+  gathered over `tp_moe_expert` before the expert GEMMs, and the partial
+  sums go back by reduce_scatter before the inverse `all_to_all` — one rule
+  with or without `ep_moe`.
+
+  **Known gap (pessimistic).** With `tp_attention > 1` under a larger
+  `tp_moe_expert`, the surviving row cut is replicated over the
+  attention-TP ranks, so the gather runs over the cross-replica group and
+  the partial sums return by an `all_reduce` over all of `tp_moe_expert`
+  plus a local slice. The cheaper form — reduce_scatter over the
+  cross-replica group, then `all_reduce` over the attention-TP pair — is two
+  chained collectives on one edge, which the lowering does not build yet.
+  Pinned as today's form by
+  `tests/backend/arch/layout/test_moe_ordered_collectives.py::
+  test_attention_tensor_parallelism_gathers_over_the_ranks_with_other_rows`.
+
 ## Where this lives in the code
 
 | Concern | Location |
@@ -294,6 +330,8 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
 | `REGISTERED_MERGE_STATISTICS`, `admits_deferred_reduction` | registration gate framed by Gray et al.'s classification (registration, not decomposability in principle) | runtime validation gate |
 | `ExpectedRoutedLoad`, `routed_row_capacity_per_rank` | cf. GShard/Switch expert capacity (per-expert; ours is a per-rank total) | MoE routed rows as an expected per-rank load, not an index range |
 | `is_measure_preserving` | measure preservation | conservation check |
+| `RouteFanout`, `remote_factor` | cf. DeepEP's dispatch (one send per distinct destination); expected distinct cells of a hypergeometric draw | a routed exchange's coefficient: `(D-1)/D` over the DISTINCT destinations a token's top-k reaches, per copy the payload holds of it |
+| `PlacementLevel`, `placement_levels`, `routed_shares` | cf. hierarchical / two-level collectives (NCCL's intra+inter decomposition) | one level a card places a collective group at (the ranks inside a node, the nodes inside the world), and how a routed exchange's total is partitioned across them |
 | `validate_dispatch_region` | GShard dispatch/combine | well-formedness of a dispatch/combine region |
 | axis_use `contract/normalize/window/recurrent/route` | tensor contraction; normalization; stencil/sliding window; scan/recurrence; MoE routing | per-(op, axis) dependence class |
 | `shardable_by` | 自述词 | pure capability set: which worlds *may* shard a symbol; implies no division |

@@ -98,7 +98,10 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci --prefix web
-      - run: uv run ruff check backend/
+      # The whole repository, one spelling in all three workflows (see
+      # `test.yml`): a gate that measured only `backend/` left
+      # `kernel_bench/`, `tools/` and `scripts/` unchecked.
+      - run: uv run ruff check .
       - id: engine
         run: echo "engine=$(uv run python -c 'from backend.fingerprint import engine_version; print(engine_version())')" >> "$GITHUB_OUTPUT"
       # What a release must do on its own: the web app builds, the shared

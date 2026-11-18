@@ -9,7 +9,8 @@ from backend.api.gallery_overview import _grid_points
 from backend.api.estimate_env import resolve_estimate_environment
 from backend.arch.eval.precision import AS_SHIPPED, PRESETS
 from backend.inference.parallel_config import ParallelConfig
-from backend.inference.parallel_sweep import class_cards, frontier_layouts, sweep_caps
+from backend.inference.parallel_sweep import (DEFAULT_SWEEP_GPUS, class_cards,
+                                             frontier_layouts, sweep_caps)
 from backend.inference.defaults import GPU_MEMORY_FRACTION_DEFAULT
 from backend.inference.sweep_grid import FRONTIER_MAX_GPUS, GALLERY_SEQ_LENS
 from tests.snapshots import resolve_snapshot
@@ -28,7 +29,7 @@ def _same(got, want, path="priced"):
         return
     if isinstance(got, list):
         assert len(got) == len(want), path
-        for i, (one, other) in enumerate(zip(got, want)):
+        for i, (one, other) in enumerate(zip(got, want, strict=True)):
             _same(one, other, f"{path}[{i}]")
         return
     if isinstance(got, (int, float)) and not isinstance(got, bool):
@@ -42,7 +43,9 @@ def test_each_card_prices_the_layouts_its_own_frontier_enumerates(gpu):
     resolved = resolve_snapshot("Qwen/Qwen3-30B-A3B")
     plan = f._walk_plan(resolved, f.FrontierView(gpu))
     caps = sweep_caps({}, resolved=resolved)
-    assert plan["cards"] == class_cards(gpu) and gpu in plan["cards"]
+    # The kept bundle carries every card of the class the Scaling series
+    # (every card of the sheet) prices, not only the Gallery's.
+    assert plan["cards"] == class_cards(gpu, DEFAULT_SWEEP_GPUS) and gpu in plan["cards"]
     for sku in plan["cards"]:
         own = [cfg.to_dict() for cfg in frontier_layouts(caps, sku)]
         assert plan["galleryLayoutsByCard"][sku] == own
@@ -60,7 +63,8 @@ def test_each_card_prices_the_layouts_its_own_frontier_enumerates(gpu):
 def test_a_view_at_another_hbm_fraction_walks_its_own_card_alone():
     view = f.FrontierView("H100-SXM", 0.8)
     assert not view.keeps_walk() and view.walk_cards() == ["H100-SXM"]
-    assert f.FrontierView("H100-SXM").walk_cards() == class_cards("H100-SXM")
+    assert f.FrontierView("H100-SXM").walk_cards() == class_cards(
+        "H100-SXM", DEFAULT_SWEEP_GPUS)
 
 
 def test_a_dtype_the_class_has_no_peak_for_is_refused_in_the_record():

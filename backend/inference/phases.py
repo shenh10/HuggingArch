@@ -59,6 +59,25 @@ from .step_eval import evaluate_step
 from backend.measure.auto_sweep import MeasuredTrack
 
 
+#: The times a step publishes only when it HAS one. A phase that was walked
+#: but whose step time is withheld (`time_unpublished_reason`: a deployment
+#: that admits no batch at this seq) publishes EVERY one of these as `None`,
+#: never some of them — each is read as a latency or as the denominator of a
+#: rate, so a partial set is a wrong number, not a partial answer. Declared
+#: once because two producers state it: `estimate_phase`'s no-capacity
+#: branch below, and `batch_sweep.phase_at` when it re-prices such a step at
+#: another batch or card.
+WITHHELD_TIMES: Tuple[str, ...] = (
+    "t_compute_s", "t_memory_s", "t_comm_s", "t_sol_s",
+    "t_sol_by_bound", "t_sol_by_bound_share", "t_measured_s",
+)
+#: What survives in `pipeline_time` when the times go: the step's STRUCTURE —
+#: which stage this rank is, how many there are, and every stage's row laws —
+#: so a card that does admit a batch can price the same stages. The sums
+#: (`t_sol`, `t_compute`, `per_stage`, …) go with the times.
+WITHHELD_PIPELINE: Tuple[str, ...] = ("stages", "stage", "stage_laws")
+
+
 @dataclass
 class PhaseMetrics:
     phase: str
@@ -875,7 +894,7 @@ def estimate_phase(
         # would be the time of a run this deployment does not have.
         if pipeline_time is not None:
             pipeline_time = {key: value for key, value in pipeline_time.items()
-                             if key in ("stages", "stage", "stage_laws")}
+                             if key in WITHHELD_PIPELINE}
         t_compute = t_memory = t_comm = t_sol = t_measured = None
         t_sol_by_bound = None
     elif stage is not None and pipeline_time is not None:
@@ -1029,7 +1048,7 @@ def estimate_phases(
 
 def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
                      num_gpus: int) -> Dict[str, Any]:
-    """The three throughputs a phase dict supports, named, from its own
+    """The four throughputs a phase dict supports, named, from its own
     fields — so no page divides tokens by time itself.
 
     `t_sol_s` is one model-parallel replica group's step time and
@@ -1037,8 +1056,12 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
     so tokens over time is PER GROUP. Independent groups (dp_attention ×
     dp_replicas, the `unique_tokens_multiplier`) run in parallel, so the
     CLUSTER total multiplies by that count, and PER GPU divides the cluster
-    total by the GPU count. Each is computed for the theoretical step time
-    and, where a measured step time exists, for that too.
+    total by the GPU count. The fourth, `per_request`, is the rate ONE
+    request sees: the step's tokens that belong to one request over the
+    step time — decode's 1/TPOT and prefill's prompt tokens over TTFT are
+    the same quotient, named once here. Each is computed for the
+    theoretical step time and, where a measured step time exists, for that
+    too.
     """
     # A phase that never ran (OOM, infeasible) has no step time and so no
     # rate; one that ran states its tokens and how they were counted.
@@ -1052,13 +1075,18 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
     groups = max(1, int(unique_tokens_multiplier or 1))
     gpus = max(1, int(num_gpus or 1))
 
-    # A decode request's own tokens per step: 1, or 1 + α·K under
-    # speculative decoding, where one step verifies the drafts and keeps
-    # what is accepted. Its time per output token is the step over that.
+    # The tokens ONE request contributes to the step: its uncached prompt in
+    # prefill, 1 in decode — 1 + α·K when the step verifies K drafts and
+    # keeps what is accepted. Over the step time it is the rate one request
+    # sees (`per_request` below): decode's 1/TPOT and prefill's prompt
+    # tokens over TTFT are the same quotient of the same two fields, so no
+    # consumer divides tokens by a time itself.
     batch = phase.get("batch") or 0
-    per_request = (tokens / batch
-                   if phase.get("phase") == "decode" and tokens and batch
-                   else None)
+    per_request_tokens = tokens / batch if tokens and batch else None
+    # Decode's own name for the reciprocal; `output_tokens_per_request_step`
+    # and `concurrent_requests` are decode's vocabulary too.
+    decoding = phase.get("phase") == "decode"
+    per_request = per_request_tokens if decoding else None
 
     def rates(t: Optional[float]) -> Optional[Dict[str, Any]]:
         if t is None or t <= 0 or not tokens or tokens <= 0:
@@ -1069,6 +1097,9 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
             # (`t / (1 + α·K)`) — the step itself under plain decode.
             **({"time_per_output_token_s": t / per_request}
                if per_request else {}),
+            # Every phase: the tokens/s ONE request sees.
+            **({"per_request": per_request_tokens / t}
+               if per_request_tokens else {}),
             "per_group": per_group,
             "cluster": per_group * groups,
             "per_gpu": per_group * groups / gpus,
@@ -1087,6 +1118,10 @@ def phase_throughput(phase: Dict[str, Any], *, unique_tokens_multiplier: int,
 
     return {
         "tokens_per_step": tokens,
+        # The step's tokens that belong to one request, whatever the phase:
+        # the numerator of `per_request` above.
+        **({"tokens_per_request_step": per_request_tokens}
+           if per_request_tokens else {}),
         # Decode: the tokens one request outputs per step (1 + α·K), and
         # the requests the cluster decodes at once (B per group × groups).
         **({"output_tokens_per_request_step": per_request,
@@ -1302,9 +1337,9 @@ def compute_per_op_timing(
     #: The nodes of a MoE block on this program (`Program.dispatch_members`,
     #: fused kernels included where what they absorbed was).
     moe_block_members: FrozenSet[int] = frozenset(),
-    #: Each leaf on a MoE dispatch's routed buffer, with that dispatch's
-    #: boundary on the rank, at this point (`ServingLayers.routed` read
-    #: there; `access.routed_launches`).
+    #: Each leaf on a MoE dispatch's routed buffer, with the launch it runs
+    #: on the rank — the routed rows that leaf is handed — at this point
+    #: (`ServingLayers.routed` read there; `access.routed_launches`).
     routed: Any = None,
     #: The matrices a kernel multiplies, partition by partition, beside one
     #: rank's extents of them (`Analysis.weight_shards`, asked of the row's
@@ -1610,6 +1645,13 @@ def compute_per_op_timing(
             comm_world = int(m.get("comm_world", 1) or 1)
             comm_op = str(m.get("op") or node.op or "") if is_comm else ""
             comm_base_stride = int(m.get("comm_base_stride", 1) or 1) if is_comm else 1
+            # A routed MoE exchange's top-k fan-out, as the walk published
+            # it (`materialize_comm._comm_layers`): what prices its dedup
+            # on this card and on any other one this row is re-read on
+            # (`comm_cost.CollectiveSignature`). None for every collective
+            # that is not a routed exchange.
+            comm_route_fanout = (m.get("comm_route_fanout") or None
+                                 if is_comm else None)
             # The framework's dispatch of this collective
             # (`ServingLayers.collectives`): the rungs it is priced over.
             comm_rungs = ([r.as_dict() for r in laws.collectives.get(comm_op, ())]
@@ -1633,7 +1675,9 @@ def compute_per_op_timing(
                 demand=asked_law,
                 weight_total=weight_total_pr, metadata_total=meta_total_pr,
                 comm_payload=comm_payload_one,
-                comm_factor=comm_factor(comm_op, comm_world) if is_comm else 0.0,
+                comm_factor=(comm_factor(comm_op, comm_world,
+                                         comm_route_fanout)
+                             if is_comm else 0.0),
                 comm_priced=is_comm and comm_world > 1,
                 comm_rungs=len(comm_rungs)), laws.book))
             # This row at the walk's point: its law read there on the card
@@ -1643,6 +1687,7 @@ def compute_per_op_timing(
             facts = {"count_per_step": cnt, "act_dtype": adt_name, "is_comm": is_comm,
                      "comm_op": comm_op, "comm_world": comm_world,
                      "comm_base_stride": comm_base_stride,
+                     "comm_route_fanout": comm_route_fanout,
                      "comm_rungs": comm_rungs}
             card = RowCard(op_peak, peak_hbm_bw_bytes_per_sec, fabric,
                            launch_floor_s)
@@ -1974,6 +2019,29 @@ def compute_per_op_timing(
                 "shape_out_dims": _outputs(shape, _named_dims),
                 "shape_out_full": shape_out_full_val,
                 "shape_outs": shape_outs_val,
+                # The element dtype of each tensor the shape columns name, as
+                # the walk billed its read or write (`LeafAccess.input_dtypes`
+                # / `port_dtype`): one per `shape_in` input, one per
+                # `shape_outs` port; `output_dtype` is `shape_out`'s.
+                "input_dtypes": (
+                    None if ab is None or not shape_in_val else list(
+                        ab.input_dtypes(len(shape_in_val)
+                                        if isinstance(shape_in_val[0], list)
+                                        else 1))),
+                # The stored tensors the kernel streams that arrive on no
+                # input (its own, a tie's target), each as one rank holds it
+                # (`LeafAccess.weights`): the weight operands beside the
+                # inputs; one an edge threads in is a `shape_in` input.
+                "weights": (
+                    None if ab is None else
+                    [{"name": w.name,
+                      "shape": [as_number(v) for v in w.shape],
+                      "dtype": w.dtype}
+                     for w in ab.weights if w.input is None] or None),
+                "port_dtypes": (
+                    None if ab is None or shape_outs_val is None else
+                    [ab.port_dtype(name)
+                     for name, p in _shape_outs_src.items() if p]),
                 # The MoE dispatch boundary this launch's routed buffer is
                 # on (`eval.routed.RoutedLaunch`, its `wire`), with which of
                 # its tensors are that buffer and the bytes it moves per
@@ -2035,6 +2103,11 @@ def compute_per_op_timing(
                 "comm_op": comm_op,
                 "comm_tensor_bytes": point["comm_tensor_bytes"],
                 "comm_base_stride": comm_base_stride,
+                # A routed MoE exchange's top-k fan-out, which prices its
+                # dedup wherever the row is priced; None for every other
+                # collective (a Ulysses CP exchange is flat, and that is a
+                # fact about it rather than a missing one).
+                "comm_route_fanout": comm_route_fanout,
                 # The framework's dispatch rungs the collective is priced
                 # over, so another card reads the same ladder.
                 "comm_rungs": comm_rungs,

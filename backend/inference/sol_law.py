@@ -36,7 +36,7 @@ from .capacity import (
     without_step,
 )
 from .card import Card
-from .comm_cost import CollectiveRung, collective_ladder
+from .comm_cost import CollectiveSignature
 from .gpu_specs import peak_flops_for_dtype, peak_hbm_bw
 from .phases import Speculation, phase_binding, phase_throughput, step_tokens
 from .parallel_config import ParallelConfig
@@ -576,20 +576,18 @@ def _floorTerms(inputs: tuple[str, ...],
 
 
 def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Every collective the rows price, once, as its signature
+    (`comm_cost.CollectiveSignature.key`): what `cardBinding` prices on a
+    card the record is re-read on."""
     out: list[str] = []
     seen: set[str] = set()
     for row in rows:
-        if not row.get("is_comm") or int(row.get("comm_world") or 1) <= 1:
+        sig = CollectiveSignature.of(row)
+        if sig is None:
             continue
-        signature = json.dumps({
-            "op": row["comm_op"], "world": int(row["comm_world"]),
-            "count": int(row["count_per_step"]),
-            "stride": int(row["comm_base_stride"]),
-            "rungs": [dict(rung) for rung in row.get("comm_rungs") or ()],
-        }, sort_keys=True)
-        if signature not in seen:
-            seen.add(signature)
-            out.append(signature)
+        if sig.key not in seen:
+            seen.add(sig.key)
+            out.append(sig.key)
     return tuple(out)
 
 
@@ -1501,15 +1499,9 @@ def cardBinding(record: Mapping[str, Any], card: Card, *,
                     peak_flops_for_dtype(gpu, dtype) or math.inf)
 
     def collectiveValues(signature: str) -> None:
-        facts = json.loads(signature)
-        rungs = tuple(CollectiveRung.from_dict(rung)
-                      for rung in facts.get("rungs") or ())
-        ladder = collective_ladder(
-            op=facts["op"], world=int(facts["world"]),
-            count_per_step=int(facts["count"]),
-            base_stride=int(facts["stride"]), fabric=fabric, rungs=rungs)
-        base = (f"_{facts['op']}_{int(facts['world'])}_"
-                f"{int(facts['count'])}_{int(facts['stride'])}")
+        sig = CollectiveSignature.from_key(signature)
+        ladder = sig.ladder(fabric)
+        base = sig.symbol_suffix
         names = (f"COMM_S_PER_BYTE{base}", f"COMM_LATENCY_S{base}")
         values = (ladder[-1].s_per_byte, ladder[-1].latency_s)
         for symbol, value in zip(names, values, strict=True):

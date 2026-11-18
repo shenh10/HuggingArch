@@ -548,6 +548,20 @@ symbols:
       gate that also scores other lanes writes that in its own component (Inkling's
       `n_route_targets + n_shared_experts`).
     derived: "n_experts + n_zero_experts"
+  n_route_experts:
+    kind: whole
+    group: moe_routing
+    meaning: >-
+      How many of a dispatch's `n_route_targets` hold weights, as a routed
+      EXCHANGE's measurement cell states it (`routed_all_to_all`): with
+      `n_experts_active` and `n_route_targets` it is how many distinct
+      destinations a token reaches, which is how many copies of it the launch
+      sends (`comm_volume.RouteFanout`). Global and never divided — the group
+      the launch runs on is `n_comm_ranks` beside it. It is `n_experts`, the
+      same experts, under its own name because in a measurement cell that name
+      is already the experts ONE LAUNCH runs (a grouped GEMM's bank, the ones
+      the step's rows reach), which is a per-rank count and not this one.
+    derived: n_experts
   n_expert_copies:
     kind: expert_copies
     shardable_by: [moe_copies]

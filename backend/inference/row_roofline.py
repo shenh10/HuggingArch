@@ -99,7 +99,6 @@ at the point times a measured launch time) for the measured one.
 """
 from __future__ import annotations
 
-import json
 import math
 import operator
 import re
@@ -118,8 +117,9 @@ from backend.arch.eval.storage import is_expert_axis
 from backend.arch.eval.transforms import Workload
 from backend.arch.law_text import as_written, read_walk_law
 from backend.measure.auto_sweep import compile_law
-from backend.arch.layout.comm_volume import collective_per_rank_bytes
-from .comm_cost import (CollectiveRung, Fabric, Segment, collective_ladder,
+from backend.arch.layout.comm_volume import (RouteFanout,
+                                             collective_per_rank_bytes)
+from .comm_cost import (CollectiveRung, CollectiveSignature, Fabric, Segment,
                         ladder_segment, price_collective)
 from .gpu_specs import NoPeakBandwidth, NoPeakForDtype
 from .intensity import arithmetic_intensity, intensity_formula
@@ -166,9 +166,10 @@ def rung_symbols(k: int) -> Tuple[sp.Symbol, sp.Symbol, sp.Symbol]:
 
 def row_rungs(row: Mapping[str, Any]) -> Tuple[CollectiveRung, ...]:
     """The framework's dispatch rungs the row's collective is priced over
-    (`comm_cost.CollectiveRung`, carried on the row)."""
-    return tuple(CollectiveRung.from_dict(r)
-                 for r in row.get("comm_rungs") or ())
+    (`comm_cost.CollectiveRung`, carried on the row): none for a row that
+    prices no collective."""
+    sig = CollectiveSignature.of(row)
+    return () if sig is None else sig.rungs
 
 
 #: The expressions a row carries, by name (the module docstring states each).
@@ -423,24 +424,19 @@ class RowRoofline:
         }
 
     @staticmethod
-    def comm(*, op: str, world: int, tensor_bytes: float,
-             count: int, base_stride: int, fabric: Fabric,
-             rungs: Tuple[CollectiveRung, ...] = (),
+    def comm(sig: CollectiveSignature, *, tensor_bytes: float, fabric: Fabric,
              t_sym: Optional[str] = None, t_sub: Optional[str] = None
              ) -> Tuple[float, List[Dict[str, Any]]]:
-        """`(t_comm, phase rows)` of a collective whose payload is
+        """`(t_comm, phase rows)` of the collective `sig` names
+        (`comm_cost.CollectiveSignature`, off the row) whose payload is
         `tensor_bytes`, priced on `fabric` by the algorithm the framework's
-        `rungs` give that payload there (`comm_cost.collective_ladder`).
-        Zero for a group of one."""
-        if world <= 1:
-            return 0.0, []
-        seg = ladder_segment(collective_ladder(
-            op=op, world=world, count_per_step=count, base_stride=base_stride,
-            fabric=fabric, rungs=rungs), float(tensor_bytes))
+        rungs give that payload there (`comm_cost.collective_ladder`)."""
+        seg = ladder_segment(sig.ladder(fabric), float(tensor_bytes))
         return price_collective(
-            op=op, world=world, tensor_bytes=float(tensor_bytes),
-            count_per_step=count, fabric=fabric, base_stride=base_stride,
-            algorithm=seg.algorithm, t_sym=t_sym, t_sub=t_sub)
+            op=sig.op, world=sig.world, tensor_bytes=float(tensor_bytes),
+            count_per_step=sig.count, fabric=fabric, base_stride=sig.stride,
+            algorithm=seg.algorithm, fanout=sig.route_fanout,
+            t_sym=t_sym, t_sub=t_sub)
 
 
 class RowCard(NamedTuple):
@@ -465,13 +461,10 @@ class RowCard(NamedTuple):
         NCCL's past them — each with the seconds `price_collective` charges
         per payload byte and the fixed time over the step. One free range
         off a collective and for a group of one."""
-        if not row["is_comm"] or int(row["comm_world"]) <= 1:
+        sig = CollectiveSignature.of(row)
+        if sig is None:
             return (Segment("", math.inf, 0.0, 0.0),)
-        return collective_ladder(
-            op=row["comm_op"], world=int(row["comm_world"]),
-            count_per_step=int(row["count_per_step"]),
-            base_stride=int(row["comm_base_stride"]), fabric=self.fabric,
-            rungs=row_rungs(row))
+        return sig.ladder(self.fabric)
 
     def comm_values(self, row: Mapping[str, Any]) -> Tuple[float, ...]:
         """The card's values of the row law's collective symbols, in the
@@ -588,11 +581,19 @@ def _exact_number(value: Any) -> Any:
     return sp.Integer(value) if isinstance(value, int) else sp.Float(value)
 
 
-def comm_factor(op: str, world: int) -> float:
+def comm_factor(op: str, world: int,
+                route_fanout: Optional[Mapping[str, Any]] = None) -> float:
     """Per-rank interconnect bytes per payload byte of one instance of a
     collective (`collective_per_rank_bytes` is linear in the payload); 0
-    for a group of one."""
-    return collective_per_rank_bytes(op, world, 1.0)
+    for a group of one.
+
+    `route_fanout` is a routed exchange's top-k fan-out as the row carries
+    it (`RouteFanout.as_dict`): the rank-level dedup is part of the bytes
+    the layer itself publishes, so the logical column and the card's price
+    of a single-node exchange are one number."""
+    return collective_per_rank_bytes(
+        op, world, 1.0,
+        RouteFanout.from_dict(route_fanout) if route_fanout else None)
 
 
 def law_columns(exprs: Mapping[str, sp.Expr], book: "LawBook"
@@ -798,6 +799,9 @@ def row_law(row: Mapping[str, Any]) -> Dict[str, Any]:
         "comm_world": row["comm_world"],
         "count_per_step": row["count_per_step"],
         "comm_base_stride": row["comm_base_stride"],
+        # A routed exchange's dedup travels with the row: a re-read on
+        # another card re-levels the same fan-out there.
+        "comm_route_fanout": row.get("comm_route_fanout"),
         "comm_rungs": row.get("comm_rungs") or [],
         "peak_flops_per_sec_for_op": row.get("peak_flops_per_sec_for_op"),
         "act_dtype": row.get("act_dtype"),
@@ -992,6 +996,7 @@ COLUMNS: Tuple[Column, ...] = (
         "peak_flops_per_sec_for_op", "act_dtype", "moe_block_member",
         "active_ratio_per_token", "derived_group", "count_per_step",
         "parent_aggregation_id", "comm_op", "comm_base_stride",
+        "comm_route_fanout",
         "comm_collective_in_shape", "comm_collective_out_shape",
         "comm_payload_shape", "comm_payload_role",
         "comm_payload_dtype_bytes", "comm_payload_scale", "point_law",
@@ -1066,12 +1071,11 @@ def point_columns(at: RowAt, row: Mapping[str, Any], card: RowCard, *,
     cnt = int(row["count_per_step"])
     is_comm = bool(row["is_comm"])
     world = int(row["comm_world"] or 0)
+    sig = CollectiveSignature.of(row)
     phases: List[Dict[str, Any]] = []
-    if is_comm and world > 1:
+    if sig is not None:
         phases = RowRoofline.comm(
-            op=row["comm_op"], world=world, tensor_bytes=at.comm_bytes,
-            count=cnt, base_stride=int(row["comm_base_stride"]),
-            fabric=card.fabric, rungs=row_rungs(row),
+            sig, tensor_bytes=at.comm_bytes, fabric=card.fabric,
             t_sym=t_sym, t_sub=t_sub)[1]
     bw, label = 0.0, ""
     if phases:
@@ -1146,22 +1150,21 @@ def collective_symbol(row: Mapping[str, Any],
                       rate: sp.Symbol = COMM_S_PER_BYTE) -> sp.Symbol:
     """One of the row law's collective symbols (`comm_names`: a rate, a
     fixed time or a range's bound), as a step's law names it: one symbol per
-    (op, group size, instances, node stride) — everything
-    `RowCard.comm_ladder` prices besides the fabric and the framework's
-    rungs, which one step's rows share."""
-    if not row["is_comm"] or int(row["comm_world"]) <= 1:
+    signature (`comm_cost.CollectiveSignature.symbol_suffix`) — everything
+    `RowCard.comm_ladder` prices besides the fabric, which one step's rows
+    share."""
+    sig = CollectiveSignature.of(row)
+    if sig is None:
         return rate
     base, _r, k = rate.name.rpartition("_r")
     stem, suffix = (base, f"_r{k}") if _r and k.isdigit() else (rate.name, "")
-    return law_symbol(
-        f"{stem}_{row['comm_op']}_{int(row['comm_world'])}_"
-        f"{int(row['count_per_step'])}_{int(row['comm_base_stride'])}{suffix}")
+    return law_symbol(f"{stem}{sig.symbol_suffix}{suffix}")
 
 
 def _row_comm_names(row: Mapping[str, Any]) -> Tuple[sp.Symbol, ...]:
-    """The collective symbols the row's law reads (`comm_names`)."""
-    priced = row["is_comm"] and int(row["comm_world"]) > 1
-    return comm_names(len(row_rungs(row)) if priced else 0)
+    """The collective symbols the row's law reads (`comm_names`): none for a
+    row that prices no collective, which `row_rungs` already says."""
+    return comm_names(len(row_rungs(row)))
 
 
 def lifted_law(row: Mapping[str, Any], name: str) -> sp.Expr:
@@ -1450,13 +1453,9 @@ class CardForm:
                 dtype_idx[dtype] = len(dtypes)
                 dtypes.append(dtype)
             si = -1
-            if row["is_comm"] and int(row["comm_world"]) > 1:
-                sig = json.dumps({
-                    "op": row["comm_op"], "world": int(row["comm_world"]),
-                    "count": int(row["count_per_step"]),
-                    "stride": int(row["comm_base_stride"]),
-                    "rungs": [dict(r) for r in row.get("comm_rungs") or ()],
-                }, sort_keys=True)
+            signature = CollectiveSignature.of(row)
+            if signature is not None:
+                sig = signature.key
                 if sig not in sig_idx:
                     sig_idx[sig] = len(sigs)
                     sigs.append(sig)
@@ -1530,12 +1529,8 @@ def _sig_ladder(sig: str, fabric: Fabric) -> Tuple[Segment, ...]:
     built at a unit step latency, so a segment's `latency_s` is the hops
     coefficient one link traversal multiplies. One per (signature, card):
     every point of a walk shares its collectives' signatures."""
-    d = json.loads(sig)
-    return collective_ladder(
-        op=d["op"], world=int(d["world"]), count_per_step=int(d["count"]),
-        base_stride=int(d["stride"]),
-        fabric=fabric._replace(step_latency=1.0),
-        rungs=tuple(CollectiveRung.from_dict(r) for r in d.get("rungs") or ()))
+    return CollectiveSignature.from_key(sig).ladder(
+        fabric._replace(step_latency=1.0))
 
 
 @dataclass(frozen=True)

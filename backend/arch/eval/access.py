@@ -78,6 +78,11 @@ class LeafAccess:
     #: grouped by the weight they are packed into (`weight_packs`) — what
     #: `Analysis.weight_shards` describes partition by partition.
     weight_packs: Tuple[Tuple[int, ...], ...] = ()
+    #: Every stored tensor the leaf's kernel streams, one rank's shape of it
+    #: and its resident dtype, and the input it arrives on where a dataflow
+    #: edge threads it in (`StreamedWeight`): the weight operands, which the
+    #: activation terms do not name — a weight is billed as a weight read.
+    weights: Tuple["StreamedWeight", ...] = ()
     #: The quantised activation format (`ActivationFormat`) this leaf writes
     #: its primary output in (`Traffic.written_formats[""]`) — a grafted
     #: cast's; the absorbed-quantise branch that would state a fused
@@ -200,6 +205,25 @@ class LeafAccess:
         if self.output_cached is None:
             return None
         return self.output_cached.format_name
+
+    def input_dtypes(self, arity: int) -> Tuple[Optional[str], ...]:
+        """Each input's element dtype by its `Shape.ins` position, as its
+        read was billed (`in_terms_per_rank`) — or, for a stored tensor an
+        edge threads in, its resident dtype (`weights`); None for an input
+        nothing prices (a view moves nothing)."""
+        read: Dict[int, Optional[str]] = {
+            weight.input: weight.dtype for weight in self.weights
+            if weight.input is not None}
+        for term in self.in_terms_per_rank:
+            read.setdefault(term.index, term.dtype)
+        return tuple(read.get(i) for i in range(arity))
+
+    def port_dtype(self, port: str) -> Optional[str]:
+        """The element dtype written on `port` ("" the primary output), as
+        the write was billed (`out_terms_per_rank`); None where nothing is
+        written there."""
+        return next((term.dtype for term in self.out_terms_per_rank
+                     if term.port == port), None)
 
     @memo_property
     def _text(self) -> Dict[str, Any]:
@@ -452,6 +476,8 @@ class _TrafficRow(NamedTuple):
     #: The quantised format the leaf writes its primary output in
     #: (`Traffic.written_formats`), None when it writes none.
     output_activation_format: Optional[Any] = None
+    #: Every stored tensor the leaf streams (`StreamedWeight`).
+    weights: Tuple["StreamedWeight", ...] = ()
     #: The derivation's per-edge activation terms (`Traffic.in_edges`) and
     #: per-port write terms (`Traffic.out_terms`).
     in_edges: Tuple[Any, ...] = ()
@@ -522,10 +548,12 @@ def _routed_terms(graph: Any, node: Any, t: Any
 def routed_launches(program: Any, access: Layer["LeafAccess"],
                     launches: Mapping[int, Any]) -> Layer[Any]:
     """Each leaf of `program` that reads or writes a routed buffer
-    (`LeafAccess.routed_inputs` / `routed_output`), mapped to its dispatch's
-    boundary on the rank (`Analysis.routed`, `launches`): the one record a
-    launch's padded geometry is read off. The dispatch is the graph's
-    (`Program.dispatch_of`); a fused launch's is what it absorbed."""
+    (`LeafAccess.routed_inputs` / `routed_output`), mapped to the launch it
+    runs on the rank (`Analysis.routed`, `launches`, by leaf uid): the one
+    record a launch's padded geometry is read off. A fused launch runs what
+    its members run — they are one kernel on one buffer, so they must agree.
+    A node grafted after the walk is in `launches` only if its grafter
+    named the leaf whose tensor it carries."""
     out: Dict[int, Any] = {}
     for uid, ab in access.values.items():
         if not (ab.routed_inputs or ab.routed_output):
@@ -537,14 +565,16 @@ def routed_launches(program: Any, access: Layer["LeafAccess"],
             # collective keyed by its payload, not a grouped launch padded
             # per expert.
             continue
-        members = ([program.by_uid(origin) for origin in node.origins]
-                   if isinstance(node, FusedNode) else [node])
-        found = {program.dispatch_of(member) for member in members} - {None}
-        if len(found) != 1 or next(iter(found)) not in launches:
+        members = (node.origins if isinstance(node, FusedNode)
+                   else (node.uid,))
+        found = [launches[member] for member in members
+                 if member in launches]
+        if not found or any(other != found[0] for other in found[1:]):
             raise ValueError(
-                f"{node.display_path}: it moves a routed buffer, and "
-                f"{len(found)} dispatches the walk evaluated enclose it")
-        out[uid] = launches[found.pop()]
+                f"{node.display_path}: it moves a routed buffer, and its "
+                f"members run {len(found)} routed launches that are not "
+                f"one ({found!r})")
+        out[uid] = found[0]
     return Layer(program, out)
 
 
@@ -630,6 +660,7 @@ def _leaf_traffic_rows(analysis: Any, *,
     # bytes on the row came from (`traffic.streamed_sources`).
     read_aliases = graph.read_aliases or {}
     borrowed_by = traffic_mod._borrowed_sources(graph)
+    held = _held_tensors(analysis)
     out: Dict[int, _TrafficRow] = {}
     for uid, t in layer.values.items():
         node = graph.by_uid(uid)
@@ -703,8 +734,54 @@ def _leaf_traffic_rows(analysis: Any, *,
             **dict(zip(("routed_inputs", "routed_output", "routed_extent"),
                        _routed_terms(graph, node, t), strict=True)),
             weight_packs=weight_packs(graph, node, own_srcs, borrowed_srcs),
+            weights=streamed_weights(node, own_srcs, borrowed_srcs, held),
         )
     return out
+
+
+class StreamedWeight(NamedTuple):
+    """One stored tensor a leaf's kernel streams: its name, the shape one
+    rank holds of it, its resident dtype (the widest of its layer segments,
+    as `widest_format` describes a leaf), and the input it arrives on —
+    None for a tensor the leaf owns (or reads through a tie)."""
+    name: str
+    shape: Tuple[Any, ...]
+    dtype: Optional[str]
+    input: Optional[int] = None
+
+
+def _held_tensors(analysis: Any) -> Dict[int, Dict[int, list]]:
+    """`Analysis.local_tensors()` by node and tensor index: each stored
+    tensor's layer segments as this rank holds them."""
+    held: Dict[int, Dict[int, list]] = {}
+    for row in analysis.local_tensors():
+        held.setdefault(row.uid, {}).setdefault(row.tensor_index, []).append(row)
+    return held
+
+
+def streamed_weights(node: Any, own: Mapping[int, Any],
+                     borrowed: Sequence[int],
+                     held: Mapping[int, Mapping[int, list]]
+                     ) -> Tuple[StreamedWeight, ...]:
+    """The stored tensors `node` streams (`traffic.streamed_sources`: the
+    ones billed to it), each as `StreamedWeight`. A borrowed tensor names
+    the input edge that threads it in — the edge `_borrowed_sources` found
+    it on, by its position in the node's inputs."""
+    arrives = {ref.src.uid: index
+               for index, ref in enumerate(node.inputs_obj or ())
+               if ref.src is not None and is_identity_source(ref.src.op)}
+    out = []
+    for source in (*own, *(b for b in borrowed if b not in own)):
+        for segments in held.get(source, {}).values():
+            widest = traffic_mod.widest_format(
+                tuple(row.rep for row in segments if row.rep is not None))
+            tensor = segments[0].tensor
+            out.append(StreamedWeight(
+                name=tensor.logical_name,
+                shape=tuple(tensor.shape),
+                dtype=widest.logical_dtype if widest is not None else None,
+                input=None if source in own else arrives.get(source)))
+    return tuple(out)
 
 
 class ReadTerm(NamedTuple):
@@ -715,13 +792,15 @@ class ReadTerm(NamedTuple):
     the span over they are the elements the edge read instead.
 
     `headless_store` says the fan-out expanded a tensor stored with no head
-    axis at all, which its ratio no longer says at one head per rank."""
+    axis at all, which its ratio no longer says at one head per rank.
+    `dtype` is the element dtype `width` is the bytes of."""
     index: int
     fanout: Any
     width: Any
     elements: Any
     spanned: Any
     headless_store: bool = False
+    dtype: Optional[str] = None
 
 
 def _in_terms(row: _TrafficRow) -> Tuple[ReadTerm, ...]:
@@ -729,7 +808,7 @@ def _in_terms(row: _TrafficRow) -> Tuple[ReadTerm, ...]:
     records."""
     return tuple(ReadTerm(int(edge.index), value_of(edge.fanout),
                           value_of(edge.width), value_of(edge.elements),
-                          edge.spanned, edge.headless_store)
+                          edge.spanned, edge.headless_store, edge.dtype)
                  for edge in row.in_edges)
 
 
@@ -738,18 +817,20 @@ class WriteTerm(NamedTuple):
     (`traffic._PortWrite`): the port it lands on ("" the main output), the
     elements written, the width, and whether those elements are still the
     whole of what that port publishes — at a fused boundary that rewrote
-    only a region of its output they are the region."""
+    only a region of its output they are the region. `dtype` is the element
+    dtype written."""
     port: str
     elements: Any
     width: Any
     spanned: Any
+    dtype: Optional[str] = None
 
 
 def _out_terms(row: _TrafficRow) -> Tuple[WriteTerm, ...]:
     """The row's activation-write terms, off the derivation's own port
     records."""
     return tuple(WriteTerm(term.port, value_of(term.elements),
-                           value_of(term.width), term.spanned)
+                           value_of(term.width), term.spanned, term.dtype)
                  for term in row.out_terms)
 
 
@@ -807,6 +888,7 @@ def _access_row(row: _TrafficRow, rank: Optional[_TrafficRow], *,
         weight_dtype=row.weight_dtype, scale_dtype=row.scale_dtype,
         weight_granularity=row.weight_granularity,
         weight_packs=row.weight_packs,
+        weights=row.weights,
         output_activation_format=row.output_activation_format,
         act_dtype_chosen=row.act_dtype_chosen, edge_dtype=row.edge_dtype,
         activation_granularity=row.activation_granularity,

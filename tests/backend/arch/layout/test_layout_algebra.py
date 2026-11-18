@@ -489,9 +489,15 @@ class TestValueAndJoin(unittest.TestCase):
 
 class TestExpectedRoutedLoad(unittest.TestCase):
     def _wl(self, **kw):
+        # The fan-out places the bank's own experts (one bank, one count),
+        # so it follows `num_experts` unless a case states its own.
+        experts = max(int(kw.get("num_experts", 64)), 1)
         args = dict(group=TP8, expert_shard_axis=layout.sharded(TP8),
                     routed_rows_in_cell=Fraction(4096), num_experts=64,
-                    load_assumption_id="balanced")
+                    load_assumption_id="balanced",
+                    fanout=layout.RouteFanout(picks=min(8, experts),
+                                              targets=experts,
+                                              placed=experts))
         args.update(kw)
         return layout.ExpectedRoutedLoad(**args)
 
@@ -518,6 +524,11 @@ class TestExpectedRoutedLoad(unittest.TestCase):
             self._wl(expert_load_factor=Fraction(1, 2))     # below the mean
         with self.assertRaises(ValueError):
             self._wl(expert_load_factor=65)                 # > all the rows
+        with self.assertRaises(ValueError):
+            # The fan-out places another bank's experts: one bank, one count.
+            self._wl(fanout=layout.RouteFanout(picks=8, targets=32, placed=32))
+        with self.assertRaises(ValueError):
+            self._wl(fanout=None)                           # required
 
     def test_busiest_rank_dilutes_the_hot_expert_over_its_rank(self):
         """rho is per expert; a rank of k experts holding the hot one carries

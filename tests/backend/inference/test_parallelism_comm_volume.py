@@ -12,13 +12,17 @@ Layout topology is locked on the public analyze() path; here we pin
 the bytes the pipeline actually reports.
 
 Ring-AR per-rank traffic: all_reduce = 2(N-1)/N·T, every other collective
-(all_gather / reduce_scatter / all_to_all) = (N-1)/N·T.
+(all_gather / reduce_scatter / all_to_all) = (N-1)/N·T — except a ROUTED
+MoE exchange, which sends a token once per distinct destination its top-k
+picks land on and so takes its own fan-out's coefficient (the row's
+`comm_route_fanout`, `comm_volume.RouteFanout`).
 """
 import math
 from fractions import Fraction
 import os
 import sys
 import unittest
+from typing import Mapping
 
 import pytest
 
@@ -84,9 +88,36 @@ def _routed_dt(row) -> float:
     return 1 + 4 * math.ceil(inner / 128) / inner
 
 
-def _expect(op: str, world: int, shape, dt: float = _ACT_DT) -> float:
-    """Closed-form per-rank bytes for one collective over `shape`·dt."""
+def _dedup_coefficient(world: int, fanout: Mapping[str, int]) -> Fraction:
+    """A routed exchange's coefficient, written here from the counts.
+
+    Deliberately NOT `comm_volume.ring_factor(op, world, fanout)`: that is
+    the implementation, and a test that calls it checks that the row read
+    the right function, not that the function is right. So the expectation
+    is spelled out — the share whose destination is not this rank, times
+    the distinct destination ranks a token's `k` picks reach out of `D`
+    (one minus the hypergeometric chance of missing a rank's `E/D`
+    targets), over the copies of the token the payload holds.
+    """
+    d, k = int(world), int(fanout["picks"])
+    targets, placed = int(fanout["targets"]), int(fanout["placed"])
+    per_rank = placed // d
+    reached = d * (1 - Fraction(math.comb(targets - per_rank, k),
+                                math.comb(targets, k)))
+    return (Fraction(d - 1, d) * reached
+            / Fraction(k * placed, targets))
+
+
+def _expect(op: str, world: int, shape, dt: float = _ACT_DT,
+            fanout=None) -> float:
+    """Closed-form per-rank bytes for one collective over `shape`·dt.
+
+    `fanout` is the row's own `comm_route_fanout` where it has one: a routed
+    MoE exchange sends a token once per distinct destination RANK, so its
+    coefficient is `_dedup_coefficient` and not the flat `(N-1)/N`."""
     t = math.prod(int(d) for d in shape) * dt
+    if fanout:
+        return float(_dedup_coefficient(world, fanout)) * t
     return collective_per_rank_bytes(op, world, t)
 
 
@@ -146,7 +177,8 @@ class _VolumeBase(unittest.TestCase):
         shape = row.get("comm_payload_shape") or row.get("shape_out")
         self.assertTrue(shape, f"comm row missing shape_out: {row}")
         layers = int(row.get("count_per_step", 1) or 1)
-        want = _expect(op, world, shape, dt) * layers
+        want = _expect(op, world, shape, dt,
+                       row.get("comm_route_fanout")) * layers
         got = float(row["comm_bytes_per_rank"])
         self.assertAlmostEqual(
             got, want, delta=max(1.0, want * 1e-6),
@@ -468,6 +500,7 @@ class TestCommVolumeInvariantSweep(_VolumeBase):
                         r["op"], int(r["comm_world"]),
                         r.get("comm_payload_shape") or r["shape_out"],
                         dt=float(r.get("comm_payload_dtype_bytes") or _ACT_DT),
+                        fanout=r.get("comm_route_fanout"),
                     ) * layers
                     got = float(r["comm_bytes_per_rank"])
                     if math.isclose(got, want, rel_tol=1e-6):

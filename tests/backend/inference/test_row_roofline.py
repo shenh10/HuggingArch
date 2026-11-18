@@ -173,7 +173,7 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
     row — the same `price_collective` and the same `act_dtype` lookup."""
 
     def test_stamped_rows_equal_a_direct_estimate(self):
-        from backend.inference.parallel_sweep import _estimate_layout
+        from tests.sweep_parity import layout_at
         from backend.inference.capacity import estimate_capacity
         config = _config("Qwen__Qwen3-8B")
         parallel = ParallelConfig(tp_attention=2, tp_dense_ffn=2)
@@ -184,7 +184,7 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
                       parallel=parallel, num_gpus=2,
                       avg_input_tokens=1024, avg_output_tokens=128,
                       prefill_batch_size=1, decode_batch_size=8)
-        stamped = _estimate_layout({**common, "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
+        stamped = layout_at({**common, "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
         direct = estimate_capacity(gpu_sku="A100-80G-SXM", **common)
         for key in ("per_op_timing", "per_op_timing_decode"):
             got = {r["aggregation_id"]: r for r in stamped["A100-80G-SXM"]["sol"][key]}
@@ -204,6 +204,73 @@ class TestTheSecondCardIsPricedByTheSameLoop(unittest.TestCase):
                     # per-phase rows are the Inference estimate's alone.
                     self.assertNotIn("comm_phases", g, agg)
             self.assertGreater(comm_rows, 0, f"{key}: TP=2 has collectives to re-price")
+
+
+    def test_a_routed_exchange_is_re_levelled_on_the_second_card(self):
+        """The routed exchange is priced per placement level, and the levels
+        are the CARD's: one node of eight on an SXM board, two nodes of four
+        on PCIe cards. So a re-stamped row must be re-levelled there and not
+        carry the source card's levels — the 2026-10-31 judgement, on the
+        one collective whose bytes are not a function of its group's size.
+
+        A direct estimate on the second card is the comparison, as above; the
+        exchange's own level split is asserted apart, because the two cards
+        agreeing on a number they both read from the first card's levels
+        would pass the equality alone — and so is the conservation, because
+        two cards agreeing on a total that is missing a term would pass it
+        too.
+        """
+        from tests.sweep_parity import layout_at
+        from backend.inference.capacity import estimate_capacity
+        from backend.inference.comm_cost import (CollectiveSignature,
+                                                 placement_levels)
+        from backend.inference.row_roofline import RowRoofline
+        stem = "Qwen__Qwen3-30B-A3B"
+        common = dict(config=_config(stem), resolved=_resolved(stem),
+                      parallel=ParallelConfig(ep_moe=8, dp_attention=8),
+                      num_gpus=8, avg_input_tokens=1024, avg_output_tokens=128,
+                      prefill_batch_size=1, decode_batch_size=8)
+        stamped = layout_at(
+            {**common, "gpu_skus": ["H100-SXM", "H100-PCIe"]})
+        direct = estimate_capacity(gpu_sku="H100-PCIe", **common)
+        exchanges = 0
+        for key in ("per_op_timing", "per_op_timing_decode"):
+            got = {r["aggregation_id"]: r
+                   for r in stamped["H100-PCIe"]["sol"][key]}
+            for row in direct[key]:
+                sig = CollectiveSignature.of(row)
+                if sig is None or sig.route_fanout is None:
+                    continue
+                exchanges += 1
+                agg = row["aggregation_id"]
+                self.assertEqual(got[agg]["comm_route_fanout"],
+                                 row["comm_route_fanout"], agg)
+                self.assertAlmostEqual(
+                    got[agg]["t_comm_s"], row["t_comm_s"],
+                    delta=1e-12 * row["t_comm_s"], msg=agg)
+                # The PCIe card's nodes hold four GPUs, so this group of
+                # eight exchanges at BOTH levels; on the walked card it
+                # exchanges at one.
+                self.assertEqual(
+                    [level.fabric for level
+                     in placement_levels(sig.world, 4, sig.stride)],
+                    ["intra", "inter"], agg)
+                self.assertEqual(
+                    [level.fabric for level
+                     in placement_levels(sig.world, 8, sig.stride)],
+                    ["intra"], agg)
+                # Both levels together are the exchange's own bytes — the
+                # number the row publishes — so a level charged to nobody
+                # fails here and not only in a total two cards share.
+                _t, phases = RowRoofline.comm(
+                    sig, tensor_bytes=float(row["comm_tensor_bytes"]),
+                    fabric=_fabric("H100-PCIe"))
+                self.assertEqual(len(phases), 2, agg)
+                self.assertAlmostEqual(
+                    sum(ph["bytes_per_rank"] for ph in phases),
+                    float(row["comm_bytes_per_rank"]),
+                    delta=1e-6 * float(row["comm_bytes_per_rank"]), msg=agg)
+        self.assertGreater(exchanges, 0, "ep_moe=8 has a routed exchange")
 
 
 _PP_TIMES = ("t_compute_s", "t_memory_s", "t_comm_s", "t_sol_s")
@@ -278,13 +345,13 @@ class TestAPipelineStepReadElsewhere(unittest.TestCase):
 
     def test_another_card_is_an_estimate_on_that_card(self):
         """The sweep's points: one walk, every card re-priced from it."""
-        from backend.inference.parallel_sweep import _estimate_layout
+        from tests.sweep_parity import layout_at
         stem = "Qwen__Qwen3-30B-A3B"
         common = dict(config=_config(stem), resolved=_resolved(stem),
                       parallel=ParallelConfig(pp=2), num_gpus=2,
                       avg_input_tokens=2048, avg_output_tokens=256,
                       prefill_batch_size=4, decode_batch_size=16)
-        swept = _estimate_layout({**common,
+        swept = layout_at({**common,
                                   "gpu_skus": ["H100-SXM", "A100-80G-SXM"]})
         direct = _pp_estimate(stem, 4, gpu_sku="A100-80G-SXM")
         direct_decode = _pp_estimate(stem, 16, gpu_sku="A100-80G-SXM")
@@ -299,46 +366,95 @@ class TestAPipelineStepReadElsewhere(unittest.TestCase):
 
 
 class TestAWithheldStepStaysWithheld(unittest.TestCase):
-    """MiniMax-M2.7 at pp=2 holds 107 GB of weights per rank: no batch runs
-    on an H100, so it publishes no step — no batch, no time, no per-op rows,
-    no module table. The walk behind it is re-priced at another batch and
-    still has no time; re-priced onto an H200, which admits a batch, it has
-    one."""
+    """A deployment that admits no request publishes no step time. There are
+    two such deployments and they publish different things, so each asks the
+    engine what its own shape is rather than spelling the keys here.
+
+    MiniMax-M2.7 at pp=2 cannot LOAD its weights on an H100 (107.16 GiB per
+    rank against 72.00 GiB usable), so no phase is walked at all
+    (`capacity._capacity_preparation` refuses first): every phase is the
+    no-step phase (`capacity.withheld_phase` — its name, no batch, and why),
+    both in the published estimate and in the pending walk behind it, and no
+    per-op rows or module tables come with it. A step that is not there does
+    not re-price. On an H200, which holds the weights and admits a batch, it
+    has a step.
+
+    Qwen3-30B-A3B at pp=2 does hold its weights on an H100; a 2M-token
+    request leaves no KV room for even one of them. That phase IS walked, so
+    its structure stands — FLOPs, bytes, and every stage's row laws, which is
+    what another card prices from (`phases.WITHHELD_PIPELINE`) — and only its
+    times go (`phases.WITHHELD_TIMES`). Re-priced at another batch the
+    structure re-prices and the times stay withheld."""
 
     STEM = "MiniMaxAI__MiniMax-M2.7"
+    #: Weights fit, one request's KV does not: the walked phase whose times
+    #: are withheld. The length is the point — at a servable length this
+    #: deployment has a step.
+    WALKED_STEM = "Qwen__Qwen3-30B-A3B"
+    WALKED_CONTEXT = 2_000_000
     ROWS = ("per_op_timing", "per_op_timing_decode", "per_op_timing_draft")
 
-    def _common(self) -> dict:
-        return dict(config=_config(self.STEM), resolved=_resolved(self.STEM),
-                    model_id=self.STEM.replace("__", "/", 1),
-                    parallel=ParallelConfig(pp=2), num_gpus=2,
-                    avg_input_tokens=2048, avg_output_tokens=256,
-                    selection_mode="theoretical_only")
+    def _common(self, stem: str = STEM, **over) -> dict:
+        return {**dict(config=_config(stem), resolved=_resolved(stem),
+                       model_id=stem.replace("__", "/", 1),
+                       parallel=ParallelConfig(pp=2), num_gpus=2,
+                       avg_input_tokens=2048, avg_output_tokens=256,
+                       selection_mode="theoretical_only"), **over}
 
     def _no_step(self, result: dict, msg: Any) -> None:
+        """`result` publishes no step: the no-step phase as its one producer
+        writes it, and none of the step's own lists."""
+        from backend.inference.capacity import withheld_phase
         reason = result["infeasibility_reason"]
         self.assertTrue(reason, msg)
         self.assertFalse(set(self.ROWS) & set(result), msg)
         self.assertNotIn("vs_naive_delta", result, msg)
         for phase in ("prefill", "decode"):
             self.assertEqual(result["phases"][phase],
-                             {"phase": phase, "batch": None,
-                              "time_unpublished_reason": reason}, (msg, phase))
+                             withheld_phase(phase, reason), (msg, phase))
 
     def _withheld(self, phase: dict, msg: Any) -> None:
+        """`phase` was walked and publishes no time: every time the engine
+        declares withheld is absent, and `pipeline_time` carries the step's
+        structure without its sums."""
+        from backend.inference.phases import WITHHELD_PIPELINE, WITHHELD_TIMES
         self.assertTrue(phase["time_unpublished_reason"], msg)
-        for key in (*_PP_TIMES, "t_sol_by_bound", "t_measured_s"):
+        self.assertIsNotNone(phase["batch"], msg)
+        for key in WITHHELD_TIMES:
             self.assertIsNone(phase[key], (msg, key))
-        self.assertFalse({"t_sol", "t_compute", "t_memory", "t_comm",
-                          "per_stage", "t_sol_by_bound"}
-                         & set(phase["pipeline_time"]), msg)
+        self.assertLessEqual(set(phase["pipeline_time"]),
+                             set(WITHHELD_PIPELINE), msg)
+        self.assertTrue(phase["pipeline_time"]["stage_laws"], msg)
 
-    def test_the_estimate_publishes_no_step_and_its_walk_no_time(self):
-        from tests.sweep_parity import rescale_phase, response_cell
+    def test_a_deployment_that_cannot_load_its_weights_is_never_walked(self):
+        from backend.arch.eval.analysis import Point
+        from backend.inference.batch_sweep import phase_at
         from backend.inference.capacity import estimate_capacity, estimate_pending
+        from tests.sweep_parity import response_cell
         self._no_step(estimate_capacity(gpu_sku="H100-SXM", **self._common()),
                       "estimate")
+        # Not only what is PUBLISHED: the pending walk behind it is the
+        # no-step answer too, because the refusal comes before any phase walk.
         walk = estimate_pending(gpu_sku="H100-SXM", **self._common()).finish()
+        self._no_step(walk, "pending walk")
+        for phase in ("prefill", "decode"):
+            # A step that is not there does not re-price: no batch, no rows,
+            # so a sweep point moves the phase it was given, unchanged.
+            anchor = walk["phases"][phase]
+            self.assertEqual(
+                phase_at(anchor, [], Point({"B": 8}),
+                         walk["peak_flops_per_sec"],
+                         walk["peak_hbm_bw_bytes_per_sec"],
+                         _fabric("H100-SXM"), cell=response_cell(),
+                         breakdown=True), anchor, phase)
+
+    def test_a_walked_step_without_room_withholds_only_its_times(self):
+        from tests.sweep_parity import rescale_phase, response_cell
+        from backend.inference.capacity import estimate_pending
+        common = self._common(self.WALKED_STEM,
+                              avg_input_tokens=self.WALKED_CONTEXT)
+        walk = estimate_pending(gpu_sku="H100-SXM", **common).finish()
+        self.assertIn("KV budget", walk["infeasibility_reason"])
         for phase, rows in (("prefill", "per_op_timing"),
                             ("decode", "per_op_timing_decode")):
             anchor = walk["phases"][phase]
@@ -351,10 +467,13 @@ class TestAWithheldStepStaysWithheld(unittest.TestCase):
             self._withheld(again, phase)
             self.assertEqual(again["time_unpublished_reason"],
                              anchor["time_unpublished_reason"])
+            # The counts moved with the batch; only the time stayed away.
+            self.assertGreater(again["flops_per_step"],
+                               anchor["flops_per_step"], phase)
 
     def test_the_sweep_withholds_on_the_card_without_room(self):
-        from backend.inference.parallel_sweep import _estimate_layout
-        swept = _estimate_layout({**self._common(),
+        from tests.sweep_parity import layout_at
+        swept = layout_at({**self._common(),
                                   "gpu_skus": ["H100-SXM", "H200"]})
         h100, h200 = swept["H100-SXM"]["sol"], swept["H200"]["sol"]
         self.assertTrue(h100["infeasibility_reason"])

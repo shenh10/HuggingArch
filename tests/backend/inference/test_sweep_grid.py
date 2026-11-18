@@ -15,6 +15,7 @@ from backend.inference.sweep_grid import (
     ROUTINE_OUTPUT_TOKENS,
     ROUTINE_SEQ_LENS,
     SCALING_BATCH_GRID,
+    SCALING_PANEL_BATCH_GRID,
     SPEC_PRESETS,
 )
 
@@ -50,6 +51,16 @@ def test_web_sweep_grid_matches_backend():
     assert _batch_grid(ts) == SCALING_BATCH_GRID
     out = re.search(r"SWEEP_OUTPUT_TOKENS\s*=\s*(\d+)", ts)
     assert out and int(out.group(1)) == ROUTINE_OUTPUT_TOKENS
+
+
+def test_the_panels_context_batch_grid_is_the_rungs_it_draws():
+    """The Scaling panel's Context × Batch body asks one request (prefill vs
+    context) and the ceiling (KV storage), in both languages by one rule."""
+    ts = (_WEB / "compare.ts").read_text()
+    assert [bp["key"] for bp in SCALING_PANEL_BATCH_GRID] == ["b1", "max"]
+    assert re.search(r"SCALING_PANEL_BATCH_GRID[^=]*=\s*SWEEP_BATCH_GRID\.filter\(\s*"
+                     r"\(p\)\s*=>\s*p\.decode_batch_size\s*===\s*1\s*\|\|\s*"
+                     r"p\.decode_batch_size\s*===\s*null\)", ts)
 
 
 def test_serving_prefill_stays_at_one_request():
@@ -98,12 +109,13 @@ def test_react_gallery_axes_json_matches_sweep_grid():
     # The picker's GPUs are the Gallery series, and the landing GPU is one.
     assert data["gpus"] == list(GALLERY_GPUS)
     assert GALLERY_LANDING_GPU in data["gpus"]
-    # The Gallery series is the sweep series less the Kernel Bench card: the
-    # Gallery publishes serving frontiers, the Scaling panel also compares
-    # against what that card measured, so only the wider one keeps it.
+    # The Scaling series is every card the Inference page offers (the
+    # sheet); the Gallery's curated series is within it, less the Kernel
+    # Bench card the Scaling panel compares against.
+    from backend.inference.gpu_specs import load_gpu_specs
+    assert [g.sku for g in load_gpu_specs()] == DEFAULT_SWEEP_GPUS
+    assert set(GALLERY_GPUS) <= set(DEFAULT_SWEEP_GPUS)
     assert "RTX-4090" in DEFAULT_SWEEP_GPUS and "RTX-4090" not in GALLERY_GPUS
-    assert list(GALLERY_GPUS) == [g for g in DEFAULT_SWEEP_GPUS
-                                  if g != "RTX-4090"]
     # The gallery shows every model as shipped: no precision axis.
     assert "weight_dtypes" not in data
     assert "weight_dtype_options" not in data

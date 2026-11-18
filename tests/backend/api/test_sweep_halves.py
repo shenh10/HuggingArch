@@ -58,7 +58,7 @@ def _estimate_req(scope, mode="latest", **kw):
 
 def _parallel_req(scope, mode="latest", **kw):
     from backend.api._models import InferenceParallelSweepRequest
-    body = dict(model_id=MODEL, gpu_sku="", context_len=4096, modes=["tp_tp"],
+    body = dict(model_id=MODEL, gpu_sku="", contexts=[4096], modes=["tp_tp"],
                 gpu_skus=["H100-SXM", "B200"], avg_output_tokens=256, selection_mode=mode)
     return InferenceParallelSweepRequest(**{**body, **kw}).model_copy(
         update={"measurement_scope": scope})
@@ -180,8 +180,11 @@ def test_the_parallel_sweep_looks_up_once_for_every_layout_and_card(sweeps):
     with FixtureBench() as bench:
         out = asyncio.run(rt.compute_parallel_sweep_cached(_parallel_req(bench.scope)))
     assert cells["n"] > 1 and bench.lookups == 1
-    pts = [p for s in out["series"] for p in s["points"] if p["feasible"]]
-    assert pts and all(p["decode_measured_coverage"]["total"] > 0 for p in pts)
+    assert [p for s in out["series"] for p in s["points"] if p["feasible"]]
+    # The one lookup reached every card of every layout: each point of the
+    # sweep's cloud carries the prefill coverage that fold wrote.
+    priced = [p for p in out["throughput_cloud"] if "refused" not in p]
+    assert priced and all(p["prefill_coverage"]["total"] > 0 for p in priced)
 
 
 def test_every_axis_that_makes_points_is_in_the_theory_key(monkeypatch):

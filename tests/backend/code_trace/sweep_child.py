@@ -31,7 +31,7 @@ def main(model: str, modes: str, cells: str,
     env = dict(config=config, gpu_sku="B300", gpu_memory_fraction=0.9,
                num_gpus=8, avg_output_tokens=256, parallel=None,
                selection_mode="theoretical_only", model_id=model)
-    plan = ps.ParallelSweepPlan.of(modes=modes.split(","), context_len=1024,
+    plan = ps.ParallelSweepPlan.of(modes=modes.split(","), contexts=[1024],
                                    gpu_skus=gpus.split(","), base_env=env)
     p = provider()
     t0 = time.perf_counter()
@@ -48,7 +48,7 @@ def main(model: str, modes: str, cells: str,
         t0 = time.perf_counter()
         with recording() as rec:
             result = ps.run_layout_cell(cell)
-        out.append({"cell": f"{cell.mode}@{cell.x}",
+        out.append({"cell": f"{'/'.join(cell.modes)}@{cell.x}",
                     "seconds": time.perf_counter() - t0,
                     "result": json.loads(json.dumps(result, sort_keys=True,
                                                     default=str)),

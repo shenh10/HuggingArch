@@ -177,21 +177,32 @@ def test_a_pipeline_step_waits_for_every_stage(monkeypatch):
 
 
 def test_parallel_sweep_points_carry_their_coverage():
+    """A swept point says how much of its prefill step is measured, and
+    publishes no measured rate where that coverage is short — a page draws
+    the measured track only where every row of the step is, and the
+    coverage is the one fact it reads (`frontier.coverage_field`).
+
+    That fact lives on the throughput cloud, which is where every
+    throughput of the sweep lives: the chart point (`_point`) answers
+    WHETHER a deployment serves and carries no rate at all."""
+    from backend.inference.frontier import coverage_field
     from backend.inference.parallel_sweep import estimate_parallel_sweep
     with FixtureBench(_policy) as bench:
         env = Deployment(LLAMA, selection_mode="latest", measurement_scope=bench.scope).env()
-        out = estimate_parallel_sweep(mode="tp_tp", context_len=CTX, gpu_skus=["H100-SXM"],
+        out = estimate_parallel_sweep(mode="tp_tp", contexts=[CTX], gpu_skus=["H100-SXM"],
                                       base_env=env)
-    pts = out["series"][0]["points"]
+    cloud = [p for p in out["throughput_cloud"] if "refused" not in p]
+    assert cloud
+    for p in cloud:
+        cov = p[coverage_field("prefill")]
+        assert cov["measured"] < cov["total"] and cov["states"]["missing"]
+        assert p["prefill_t_measured_s"] is None
+        # Short coverage ⇒ no measured rate on the point at all.
+        assert "prefill_tok_s_per_user_measured" not in p
+        assert "prefill_tok_s_per_gpu_measured" not in p
+    pts = [p for s in out["series"] for p in s["points"]]
     assert pts
-    for p in pts:
-        if not p["feasible"]:
-            continue
-        for phase in ROWS:
-            cov = p[f"{phase}_measured_coverage"]
-            assert cov["measured"] < cov["total"] and cov["states"]["missing"]
-            assert p[f"{phase}_t_measured_s"] is None
-            assert p[f"{phase}_tps_per_gpu_measured"] is None
+    assert not [k for p in pts for k in p if k.startswith("prefill_")]
 
 
 def test_partial_total_is_each_row_measured_or_its_sol():

@@ -88,7 +88,7 @@ def test_every_surface_reads_the_same_identity(monkeypatch):
     monkeypatch.setattr(sweep_runtime, "result_version", lambda r: "rv")
     for kind, cls, extra in (("sweep", InferenceEstimateSweepRequest, {"seq_lens": [1]}),
                              ("parallel", InferenceParallelSweepRequest,
-                              {"modes": ["tp_tp"], "context_len": 8, "gpu_skus": ["H100-SXM"]})):
+                              {"modes": ["tp_tp"], "contexts": [1024], "gpu_skus": ["H100-SXM"]})):
         a = _scoped(cls, None, 10, **extra)
         # A measured answer is never cached; it joins in flight on its identity.
         assert sweep_runtime.sweep_cache_key(kind, a) is None

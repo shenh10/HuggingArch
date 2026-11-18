@@ -12,10 +12,11 @@ from backend.arch.eval.dim import Dim, exact, expr_of, require_equal, value_of
 from backend.arch.eval.transition import OutputStates
 
 from .axis_use import AXIS_USE
+from .comm_volume import RouteFanout
 from .edge import EdgeState
 from .linear import normalize_axis
 from .groups import same
-from .layout import axis_fully_replicated, product, sharded
+from .layout import axis_fully_replicated, sharded
 from .value import SUM, Partial, join_orthogonal_partials
 from .workload import ExpectedRoutedLoad
 
@@ -140,6 +141,12 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
     is not a static axis layout, so the expected load travels beside the
     state until combine (`ExpectedRoutedLoad`: the mean, and the busiest
     rank's).
+
+    The same node binding says how the dispatch FANS OUT (`RouteFanout`:
+    the picks, the destinations they are drawn from, and the ones that hold
+    weights), which is what the exchange of those rows is priced by — a
+    token crosses the fabric once per distinct destination its picks land
+    on, not once per pick.
     """
     del in_shapes
     token, routing = _pair_rank3(rule, node, states, DISPATCH_OP)
@@ -157,8 +164,7 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
         raise ValueError(
             f"{node.display_path}: routing selection axis must be whole")
 
-    preserved = rule.route_preserved_cuts(token)
-    routed_axis = rule.replicated() if not preserved else product(preserved)
+    routed_axis, preserved_cells = rule.routed_rows_layout(token)
     # Expected routed load travels on the routed rows in every deployment:
     # it is what the rows axis MEANS (a mean count per expert), with or
     # without a route family to exchange over.
@@ -175,6 +181,12 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
         # `n_expert_copies`, the bank's own count.
         experts = int(value_of(binding["n_expert_copies"]))
         mean = binding["M"]
+        # The same binding says how the dispatch fans out: how many
+        # destinations the top-k draws from, and how many it picks. Read
+        # here, where the routed rows are born, because the exchange that
+        # moves them cannot ask the router afterwards.
+        picks = int(value_of(binding["n_experts_active"]))
+        targets = int(value_of(binding["n_route_targets"]))
     except KeyError as exc:
         raise ValueError(
             f"{node.display_path}: routed workload dimension "
@@ -184,9 +196,6 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
     per_expert = (Dim(expr_of(mean), exact(mean))
                   if isinstance(mean, Dim) else exact(mean))
     global_rows = per_expert * experts
-    preserved_cells = 1
-    for cut in preserved:
-        preserved_cells *= cut.num_shards
     routed_rows = global_rows / preserved_cells
     # Without expert parallelism every rank holds every expert; the mean
     # still travels, so the rows axis is read as the average it is (a static
@@ -199,7 +208,9 @@ def permute(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
         routed_rows_in_cell=routed_rows,
         num_experts=experts,
         load_assumption_id="moe_routing_balance",
-        expert_load_factor=rule.expert_load)
+        fanout=RouteFanout(picks=picks, targets=targets, placed=experts),
+        expert_load_factor=rule.expert_load,
+        dispatched_rows=routed_axis)
     if not workload.is_measure_preserving():
         raise AssertionError(
             f"{node.display_path}: routed-load measure was not "
@@ -244,9 +255,29 @@ def combine(rule: LayoutPropagation, node: Any, states: List[Optional[EdgeState]
             f"{expert.workload.group.id!r}, which is not live")
 
     required = list(states)
+    # The inverse dispatch takes the rows back as the dispatch left them —
+    # the rows axis the dispatch published on its load evidence. Rows a
+    # layout gathered inside the zone go back to that cut — a pending sum
+    # over the gathered ranks is then a reduce_scatter, a complete value a
+    # local slice — and anything the exchange moves is a rank's own. Where
+    # nothing was gathered the rows are already that cut.
+    rows = (expert.workload.dispatched_rows
+            if expert.workload is not None else None)
+    if rows is None:
+        raise ValueError(
+            f"{node.display_path}: routed expert result carries no rows "
+            "axis from its dispatch (ExpectedRoutedLoad.dispatched_rows)")
+    if expert.layout[1] != rows:
+        expert = EdgeState(
+            (expert.layout[0], rows, expert.layout[2]), expert.value,
+            expert.workload.as_dispatched()
+            if expert.workload is not None else None,
+            expert.provenance)
+        required[0] = expert
+    inclusion = (rule.route_family is not None
+                 and rule.route_owner_inclusion(routing))
     out_value = expert.value
-    if rule.route_family is not None \
-            and rule.route_owner_inclusion(routing):
+    if inclusion:
         routed_sum = Partial(
             SUM, rule.route_family).with_provenance(node.uid)
         if out_value is None:

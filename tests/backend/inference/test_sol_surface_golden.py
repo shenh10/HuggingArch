@@ -41,6 +41,32 @@ measures the *other* side of a cross-tree comparison — into the golden's
 cells. One declaration of the columns, and the admitter measures a new
 model's cells with the same code.
 
+What a cell pins when the deployment cannot load the weights
+------------------------------------------------------------
+63 of the 126 cells are deployments that refuse: the weights alone exceed
+usable HBM on the card, so the estimate publishes no step at any batch
+(`infeasibility_reason`). Since `d2ab068b` such a card runs no phase walk
+either — there is nothing measured at one request for this file to pin, and
+the walk it used to take (which this file pinned on the grounds that every
+other card and batch was re-priced from it) is not taken, because a card
+class is re-priced from its own representative's walk and a class whose
+roomiest card refuses has no card that does not.
+
+So a refused cell pins what the budget answers without a step: the weight
+footprint module by module, the parameter count, the cache law, the
+ceilings. Its phase and per-op columns are `None` beside the reason, not
+zero — a withheld step is not a step that moved no bytes, and writing the
+zero would make a step reappearing here read as growth from nothing.
+
+Those cells are therefore not watching per-op accounting, and for 22 of the
+63 models — DeepSeek-V3 / R1 / V3.1 / V3.2 / V4-Pro, Kimi-K2 / K3, GLM-4.5
+and 5 through 5.3, Ling-2.6-1T, Qwen3.8-2.4T-A95B, Nemotron-3-Ultra,
+Step-5-Preview, Hy4-preview, both LongCats, MiMo-V2.5-Pro — neither cell
+is, because they refuse on one H100 and on eight alike. Closing that needs
+a layout this matrix does not have (a wide one that holds a 1T-parameter
+model), and adding a deployment is a case-matrix change: its own commit, so
+the diff on every other cell stays reviewable.
+
 One of the three `*_read`/`*_write` splits the report asks for is still absent,
 and absent for a reason rather than by omission: the cache a step reads arrives
 as an INPUT to the attention leaf in the post-swap tree, so a KV-read column

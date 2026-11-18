@@ -787,10 +787,19 @@ def _build_subtree(leaves: List[LeafTensor], depth: int,
 
 
 def shard_degrades(analysis: Any) -> list[str]:
-    """One warning per AXIS whose extent could not honour its degree.
+    """One warning per DEGREE whose axes could not honour it.
 
-    Per axis, and that is the whole of the change from the clamp this
-    replaces. That clamp capped `tp_attention` at `n_kv_heads` and then
+    One sentence per (degree asked for, pieces the layout settled on) —
+    the clause a reader is actually told — naming every axis that landed
+    there with its own extent. Keying the sentence on the extent as well
+    split one fact into a paragraph: a TP16 GQA card said "`n_heads` (24
+    entries) … cut into 8 pieces" and then the same sentence again for
+    `n_kv_heads` (8 entries), because the two axes differ in extent while
+    saying the same thing about the degree.
+
+    Per degree rather than per axis, and that is the whole of the change
+    from the clamp this replaces. That clamp capped `tp_attention` at
+    `n_kv_heads` and then
     applied the cap to every attention axis at once, which is a claim about
     the query projections that no framework makes: vLLM's `QKVParallelLinear`
     splits `total_num_heads` by the FULL `tp_size` and, once `tp_size` reaches
@@ -808,33 +817,34 @@ def shard_degrades(analysis: Any) -> list[str]:
     """
     from backend.arch.layout.physical import physical_axis_partition_audit
 
-    # Axes the same degree fails on the same way (MLA's `n_heads` and
-    # `n_kv_heads`, both 128) are one fact: one sentence names them all.
-    groups: dict[tuple, list[str]] = {}
+    # Axes one degree fails on the same way (MLA's `n_heads` and
+    # `n_kv_heads`; GQA's 24 heads and 8 kv heads) are one fact: one
+    # sentence names them all, each with its own extent.
+    groups: dict[tuple, list[tuple[str, int]]] = {}
     for record in physical_axis_partition_audit(analysis):
         if record.applied == record.requested:
             continue
-        key = (record.degree, record.requested, record.extent, record.applied)
-        symbols = groups.setdefault(key, [])
-        if record.symbol not in symbols:
-            symbols.append(record.symbol)
+        key = (record.degree, record.requested, record.applied)
+        axes = groups.setdefault(key, [])
+        if record.symbol not in [symbol for symbol, _ in axes]:
+            axes.append((record.symbol, record.extent))
     warnings: list[str] = []
-    for (degree, requested, extent, applied), symbols in groups.items():
+    for (degree, requested, applied), axes in groups.items():
         # Said in the deployment's words: the degree asked for, the axes it
         # cannot divide that finely, and what the GPUs hold instead.
-        many = len(symbols) > 1
+        many = len(axes) > 1
         it = "each" if many else "it"
         held = (f"every GPU keeps all of {'them' if many else 'it'}"
                 if applied == 1
                 else f"{it} is cut into {applied} pieces and the "
                      f"other GPUs hold copies of them")
-        names = " and ".join(
-            [", ".join(f"`{s}`" for s in symbols[:-1]), f"`{symbols[-1]}`"]
-            if many else [f"`{symbols[0]}`"])
-        entries = f"{extent} {'entry' if extent == 1 else 'entries'}"
+        named = [f"`{symbol}` ({extent} {'entry' if extent == 1 else 'entries'})"
+                 for symbol, extent in axes]
+        names = " and ".join([", ".join(named[:-1]), named[-1]]
+                             if many else named)
         warnings.append(
             f"{degree or 'A parallel degree'} = {requested} "
-            f"would split {names} ({entries}{' each' if many else ''}) "
+            f"would split {names} "
             f"{requested} ways, which {'they' if many else 'it'} cannot be: "
             f"{held}."
         )

@@ -132,10 +132,11 @@ def test_a_restarted_layer_hands_on_the_mlp_output(config, program):
     for layer in starts:
         block = _group(program, layer)
         (out,) = block.output_roots()
-        ffn = "mlp" if layer == 0 else "block_sparse_moe"
-        assert out.name == ffn
-        assert not [x for x in block.nodes() if x.op == "add"
-                    and x.parent is None]
+        # A segment-start block now publishes attention + MLP, not the bare
+        # MLP branch; the combine is the block's only output root.
+        assert out.name == "mlp_residual"
+        assert [x for x in block.nodes() if x.op == "add"
+                and x.parent is None] == [out]
         # The MLP combine reads the history with this layer's entry in it.
         combine = _node(block, "mlp_res")
         grown = combine.inputs_obj[1].src

@@ -16,7 +16,7 @@
 
 - [ ] New model spec: validator output below (`valid: true`); CI runs the spec gate
 - [ ] Code change: `uv run pytest tests/` passes
-- [ ] `uv run ruff check backend/` is clean (code changes)
+- [ ] `uv run ruff check .` is clean (code changes)
 - [ ] No new import of `backend/service/` from core (boundary test still passes)
 - [ ] Auth/admin changes add a **new** numbered migration (no edits to existing ones)
 - [ ] Schema / retired-field change (`backend/arch/schema/**`, `backend/arch/spec_parsing.py`): ran `PYTHONPATH=. ./.venv/bin/python tools/check_stored_specs.py` (use `--local-only` or `--db-json` when the live DB is unreachable; default is fail-closed)

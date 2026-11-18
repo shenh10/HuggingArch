@@ -164,54 +164,28 @@ def test_a_measured_zero_renders_as_zero(browser_base):  # noqa: F811
     s.assert_clean()
 
 
-def _par_point(x, meas, cov):
-    return {"x": x, "feasible": True, "prefill_tps_per_gpu": 1000, "decode_tps_per_gpu": 100,
-            "prefill_tps_per_gpu_measured": meas, "decode_tps_per_gpu_measured": meas,
-            "prefill_measured_coverage": cov, "decode_measured_coverage": cov}
-
-
 def test_scaling_draws_a_measured_point_only_at_full_coverage(browser_base):  # noqa: F811
-    """EP=2 is fully measured; EP=4 carries a mixed rate under partial
-    coverage; EP=8 a rate with no coverage at all. Only EP=2 is drawn; the
-    others' hover gives the coverage instead of a number."""
+    """2 GPUs is fully measured; 4 carries a mixed rate under partial
+    coverage; 8 a rate with no coverage at all. Only 2 is drawn; the others'
+    hover gives the coverage instead of a number. Prefill is a value on the
+    throughput cloud's points, so this is the one place a measured rate of
+    the Scaling panel is drawn."""
+    from tests.frontend.test_pages_smoke import (
+        prefill_measured_session, prefill_point, prefill_tooltip)
+
     full = {"measured": 73, "total": 73}
     part = {"measured": 40, "total": 73, "states": _STATES}
-    blob = {"moe_enabled": True, "series": [{"gpu_sku": "B200", "points": [
-        _par_point(2, 80, full), _par_point(4, 70, part), _par_point(8, 60, None)]}]}
     browser, base = browser_base
-    s = Session(browser, base, overrides={
-        "/inference/estimate-parallel-sweep": {
-            "by_mode": {m: blob for m in ("dp_ep", "cp_ep", "tp_ep", "tp_tp")}},
-    })
-    s.goto("/inference.html")
-    s.page.wait_for_selector("#infer-par-measured", timeout=15000)
-    s.page.check("#infer-par-measured")
-    s.page.wait_for_selector("#infer-scaling canvas", timeout=15000)
-    s.page.wait_for_selector("#infer-scaling [data-measured-rule]", timeout=5000)
-    s.page.wait_for_timeout(500)
-    box = s.page.query_selector_all("#infer-scaling canvas")[0].bounding_box()
-    x_of = lambda i: box["x"] + 56 + (box["width"] - 76) * i / 2
-    y = box["y"] + box["height"] / 2
-
-    def tooltip_at(i):
-        s.page.mouse.move(x_of(i), y)
-        s.page.wait_for_function(
-            """() => [...document.querySelectorAll('#infer-scaling div')]
-                 .some(d => d.style && d.style.position === 'absolute'
-                            && /EP = /.test(d.innerText))""",
-            timeout=5000)
-        return s.page.evaluate(
-            "() => [...document.querySelectorAll('#infer-scaling div')]"
-            ".filter(d => d.style && d.style.position === 'absolute' && /EP = /.test(d.innerText))"
-            ".map(d => d.innerText).join('\\n')")
-
-    at2 = tooltip_at(0)
-    assert "B200 · measured: 80 tok/s" in at2, at2
+    s = prefill_measured_session(browser, base, [
+        prefill_point(2, 80, full), prefill_point(4, 70, part),
+        prefill_point(8, 60, None)])
+    at2 = prefill_tooltip(s, 0, 3)
+    assert "· measured: 80 tok/s" in at2, at2
     assert "ops measured" not in at2, at2
-    at4 = tooltip_at(1)
-    assert "B200 · measured" not in at4, at4
+    at4 = prefill_tooltip(s, 1, 3)
+    assert "· measured:" not in at4, at4
     assert "measured: — (40 / 73 ops measured; missing 2 · unplaced 1)" in at4, at4
-    at8 = tooltip_at(2)
-    assert "B200 · measured" not in at8, at8
+    at8 = prefill_tooltip(s, 2, 3)
+    assert "· measured:" not in at8, at8
     assert "coverage not reported" in at8, at8
     s.assert_clean()

@@ -25,7 +25,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from backend.inference.capacity import estimate_capacity
+from backend.inference.capacity import estimate_capacity, withheld_phase
 
 SNAP_DIR = PROJECT_ROOT / "backend" / "arch" / "snapshots"
 
@@ -141,9 +141,8 @@ class TestNoCapacityWithholdsTime(unittest.TestCase):
             self.skipTest("this deployment now fits; pick a tighter one")
 
     def test_the_phase_is_its_name_and_its_reason(self):
-        self.assertEqual(self.ph, {"phase": "decode", "batch": None,
-                                   "time_unpublished_reason":
-                                       self.res["infeasibility_reason"]})
+        self.assertEqual(self.ph, withheld_phase(
+            "decode", self.res["infeasibility_reason"]))
 
     def test_the_absence_carries_a_reason(self):
         self.assertTrue((self.ph.get("time_unpublished_reason") or "").strip())

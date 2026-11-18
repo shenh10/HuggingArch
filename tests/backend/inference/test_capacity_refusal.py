@@ -117,6 +117,28 @@ def test_a_weight_refusal_finishes_without_phase_walks(monkeypatch):
     assert result["phases"]["prefill"]["batch"] is None
     assert result["phases"]["decode"]["batch"] is None
 
+    # What a refusal does NOT suspend: the budget facts. A rank that cannot
+    # load its weights is still asked which modules those weights are and how
+    # many bytes each holds — that is the answer the Memory card draws and the
+    # question the user is asking when a deployment refuses.
+    #
+    # Checked by the second route rather than by the field: sum the published
+    # roots' own per-rank bytes and compare with the per-rank total published
+    # beside them. Reading `total_bytes_per_rank` alone cannot fail, because a
+    # second producer of that number is exactly the defect — the refusal path
+    # once hand-built a `weight_breakdown` whose tree was empty and whose total
+    # came from the resident-weight ledger instead of the tree, so the same
+    # field meant "weights the rank holds in HBM" when the card refused and
+    # "weights the tree places on the rank" when it did not (they part by
+    # 1.68x on DeepSeek-V4.1-Flash, which keeps tables off the device).
+    wb = result["weight_breakdown"]
+    roots = list(wb["groups"]) + list(wb["model_level"])
+    assert roots, "a refused card published no weight tree"
+    assert sum(int(root["params"] or 0) for root in roots) > 0
+    assert (sum(float(root["bytes_per_rank"] or 0.0) for root in roots)
+            + float(wb["unattributed_scale_bytes"] or 0.0)
+            == pytest.approx(wb["total_bytes_per_rank"], rel=1e-12))
+
 
 def test_a_draft_weight_refusal_is_not_read_as_capacity_data(monkeypatch):
     """A drafted record that cannot load says `refused`; it has no capacity

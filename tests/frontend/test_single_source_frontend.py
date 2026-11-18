@@ -82,14 +82,16 @@ def test_fusion_delta_follows_the_phase_tab_and_its_sign(browser_base):  # noqa:
 
 
 def test_ep_modes_follow_the_estimates_moe_answer(browser_base):  # noqa: F811
+    """A model the estimate says routes no tokens to experts has no EP axis:
+    the parallel modes KV storage offers are TP alone, and the notes of the
+    EP ladders — about an axis this model does not have — are not printed."""
     browser, base = browser_base
     s = Session(browser, base, overrides={"/inference/estimate": _estimate(moe_enabled=False)})
     s.goto(_LINK)
     assert s.wait_for(lambda: s.count("/inference/estimate") >= 1)
-    s.page.wait_for_selector("#infer-scaling-mode-dp_ep", timeout=15000)
-    assert s.wait_for(lambda: s.page.is_disabled("#infer-scaling-mode-dp_ep"))
-    assert s.page.get_attribute("#infer-scaling-mode-dp_ep", "title") == "Not MoE — no EP axis"
-    assert not s.page.is_disabled("#infer-scaling-mode-tp_tp")
+    s.page.wait_for_selector("#infer-scaling-par", timeout=15000)
+    assert s.wait_for(lambda: s.page.eval_on_selector_all(
+        "#infer-scaling-par option", "els => els.map(e => e.textContent)") == ["TP"])
     s.assert_clean()
 
 
@@ -99,7 +101,7 @@ def test_refused_degrees_and_the_enumeration_bound_are_different_answers(browser
                "warnings": ["n_heads=24 splits 8 ways, not the 16 requested; the "
                             "remaining ranks replicate that tensor rather than divide "
                             "it further."] if x == 16 else [],
-               "prefill_tps_per_gpu": 1000.0, "decode_tps_per_gpu": 100.0}
+               "context": 4096}
               for x in (2, 4, 8, 16)]
     tp = {"moe_enabled": True, "series": [{"gpu_sku": "B200", "points": points}],
           "ladder": {"refused": [{"x": 32, "reason": "mlp.linear_fc1: exact endpoint "
@@ -111,9 +113,15 @@ def test_refused_degrees_and_the_enumeration_bound_are_different_answers(browser
     })
     s.goto(_LINK)
     assert s.wait_for(lambda: s.count("/inference/estimate-parallel-sweep") >= 1)
-    s.page.wait_for_selector("#infer-scaling-mode-tp_tp", timeout=15000)
-    s.page.click("#infer-scaling-mode-tp_tp")
-    s.page.wait_for_selector('[data-ladder="refused"][data-x="32"]', timeout=15000)
+    # Collapsed by default: one line counts the degrees and names them, the
+    # reasons are a click away. The enumeration bound is NOT in there — it
+    # is a different answer and stays on its own line.
+    note = s.page.wait_for_selector("[data-ladder-notes]", timeout=15000)
+    head = s.page.inner_text("[data-ladder-notes] summary")
+    assert "1 degree did not hold (TP32)" in head
+    assert "1 degree replicates an axis (TP16)" in head
+    assert "divisible by world degree 32" not in head
+    note.evaluate("e => e.open = true")
     refused = s.page.inner_text('[data-ladder="refused"][data-x="32"]')
     assert "does not hold" in refused and "divisible by world degree 32" in refused
     assert "replicate" in s.page.inner_text('[data-ladder="replicated"][data-x="16"]')
@@ -201,7 +209,7 @@ def test_a_parallel_sweep_draws_the_cells_that_landed_while_the_rest_compute(bro
                 "series": [{"gpu_sku": "B200", "points": [
                     {"x": x, "feasible": True,
                      "parallel": {"tp_attention": x, "tp_dense_ffn": x, "tp_moe_expert": x},
-                     "warnings": [], "prefill_tps_per_gpu": 1000.0, "decode_tps_per_gpu": 100.0}
+                     "warnings": [], "context": 4096}
                     for x in xs]}]}
 
     browser, base = browser_base
@@ -223,11 +231,15 @@ def test_a_parallel_sweep_draws_the_cells_that_landed_while_the_rest_compute(bro
 
     s.page.route("**/inference/estimate-parallel-sweep", sweep)
     s.goto(_LINK)
-    s.page.wait_for_selector("#infer-scaling-mode-tp_tp", timeout=15000)
-    s.page.click("#infer-scaling-mode-tp_tp")
-    s.page.wait_for_selector("[data-sweep-partial]", timeout=15000)
-    assert "2 / 4" in s.page.inner_text("[data-sweep-partial]")
+    # The panel's one status line carries the server's own count while the
+    # cells land; it goes when the whole answer has. What those cells say —
+    # here the bound past which nothing was enumerated — is drawn meanwhile.
+    s.page.wait_for_selector("[data-panel-status]", timeout=15000)
+    assert s.wait_for(lambda: "2 / 4" in s.page.inner_text("[data-panel-status]")), (
+        s.page.inner_text("[data-panel-status]"))
+    s.page.wait_for_selector('[data-ladder="beyond-cap"]', timeout=15000)
+    assert "cap 512" in s.page.inner_text('[data-ladder="beyond-cap"]')
     release.append(1)
-    s.page.wait_for_selector("[data-sweep-partial]", state="detached", timeout=15000)
+    assert s.wait_for(lambda: "2 / 4" not in s.page.inner_text("#infer-scaling"), 15000)
     s.errors = [e for e in s.errors if "503" not in e]
     s.assert_clean()

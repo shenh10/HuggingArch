@@ -179,7 +179,7 @@ def test_uploads_and_promotions_never_move_a_theory_key(wired, monkeypatch, meas
         out = [call_key(R._estimate_payload, (est,), {})]
         for kind, req in (("sweep", InferenceEstimateSweepRequest(**_BODY, seq_lens=[1024], **mode)),
                           ("parallel", InferenceParallelSweepRequest(
-                              **_BODY, modes=["tp_tp"], context_len=1024, **mode))):
+                              **_BODY, modes=["tp_tp"], contexts=[1024], **mode))):
             req = asyncio.run(_access.with_measurement_scope(req))
             # A measured answer has no cache key (made live); its join does.
             key = S.sweep_cache_key(kind, req)

@@ -739,8 +739,10 @@ def test_scaling_chart_click_applies_nearest_point():
     assert 'id="infer-scaling-metric"' not in panel
     assert "GPU: 同 Plan" not in panel
     assert "MeasuredCheck" in panel
-    assert 'id="infer-scaling-measured"' in panel
-    assert 'id="infer-par-measured"' in panel
+    # One measured checkbox, in the one section that draws a step time.
+    assert 'id="infer-throughput-measured"' in panel
+    assert 'id="infer-scaling-measured"' not in panel
+    assert 'id="infer-par-measured"' not in panel
     assert 'id="infer-scaling-ngpu"' in panel
     assert "BATCH_PAR_DEGREE = 8" in panel
     assert "function feasibleDegrees" in panel
@@ -748,11 +750,16 @@ def test_scaling_chart_click_applies_nearest_point():
     assert "p.feasible" in panel
     assert "batchDegrees.map" in panel
     fn = panel.index("export function ScalingPanel")
-    assert panel.find("<ParallelSection", fn) < panel.find(">Context × Batch<", fn)
-    assert panel.find(">Context × Batch<", fn) < panel.find("<KvStorageSection", fn)
+    assert panel.find("<ParallelSection", fn) < panel.find("<ThroughputSection", fn)
+    assert panel.find("<ThroughputSection", fn) < panel.find(">KV storage<", fn)
+    assert panel.find(">KV storage<", fn) < panel.find("<KvStorageSection", fn)
+    # One chart area: no section draws a throughput of its own beside it.
+    assert "prefill_tps_per_gpu" not in panel
+    assert 'title="Prefill (B=1)"' not in panel
     # And the hover rows carry the facts: B/GPU and the step time that made it.
     assert "B/GPU=${p.b}" in panel and "fmtT(p.t)" in panel
-    assert "decode_batch_per_gpu" in panel and "decode_t_sol_s" in panel
+    # A line's hover reads the drawn phase's own batch and step time.
+    assert 'const tField = phase === "decode" ? "tpot_s" : "prefill_t_s"' in panel
     # SOL and measured share a legend name (same colour, dashed vs solid).
     # A legend click must not setOption inside ECharts' own dispatch, and a
     # hidden series is selected === false (empty {} means all visible).

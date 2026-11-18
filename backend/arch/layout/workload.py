@@ -20,6 +20,7 @@ import sympy as sp
 
 from backend.arch.eval.dim import exact, require, same_law, value_of
 
+from .comm_volume import RouteFanout
 from .groups import ProcessGroupFamily, same
 from .layout import Block
 
@@ -37,6 +38,13 @@ class ExpectedRoutedLoad:
     routed_rows_in_cell: Any
     num_experts: int          # E
     load_assumption_id: str
+    #: The dispatch's top-k fan-out (`comm_volume.RouteFanout`): how many
+    #: DISTINCT destinations a token's picks reach, which is how many copies
+    #: of it the exchange sends. Required: a routed tensor's rows ARE one
+    #: token's picks, so how those picks collapse onto destinations is part
+    #: of what the rows axis means, and the exchange that reads it
+    #: (`materialize_rows.exchange_row`) has nowhere else to get it.
+    fanout: RouteFanout
     #: rho = max/mean EXPERT load (`Workload.ep_load_factor`), the
     #: number a routing trace measures — independent of how the experts are
     #: placed. What a rank carries is `busiest_rank_load_factor`.
@@ -45,6 +53,11 @@ class ExpectedRoutedLoad:
     #: expert tensor parallelism. The route measure stays unchanged; this is
     #: the number of physical copies each expert kernel consumes.
     row_replication: int = 1
+    #: The rows axis as the dispatch left it (`routed_rows_layout`): what a
+    #: gather inside the zone stacks copies of, and what the inverse
+    #: dispatch takes the rows back to. None only for evidence built outside
+    #: a dispatch (a unit probe); a combine refuses it.
+    dispatched_rows: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if (self.group is None) != (self.expert_shard_axis is None):
@@ -53,6 +66,14 @@ class ExpectedRoutedLoad:
                              "both None (every rank holds every expert)")
         if self.num_experts <= 0:
             raise ValueError("num_experts must be positive")
+        if not isinstance(self.fanout, RouteFanout):
+            raise ValueError(
+                "ExpectedRoutedLoad.fanout is the dispatch's top-k fan-out "
+                f"(RouteFanout); got {self.fanout!r}")
+        if self.fanout.placed != self.num_experts:
+            raise ValueError(
+                f"the fan-out places {self.fanout.placed} experts and the "
+                f"bank holds {self.num_experts}: one bank, one count")
         if self.group is not None:
             self._check_route_group()
         if self.routed_rows_in_cell < 0:
@@ -156,3 +177,7 @@ class ExpectedRoutedLoad:
         if not isinstance(factor, int) or factor < 1:
             raise ValueError("row replication factor must be positive")
         return replace(self, row_replication=self.row_replication * factor)
+
+    def as_dispatched(self) -> "ExpectedRoutedLoad":
+        """The rows as the dispatch left them: a row gather undone."""
+        return replace(self, row_replication=1)

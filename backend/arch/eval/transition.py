@@ -126,7 +126,9 @@ class Redistribute:
     #: The earlier redistribute object whose required state is this record's
     #: arrived state. An internal collective that consumes an edge already
     #: settled by another collective is an ordered event chain, not another
-    #: reader of the producer. Object identity survives the analysis's own
+    #: reader of the producer; so is an edge collective that reads a value
+    #: its producer's own internal exchange already moved (a dispatch's
+    #: all_to_all, then the expert-TP row gather on the same readers). Object identity survives the analysis's own
     #: reorderings and pickling; a list index would not.
     dependency: Optional[Any] = field(
         default=None, compare=False, repr=False)

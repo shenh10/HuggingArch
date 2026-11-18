@@ -114,6 +114,7 @@ from backend.arch.eval.program import Program
 from backend.arch.eval.refusal import LayoutRefusal
 from backend.inference.parallel_sweep import (
     ALL_MODES,
+    DEFAULT_SWEEP_GPUS,
     class_cards,
     class_frontier_layouts,
     frontier_layouts,
@@ -248,8 +249,13 @@ class FrontierView(NamedTuple):
     def walk_cards(self) -> List[str]:
         """The cards one walk serves this view from, the walk card first:
         the GPU's walk class (`parallel_sweep.class_cards`) when the view
-        keeps the walk, else the GPU alone."""
-        return class_cards(self.gpu_sku) if self.keeps_walk() else [self.gpu_sku]
+        keeps the walk, else the GPU alone. The kept walk is the canonical
+        bundle both consumers read — the Gallery and the Scaling panel, whose
+        series is every card of the sheet (`DEFAULT_SWEEP_GPUS`) — so it
+        carries every card of the class the wider one prices: a card missing
+        from it has no capacity fact and cannot be projected."""
+        return (class_cards(self.gpu_sku, DEFAULT_SWEEP_GPUS)
+                if self.keeps_walk() else [self.gpu_sku])
 
     def key_parts(self) -> List[Any]:
         return [*self.walk_parts(), float(self.comm_latency_us),

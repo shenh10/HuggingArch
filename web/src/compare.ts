@@ -245,6 +245,13 @@ export const SWEEP_BATCH_GRID: SweepBatchPoint[] = [
   { key: "max", prefill_batch_size: 1, decode_batch_size: null },
 ];
 
+/** What the Scaling panel's Context × Batch body asks of the grid
+ *  (`sweep_grid.SCALING_PANEL_BATCH_GRID`): one request (prefill vs context)
+ *  and each card's ceiling (KV storage). Its decode chart is a view of the
+ *  parallel sweep's cloud; Compare keeps the whole grid. */
+export const SCALING_PANEL_BATCH_GRID: SweepBatchPoint[] = SWEEP_BATCH_GRID.filter(
+  (p) => p.decode_batch_size === 1 || p.decode_batch_size === null);
+
 /** The routine grid's decode length (`sweep_grid.ROUTINE_OUTPUT_TOKENS`); also the
  *  Inference page's seeded `outTok`. */
 export const SWEEP_OUTPUT_TOKENS = 256;

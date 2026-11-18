@@ -277,8 +277,8 @@ class ServingLayers:
     access_shapes: Layer[Shape]
     pre_access_shapes: Layer[Shape]
     #: Each leaf on a MoE dispatch's routed buffer, after the rewrite and
-    #: before it, with that dispatch's boundary on the rank
-    #: (`access.routed_launches`).
+    #: before it, with the launch it runs on the rank — read off the routed
+    #: rows that leaf is handed (`Analysis.routed`, `access.routed_launches`).
     pre_routed: Layer[Any]
     routed: Layer[Any]
     #: What a leaf that runs on the step's tokens runs on: the step's rows
@@ -554,10 +554,24 @@ def build_serving_layers(cell: Any, *,
                 projection=projection,
             )
 
-        # Each leaf on a routed buffer, with its dispatch's boundary on the
-        # rank (`Analysis.routed`): what its padded launch is read off.
-        pre_routed = routed_launches(pre_program, pre_access, analysis.routed)
-        routed = routed_launches(program, access, analysis.routed)
+        # Each leaf on a routed buffer, with the launch it runs on the rank
+        # (`Analysis.routed`): what its padded launch is read off. A grafted
+        # cast carries the tensor its reader is handed (`CastSite.consumer`),
+        # so it runs that reader's launch.
+        launches = dict(analysis.routed)
+        for site in (casts.sites if casts else ()):
+            if site.consumer not in analysis.routed:
+                continue
+            launch = analysis.routed[site.consumer]
+            earlier = launches.setdefault(site.node.uid, launch)
+            if earlier != launch:
+                # One copy read by several readers (CSE) is one tensor, so
+                # one launch: its readers must be handed the same rows.
+                raise ValueError(
+                    f"{site.node.display_path}: its readers run different "
+                    f"routed launches ({earlier!r} vs {launch!r})")
+        pre_routed = routed_launches(pre_program, pre_access, launches)
+        routed = routed_launches(program, access, launches)
 
         comm_bytes = materialized.comm_bytes.rebase(rewrite, program, _sum)
         comm_meta = materialized.comm_meta.rebase(rewrite, program, _first)

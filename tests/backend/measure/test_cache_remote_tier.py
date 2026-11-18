@@ -163,13 +163,19 @@ def test_an_entry_whose_trace_is_stale_is_a_miss_and_is_overwritten(tmp_path):
     assert cache.get_or_compute("k", lambda: {"v": "NEW"},
                                 remote_ok=True) == {"v": "NEW"}
     assert cache.get("k", remote_ok=True) == {"v": "NEW"}
+    # and the stale row in the global table is replaced, not left for the
+    # next machine to read.
+    assert _value(remote.store["k"]) == {"v": "NEW"}
 
 
-def test_a_remote_entry_brings_its_trace_from_the_remote_tier(tmp_path):
-    """Another machine's entry names a trace this one never recorded: its
-    body is read from the remote tier, where the writer put it."""
-    cache, remote = _cache(tmp_path)
-    trace = Trace(_trace().items + (("x.py::f", "0123456789abcdef"),))
+def test_a_remote_entry_carries_its_trace_into_the_remote_tier():
+    """A writer whose trace another machine has never recorded puts the body
+    in the remote tier too, content-addressed, and the entry names that id —
+    which is what lets the reader there resolve it (`KeyedCache._trace`).
+    Only the writing half is pinned here: reading it back needs a provider
+    that recognises the trace, and this process's does not."""
+    remote = FakeRemote()
+    trace = Trace((*_trace().items, ("x.py::f", "0123456789abcdef")))
     other = KeyedCache("sweep", MemoryBackend(), remote=remote)
     other.put("k", {"v": 1}, trace=trace, remote_ok=True)
     assert REMOTE_TRACE_PREFIX + trace.id in remote.store

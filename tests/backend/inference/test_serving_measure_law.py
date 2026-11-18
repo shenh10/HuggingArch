@@ -183,7 +183,7 @@ def oracle(gpu: str):
 def test_pool_measured_points_match_a_direct_walk_on_two_card_classes():
     for gpu in ("H100-SXM", "B200"):
         record = oracle(gpu)
-        assert record["schema"] == "serving-law-v7"
+        assert record["schema"] == gallery.walkRecordSchema
         assert "measurePoints" in record["phases"]["decode"]
 
 
@@ -247,7 +247,7 @@ def test_stored_measure_points_are_point_keys_after_json():
         record = _layout_law(
             (model, cards, 0.9, _GALLERY_PRECISION.canonical(),
              parallel.to_dict()))
-        assert record.get("schema") == "serving-law-v7", (model, record)
+        assert record.get("schema") == gallery.walkRecordSchema, (model, record)
         throughJson = json.loads(json.dumps(record))
         table = throughJson["phases"]["decode"]["measurePoints"]
         assert table["cardless"]
@@ -362,7 +362,7 @@ def test_offline_serving_projection_never_asks_point_keys(monkeypatch):
     record = _layout_law((MODEL, ["H100-SXM"], 0.9,
                           _GALLERY_PRECISION.canonical(),
                           PARALLEL.to_dict()))
-    assert record.get("schema") == "serving-law-v7", record
+    assert record.get("schema") == gallery.walkRecordSchema, record
     for module, name in ((law, "point_keys"), (overlay, "point_keys")):
         monkeypatch.setattr(
             module, name,

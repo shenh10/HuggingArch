@@ -342,6 +342,127 @@ format, experts that take unquantised input) the default serving path is
 priced; DeepEP low latency quantises inside its dispatch kernel, a fusion
 recorded in `docs/known_limitations.md` §3.2.
 
+## The MoE exchange sends a token once per destination
+
+Every other collective's per-rank bytes are a function of its group's size:
+`(N-1)/N` of the payload, doubled for an all-reduce. A routed MoE exchange is
+not, because its payload rows are one token's **top-k picks** and several
+picks can land on the same destination. A dispatch sends such a token ONCE to
+that destination and lets the receiver fan the copy out to the experts it
+holds — DeepEP's dispatch, and the form every serving stack converged on.
+Billing a copy per pick over-counts DeepSeek-V3's top-8 dispatch by 1.51x
+(0.875 against 0.579 of the payload at EP 8).
+
+So the exchange's **total** is the ring's coefficient generalised over
+distinct destination RANKS (`comm_volume.RouteFanout`): every one of them has
+to receive the token once, whatever the topology. With `k` picks drawn from `T`
+route targets of which `E` hold weights, over `D` destinations each holding
+`E_d` of the targets:
+
+```
+k_eff   = k·E/T                                 copies the payload holds per token
+A(D,E_d) = D·(1 − C(T−E_d, k)/C(T, k))          distinct destinations reached
+factor  = (D−1)/D · A(D,E_d)/k_eff              bytes sent per payload byte
+```
+
+`A` is hypergeometric: a destination is missed only when all `k` picks avoid
+its `E_d` targets. At `k = 1` the two terms cancel and the coefficient is
+`(D−1)/D` — the flat ring, unchanged, which is how every non-routed
+all-to-all stays priced exactly as before.
+
+**The levels partition that total; they do not add to it.** The deployment
+places the route group at two levels (`comm_cost.placement_levels`): the ranks
+inside one node, over NVLink, and the nodes inside the world, over RDMA. The
+node level counts its own destinations — one RDMA send per distinct remote
+node — and the rank level takes the remainder
+(`comm_cost.routed_shares`): the destinations in the sender's own node, plus
+the forwards inside each remote node past the rank the RDMA copy landed on,
+which is what DeepEP's internode dispatch does. So the bytes a row publishes
+and the bytes its phases add up to are one number, and a group spread over
+more nodes never gets cheaper — copies move onto the slower fabric, they do
+not disappear. A level with one destination is not a level, so a single-node
+group has only the first and a group with one member per node only the second;
+the degeneracies fall out of `D ≤ 1` rather than being tested for.
+
+Latency follows the same split: `ceil(log2 D)` per level, so a single node
+keeps the flat `ceil(log2 N)` (deduping inside a node forwards nothing
+further) and a cross-node exchange pays `ceil(log2 nodes) +
+ceil(log2 members)` — the NVLink forward hop counted. The combine mirrors the
+dispatch in bytes and in hops, and the direction is not modelled. It mirrors
+it only while it IS an exchange: where the expert ranks already hold every
+token (`route_owner_inclusion`), the inverse dispatch is an all-reduce, which
+carries no fan-out and is priced flat — the oracle counts the fan-out-carrying
+legs per deployment so which it is, is on the record
+(`test_route_dedup_oracle`, `Case.routed_legs`).
+
+The levels are read off the CARD, not carried from the walk, because the same
+group of eight ranks is one node on an SXM board and two nodes of four on PCIe
+cards. A world that is not a whole number of nodes has no node level — its
+nodes hold different numbers of the group's members, so no per-node
+destination count applies to any of them — and takes one level instead,
+carrying the whole total on the inter fabric. The bytes are the same; the
+fabric is pessimistic, and this is the one placement the model does not level.
+
+**No per-framework switch.** Every framework and both phases dedup, and the
+flip side has to be said as plainly as the group-limit gap below: a stack that
+runs the naive per-pick form is **under-counted** here, by up to the same
+1.51x at top-8 — we price the better implementation, so a deployment that does
+not run it looks faster than it is. DeepEP's low-latency mode is such a form
+(it sends per expert to keep the kernel dispatch-free, and
+`docs/known_limitations.md` §3.2 records its other deviation). It is not the
+optional switch an earlier draft of this paragraph called it: sglang's
+`--deepep-mode` defaults to `auto`, which is normal for prefill and
+**low-latency for decode**, so on that stack the decode exchange's default
+path is the non-dedup one. Modelling it as deduped is a deliberate choice —
+the graph models the better form, the way it does for the doubly-quantised
+shared expert above — not a claim about what every default does.
+
+### Known gap: group-limited routing is not modelled
+
+DeepSeek's and Kimi's routers do not draw their `k` picks from all `T` targets.
+The targets are partitioned into `n_group` groups, the router keeps the
+`topk_group` best of them, and all `k` picks come from those
+(`config.n_group` / `config.topk_group`; `topk_method: noaux_tc`). Since the
+groups are laid out contiguously and expert parallelism cuts the same axis
+contiguously, a kept group lands on few destinations — at DeepSeek-V3's EP 64
+over 8-GPU nodes, one group of 32 experts is exactly one node. So a
+group-limited token reaches FEWER distinct destinations than a uniform one, at
+both levels, and this model over-counts its bytes. The direction is always
+pessimistic.
+
+How much: DeepSeek-V3 at EP 64 over 8 nodes (`n_group = 8`, `topk_group = 4`)
+is priced with a node-level share of 0.579 of the payload where the true
+figure is about 0.397 — a token can reach at most 4 of the 8 nodes, never 8,
+so the dispatch's RDMA bytes are over-counted by about 46%.
+
+Closing it needs the same formula marginalised over which groups were kept.
+With `g` groups of `T/g` targets each, `t` of them kept, and a destination
+holding `E_d` targets spread over the groups as `(e_1 … e_g)`:
+
+```
+A(D,E_d) = D · (1 − Σ_S P(S) · C(Σ_{j∈S}(T/g − e_j), k) / C(t·T/g, k))
+```
+
+summed over the `C(g,t)` kept sets `S`, each equally likely under a balanced
+router. Two facts have to be DECLARED before that can be written, and neither
+exists today:
+
+1. **the grouping itself** — `n_group` and `topk_group` reach no spec dim
+   today (the router component binds `n_expert_groups` / `n_groups_active` for
+   its own FLOPs, but the dispatch's fan-out never sees them), so the
+   dispatch's `RouteFanout` would gain two counts and the spec would have to
+   bind them at the `permute` node the way it binds `n_experts_active`; and
+2. **how groups sit on destinations** — `e_j`, which is a placement fact, not
+   a count: it needs the expert axis's group structure declared beside its
+   shard (today the axis is a flat `n_expert_copies` that expert parallelism
+   cuts, and nothing says a group of it is contiguous).
+
+Until both are declared the dispatch is priced as a uniform draw, and the
+hypergeometric form above is where to start. The oracle that checks the
+current form (`tests/backend/inference/test_route_dedup_oracle.py`) simulates
+a uniform draw for the same reason: it checks the model as stated, not the
+router as shipped.
+
 ## From per-step time to the headline numbers
 
 - **TTFT** = prefill `t_sol` (one prompt through the compute-bound phase).

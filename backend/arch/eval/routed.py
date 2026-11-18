@@ -1,9 +1,10 @@
-"""`RoutedLaunch` — one rank's MoE dispatch boundary, as a grouped kernel
+"""`RoutedLaunch` — one routed leaf's buffer on one rank, as a grouped kernel
 launches it.
 
 A dispatch (`permute`) lays the rank's tokens out per expert,
 `[n_expert_copies, M, d]`, and everything up to its `combine` runs on that
-buffer. The walk keeps `M` the MEAN rows one expert receives — exact, often
+buffer — or on several ranks' copies of it, where a layout gathers the rows
+for expert tensor parallelism. The walk keeps `M` the MEAN rows one expert receives — exact, often
 fractional (`Evaluator._tokens_per_expert`) — and the layout keeps the
 busiest rank's share of it (`ExpectedRoutedLoad`). A kernel runs whole rows,
 so the launch is a padded geometry, and every reader of that geometry — the
@@ -32,9 +33,10 @@ whole; a launch reads whole experts, so its numerator re-reads that law at
 the launched rows (`calibration_overlay._at_geometry`). The frameworks pad
 each expert to a block of rows (`BLOCK_SIZE_M`); this pads to a row.
 
-The record is per dispatch, keyed by the dispatch's uid
-(`Analysis.routed`); which dispatch a node's buffer came from is the graph's
-(`Program.dispatch_of`). Its fields are extents of the walk, so a symbolic
+The record is per leaf on a routed buffer, keyed by the leaf's uid
+(`Analysis.routed`), read off the routed tensor that leaf is handed — so a
+leaf past a row gather launches the gathered rows, and its `dispatch` names
+which dispatch the buffer came from (`Program.dispatch_of`). Its fields are extents of the walk, so a symbolic
 walk's record is a law read at any point (`Point.read`); the padded readings
 are `ceiling` / `Min` of them, numbers at a number and laws at a law.
 """
@@ -56,33 +58,39 @@ def _whole(value: sp.Basic) -> Any:
 
 @dataclass(frozen=True)
 class RoutedLaunch:
-    """One rank's dispatch boundary (module docstring)."""
+    """One routed leaf's launch on one rank (module docstring)."""
 
-    #: The uid of the dispatch (`permute`) this boundary is.
+    #: The uid of the dispatch (`permute`) whose buffer the leaf runs on.
     dispatch: int
     #: T: the rows of the dispatch's token operand on this rank.
     source_rows: Any
-    #: R: the rows dispatched onto this rank's experts — exact, a mean.
+    #: R: the routed rows the leaf runs on this rank's experts — exact, a
+    #: mean; the rows dispatched here, times the ranks a gather stacked.
     routed_rows: Any
     #: E: the experts this rank holds.
     local_experts: int
 
     @classmethod
-    def of(cls, dispatch: int, token: Sequence[Any],
-           buffer: Sequence[Any]) -> "RoutedLaunch":
-        """The boundary read off the dispatch's own tensors on one rank: its
-        token operand `[B, s, d]` and the buffer it writes `[E, M, d]` —
-        exactly those, the layouts `permute` declares (`shape_in` /
-        `shape_out`), so its experts are axis 0 of the buffer and its rows
-        axis 1, as every reader of the record takes them."""
-        if len(token) != 3 or len(buffer) != 3:
+    def of(cls, dispatch: int, token: Sequence[Any], buffer: Sequence[Any],
+           expert_axis: int, *, where: str = "") -> "RoutedLaunch":
+        """The launch read off one rank's tensors: the dispatch's token
+        operand `[B, s, d]` and the routed buffer the leaf runs on (the one
+        the dispatch writes, for the dispatch), which ends in
+        `[E, M, d]` from its expert axis `expert_axis` — the experts there,
+        the rows right after, as every reader of the record takes them."""
+        name = where or f"dispatch {dispatch}"
+        if len(token) != 3:
             raise ValueError(
-                f"dispatch {dispatch}: a token operand [B, s, d] and a buffer "
-                f"[E, M, d] are its tensors, not {list(token)!r} and "
-                f"{list(buffer)!r}")
+                f"{name}: the dispatch's token operand is [B, s, d], not "
+                f"{list(token)!r}")
+        if expert_axis + 3 != len(buffer):
+            raise ValueError(
+                f"{name}: a routed buffer ends in [E, M, d] from its expert "
+                f"axis {expert_axis}, and {list(buffer)!r} does not")
+        experts = buffer[expert_axis]
         return cls(dispatch=dispatch, source_rows=token[0] * token[1],
-                   routed_rows=buffer[0] * buffer[1],
-                   local_experts=int(value_of(buffer[0])))
+                   routed_rows=experts * buffer[expert_axis + 1],
+                   local_experts=int(value_of(experts)))
 
     def wire(self) -> Dict[str, Any]:
         """The record as a per-op row carries it: each extent exact and

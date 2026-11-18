@@ -106,7 +106,7 @@ jobs:
       # spec / hermetic suites still pass on the new stack.
       - name: Ruff
         if: steps.lock.outputs.changed == 'true'
-        run: uv run ruff check backend/
+        run: uv run ruff check .
 
       - name: Pytest
         if: steps.lock.outputs.changed == 'true'

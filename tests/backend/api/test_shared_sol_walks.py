@@ -75,8 +75,10 @@ def shared(monkeypatch, tmp_path):
     realSteps = scaling._PARALLEL.steps
 
     def oneCell(req):
+        # The layout the record holds (the ladder's first cell is one GPU).
         full = realPlan(req)
-        return dataclasses.replace(full, cells=full.cells[:1])
+        return dataclasses.replace(full, cells=tuple(
+            c for c in full.cells if c.parallel.to_dict() == PARALLEL))
 
     def counted(cell, prices):
         calls["cells"] += 1
@@ -93,7 +95,9 @@ def _request(scaling, **changes):
     body = {
         "model_id": MODEL,
         "gpu_sku": "",
-        "context_len": 4096,
+        # Two contexts: the projection and the direct cell each price the
+        # second by substitution off one walk.
+        "contexts": [1024, 4096],
         "modes": ["tp_tp"],
         "gpu_skus": ["H100-SXM"],
         "avg_output_tokens": 256,
@@ -170,16 +174,26 @@ def test_scaling_projects_the_gallery_record_without_a_cell(shared, monkeypatch)
 
 def test_a_point_outside_the_producer_anchor_runs_its_own_cell(shared):
     _gallery, scaling, _pool, _calls = shared
-    req = _request(scaling, context_len=6144)
+    req = _request(scaling, avg_output_tokens=128)
     assert scaling._sharedWalkResults(
         scaling._PARALLEL, scaling._PARALLEL.plan(req)) == {}
+
+
+def test_a_context_off_the_routine_grid_is_refused_at_the_request(shared):
+    """The sweep's contexts are the routine grid's: bounded work, and every
+    one a canonical record carries, so none forces a walk."""
+    from pydantic import ValidationError
+
+    _gallery, scaling, _pool, _calls = shared
+    with pytest.raises(ValidationError, match="routine grid"):
+        _request(scaling, contexts=[4096, 6144])
 
 
 def test_the_canonical_bundle_holds_every_scaling_layout(shared):
     """Scaling's ladder does not become direct cells beside the Gallery pool."""
     _gallery, scaling, _pool, _calls = shared
     assert asyncio.run(_gallery.keepSharedWalk(MODEL, "H100-SXM"))
-    req = _request(scaling, context_len=1024, gpu_skus=["H100-SXM"])
+    req = _request(scaling, contexts=[1024], gpu_skus=["H100-SXM"])
     plan = scaling._PARALLEL.plan(req)
     assert len(plan.cells) >= 1
     assert set(scaling._sharedWalkResults(
@@ -204,9 +218,12 @@ def test_nondefault_floors_are_substituted(shared):
     estimate = _estimateRequest(scaling, comm_latency_us=3.0)
     assert set(scaling._sharedWalkResults(
         scaling._ESTIMATE, scaling._estimate_plan(estimate))) == {0}
-    parallel = _request(scaling, launch_floor_us=2.0)
-    assert set(scaling._sharedWalkResults(
-        scaling._PARALLEL, scaling._parallel_plan(parallel))) == {0}
+    parallel = scaling._parallel_plan(_request(scaling, launch_floor_us=2.0))
+    # The record's layout, wherever the ladder puts it (one GPU comes first).
+    held = {i for i, c in enumerate(parallel.cells)
+            if c.parallel.to_dict() == PARALLEL}
+    assert len(held) == 1
+    assert set(scaling._sharedWalkResults(scaling._PARALLEL, parallel)) == held
 
 
 def test_a_paired_prefill_batch_is_substituted(shared):

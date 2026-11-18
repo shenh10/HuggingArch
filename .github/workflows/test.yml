@@ -106,9 +106,16 @@ jobs:
       # names never get resolved at runtime). Pytest didn't catch any of
       # them. Ruff scans them statically in milliseconds.
       # Run BEFORE pytest so a CI failure surfaces fast.
+      #
+      # `.` — the whole repository, not `backend/`. The gate used to measure
+      # one package of it, so every finding in `kernel_bench/` (production
+      # code: the measured-kernel producer), `tools/`, `scripts/` and
+      # `tests/` was invisible: 18 of them had accumulated unseen, including
+      # a duplicate `rms_normalise` and two dict keys declared twice in
+      # `kernel_bench/`. Whole-repo is 1,215 files and still ~60 ms.
       - name: Ruff (pyflakes — undefined names, unused imports)
         if: steps.kind.outputs.spec_only != 'true'
-        run: uv run ruff check backend/
+        run: uv run ruff check .
 
       - name: Run spec gate
         if: steps.kind.outputs.spec_only == 'true'

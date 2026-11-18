@@ -10,6 +10,7 @@ from .layout import (AxisLayout, Replicated, Block, Segmented, Product,
 from .value import (Complete, Partial, UnknownValue, ValueProvenance, COMPLETE,
                     SUM, MAX, ONLINE_ATTENTION, PENDING_MERGE_KINDS, PAYLOAD_SCHEMAS,
                     join_orthogonal_partials)
+from .comm_volume import RouteFanout
 from .workload import ExpectedRoutedLoad
 from .foldlaw import (ReductionHomomorphism, HOMOMORPHISM_REGISTRY, may_defer_reduction, GROUP_INVARIANT,
                       PARTITION_OF_UNITY, INDEX_EQUIVARIANT, CONSTANT,
@@ -55,6 +56,7 @@ __all__ = [
                      "Product",
                      "ReductionHomomorphism",
                      "Replicated",
+                     "RouteFanout",
                      "Segmented",
                      "TensorLayout",
                      "Unknown",

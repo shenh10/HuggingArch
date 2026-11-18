@@ -55,9 +55,14 @@ _NOT_ROWS = {
     "local_experts": "the experts a rank holds, a placement",
     "load_assumption_id": "a label naming the routing assumption",
     "expert_load_factor": "rho, the measured expert skew, an input",
+    "fanout": ("the dispatch's top-k fan-out (`RouteFanout`): the "
+               "destinations a token's picks land on, which prices the "
+               "exchange and derives no rows"),
     "row_replication": "how many copies of a row a gather makes, a layout",
+    "dispatched_rows": "the rows axis as dispatched, a layout",
     "is_measure_preserving": "a conservation check, no number",
     "replicate_rows": "builds a new record, reads nothing",
+    "as_dispatched": "builds a new record (a row gather undone), reads nothing",
 }
 
 

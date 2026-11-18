@@ -136,8 +136,38 @@ for _phase in ("prefill", "decode"):
             "4fe1fa9e4/b89c49b0e: a module row carries the same primary "
             "output dtype, cached tensor, and cache format as its measured "
             "leaf, so a re-read can key the row by the output it walks")
+for _rows in ("per_op_timing", "per_op_timing_decode",
+              "phases.prefill.flops_by_module", "phases.decode.flops_by_module"):
+    for _field in ("input_dtypes", "input_dtypes[*]",
+                   "port_dtypes", "port_dtypes[*]"):
+        ADDED[f"{_rows}[*].{_field}"] = (
+            "each tensor's element dtype beside the shape column that names "
+            "it, as the walk billed its read or write (`LeafAccess."
+            "input_dtypes` / `port_dtype`): the per-op table shows "
+            "`[shape] dtype → [shape] dtype`, so a cast reads as one")
+    for _field in ("weights", "weights[*].name", "weights[*].shape[*]",
+                   "weights[*].dtype"):
+        ADDED[f"{_rows}[*].{_field}"] = (
+            "the stored tensors a kernel streams that arrive on no input, "
+            "each as one rank holds it with its resident dtype (`LeafAccess."
+            "weights`): the weight operands the shape column lists beside "
+            "the inputs")
 for _phase in ("prefill", "decode"):
     ADDED[f"phases.{_phase}.binding.s_pairs"] = _PAIRS
+# The rate ONE request sees, stated once by the phase that owns the
+# throughput, beside the tokens of the step that belong to that request.
+# Every consumer of a per-request rate used to divide tokens by a time of
+# its own: the cloud's prefill axis did it, and so did the Compare page —
+# two roads to one number, which is the second producer this payload
+# exists to prevent. `phase_throughput` names it; `frontier._phase_rates`
+# reads it and takes no quotient.
+_PER_REQUEST = ("the rate one request sees, named once by the phase "
+                "(`phases.phase_throughput`), so no reader divides tokens "
+                "by a time it picked itself")
+for _phase in ("prefill", "decode"):
+    ADDED[f"phases.{_phase}.throughput.sol.per_request"] = _PER_REQUEST
+    ADDED[f"phases.{_phase}.throughput.tokens_per_request_step"] = _PER_REQUEST
+
 for _phase in ("prefill", "decode"):
     for _field in ("t_partial_s", "partial_measured_share", "throughput.partial"):
         ADDED[f"phases.{_phase}.{_field}"] = (
@@ -176,6 +206,17 @@ for _phase in ("per_op_timing", "per_op_timing_decode"):
     for _path in ("shape_weight_dims", "shape_weight_dims[*].expr",
                   "shape_weight_dims[*].value"):
         ADDED[f"{_phase}[*].{_path}"] = _WEIGHT_DIMS
+
+# A routed MoE exchange's top-k fan-out, which prices its dedup wherever the
+# row is priced — the walk's card, another card a re-read levels the group on
+# (`comm_cost.placement_levels`), and the step's law. None on every row that
+# is not a routed exchange, which is every row of a single-GPU deployment,
+# so the gate's models publish the key with no value.
+_FANOUT = ("a routed exchange sends a token once per distinct destination its "
+           "top-k picks land on; the fan-out is what prices that, and it "
+           "travels with the row so a re-read on another card re-levels it")
+for _rows in ("per_op_timing", "per_op_timing_decode"):
+    ADDED[f"{_rows}[*].comm_route_fanout"] = _FANOUT
 
 REMOVED = {}
 for _phase in ("per_op_timing", "per_op_timing_decode"):

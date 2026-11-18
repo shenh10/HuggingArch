@@ -58,7 +58,8 @@ from .calibration_overlay import (_resolve_overlay_context, key_columns_at, miss
 from .gpu_specs import get_gpu, peak_flops_for_dtype, peak_hbm_bw
 from .op_calibration import (PhysicalKey, merge_validated_rows, registry_from_lookup,
                              select_time)
-from .phases import Speculation, phase_note, phase_throughput, step_tokens
+from .phases import (WITHHELD_PIPELINE, WITHHELD_TIMES, Speculation, phase_note,
+                     phase_throughput, step_tokens)
 from .phase_formulas import (FormulaDefs, _access_bytes_formula_for_row, _flops_formula_for_row,
                              _rollup_column, enrich_module_breakdown,
                              phase_roofline_formulas)
@@ -695,15 +696,11 @@ def phase_at(phase: Dict[str, Any], point_rows: List[Dict[str, Any]],
         # Withheld before the table is enriched, as the walk withholds a
         # phase before its table is (`capacity._capacity_pending`): the
         # enrichment writes no time a withheld step does not have.
-        out.update({
-            "t_compute_s": None, "t_memory_s": None, "t_comm_s": None,
-            "t_sol_s": None, "t_sol_by_bound": None,
-            "t_sol_by_bound_share": None, "t_measured_s": None,
-        })
+        out.update(dict.fromkeys(WITHHELD_TIMES))
         if pipeline is not None:
             out["pipeline_time"] = {
                 key: value for key, value in pipeline.items()
-                if key in ("stages", "stage", "stage_laws")}
+                if key in WITHHELD_PIPELINE}
     if breakdown and rescaled_modules:
         # Rebuild this batch's subtree rollups, parent popovers and the
         # phase-formula component sums over the rescaled rows.

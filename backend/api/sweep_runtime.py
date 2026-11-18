@@ -49,7 +49,7 @@ from backend.api.offload import (
 from backend.inference.batch_sweep import measure_points
 from backend.inference.calibration_overlay import looks_up
 from backend.inference.capacity import (CapacitySweepPlan, SweepCloudDim,
-                                        iter_sweep_cell, point_served)
+                                        iter_sweep_cell)
 from backend.inference.card import Card
 from backend.inference.frontier import frontier_view
 from backend.inference.sol_data import (
@@ -68,7 +68,8 @@ from backend.inference.parallel_sweep import (
     ParallelSweepPlan,
     SCALING_DECODE_LADDER,
     config_for_degree,
-    decode_frontier,
+    decode_rungs,
+    cloud_view,
     run_layout_cell,
 )
 
@@ -265,13 +266,16 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             return {}
         payload = plan.cells[0].payload
         environment = payload
+        contexts = tuple(int(context) for context in plan.contexts)
         requestAxes = {
             "environment": environment,
-            "contexts": (int(payload["avg_input_tokens"]),),
+            "contexts": contexts,
             "decode_batches": (None,),
             "prefill_batches": (1,),
-            "prefix_tokens": (int(payload.get("s_prefix_cached") or 0),),
-            "verify_widths": (int(payload.get("s_verify") or 1),),
+            "prefix_tokens": (int(payload.get("s_prefix_cached") or 0),)
+            * len(contexts),
+            "verify_widths": (int(payload.get("s_verify") or 1),)
+            * len(contexts),
             "measurement_scope": payload.get("measurement_scope"),
         }
         if not PublicServingLawRequest.covers(
@@ -374,50 +378,38 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             failed = False
             for sku in skus:
                 try:
-                    context = int(cell.payload["avg_input_tokens"])
                     request = gridRequest(walk_key, sku, cell.parallel)
-                    ladderRequest = PublicServingLawRequest(
-                        walk=walk_key, card=sku, layout=cell.parallel,
-                        environment=request.environment,
-                        contexts=(context,),
+                    ladderRequest = dataclasses.replace(
+                        request,
                         decode_batches=(None, *SCALING_DECODE_LADDER),
                         prefill_batches=(
-                            1, *(1 for _ in SCALING_DECODE_LADDER)),
-                        prefix_tokens=request.prefix_tokens[:1],
-                        verify_widths=request.verify_widths[:1],
-                        measurement_scope=request.measurement_scope,
-                        draft_tokens=request.draft_tokens)
-                    projectedRow = projectServingLawPoints(
-                        law, ladderRequest)[0]
-                    served = projectedRow[0]
-                    byBatch = {
-                        batch: point for batch, point in zip(
-                            ladderRequest.decode_batches, projectedRow,
-                            strict=True)
-                    }
-                    ladder = []
-                    ceiling = int(served["max_decode_batch_per_gpu"] or 0)
-                    beyond = bool(served["beyond_max_context"])
-                    for batch in SCALING_DECODE_LADDER:
-                        point = byBatch[batch]
-                        if not point_served(max_batch_per_gpu=ceiling,
-                                            beyond_max_context=beyond,
-                                            requests=int(batch)):
-                            continue
-                        ladder.append({
-                            "phases": {"decode": point["phases"]["decode"]},
-                            "batch_key": f"b{int(batch)}",
-                            **({"beyond_max_context": True} if beyond else {}),
-                        })
-                    if point_served(max_batch_per_gpu=ceiling,
-                                    beyond_max_context=beyond,
-                                    requests=1):
-                        ladder.append({
-                            "phases": {"decode": served["phases"]["decode"]},
-                            "batch_key": "max",
-                        })
-                    cards[sku] = {"sol": served, "measures": {},
-                                  "ladder": ladder}
+                            1, *(1 for _ in SCALING_DECODE_LADDER)))
+                    entries = []
+                    for context, projectedRow in zip(
+                            request.contexts,
+                            projectServingLawPoints(law, ladderRequest),
+                            strict=True):
+                        served = projectedRow[0]
+                        byBatch = dict(zip(ladderRequest.decode_batches,
+                                           projectedRow, strict=True))
+                        beyond = bool(served["beyond_max_context"])
+                        flag = ({"beyond_max_context": True} if beyond
+                                else {})
+                        # The rungs the direct walk reads (`decode_rungs`);
+                        # `max` is the served point at its own ceiling.
+                        rungs = decode_rungs(
+                            SCALING_DECODE_LADDER,
+                            ceiling=served["max_decode_batch_per_gpu"])
+                        ladder = [{
+                            "phases": {"decode": (
+                                served if key == "max" else byBatch[batch]
+                            )["phases"]["decode"]},
+                            "batch_key": key, **flag}
+                            for key, batch in sorted(rungs.items(),
+                                                     key=lambda kv: kv[1])]
+                        entries.append({"context": context, "sol": served,
+                                        "measures": {}, "ladder": ladder})
+                    cards[sku] = entries
                 except Exception as exc:
                     _log.warning("serving-law projection failed for %s: %s",
                                  sku, exc)
@@ -453,11 +445,20 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
 #: that cloud states the one point-cloud vocabulary and keeps absent points.
 #: v6: a point is the serving projection's public vocabulary, and the direct
 #: estimate is normalized through the same owner as a StepLaw projection.
-_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v6"
+#: v7: the payload's cloud key is `throughput_cloud` (it carries both
+#: phases, not decode alone), and its point SET changed — `estimate_records`
+#: now asks `fits`, so a point that is beyond the model's published context
+#: or whose weights do not fit is a capacity absence instead of a served
+#: point. Compare's cloud loses those points.
+_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v7"
 
 #: The parallel answer's server-side point cloud changed to the one coordinate
 #: vocabulary and began keeping absent points, so its cached answers move once.
-_PARALLEL_SWEEP_PAYLOAD = "parallel-sweep-v2"
+#: v3: the sweep prices every context of `contexts` (the cloud spans them, a
+#: chart point names its context and carries no decode fields), every mode's
+#: ladder starts at one GPU, and a context past the model's published length
+#: keeps its cloud points, flagged.
+_PARALLEL_SWEEP_PAYLOAD = "parallel-sweep-v3"
 
 
 def served_sweep_point(result: Any) -> Any:
@@ -484,7 +485,7 @@ def _estimate_sweep_env(req: InferenceEstimateSweepRequest) -> dict:
 def _parallel_plan(req: InferenceParallelSweepRequest) -> ParallelSweepPlan:
     return ParallelSweepPlan.of(
         modes=req.modes,
-        context_len=req.context_len,
+        contexts=req.contexts,
         batch=req.batch if req.batch is not None else "max",
         gpu_skus=req.gpu_skus,
         base_env=resolve_estimate_environment(req),
@@ -564,7 +565,7 @@ def _estimate_assemble(plan: CapacitySweepPlan, results: list) -> dict:
     points = [[pt["sol"] for pt in seq] for seq in per_seq]
     shaped = plan.shape(points)
     return {"results_by_batch" if plan.gridded else "results": shaped,
-            "decode_cloud": plan.decode_cloud(points)}
+            "throughput_cloud": plan.throughput_cloud(points)}
 
 
 @dataclass(frozen=True)
@@ -613,11 +614,11 @@ class _CachedSweep:
 _PARALLEL = _CachedSweep("parallel", _parallel_plan, _parallel_cells,
                          _layout_cell_step_count, _layout_cell_steps,
                          _layout_cell_of_steps, _parallel_assemble,
-                         cloud="decode_cloud", assembles_partially=True)
+                         cloud="throughput_cloud", assembles_partially=True)
 _ESTIMATE = _CachedSweep("sweep", _estimate_plan, _estimate_cells,
                          _estimate_cell_step_count, _estimate_cell_steps,
                          _estimate_cell_of_steps, _estimate_assemble,
-                         cloud="decode_cloud", steps_are_progress=True)
+                         cloud="throughput_cloud", steps_are_progress=True)
 
 
 @dataclass(frozen=True)
@@ -891,8 +892,24 @@ async def _scoped(req: Any) -> Any:
     return req.model_copy(update={"measurement_scope": scope})
 
 
+def _stored_answer(sweep: _CachedSweep, req: Any, render: bool) -> Any:
+    """The sweep's SOL answer if this box already holds it (the local tiers
+    of `_SWEEP`), else None. Serving it starts no work: no cell runs and
+    nothing is keyed in flight, so the rate limiter — which counts the work
+    a client starts (`service.rate_limit`) — is not charged for it, and a
+    page reading views of a cached cloud may ask as often as it redraws.
+    The remote tier is left to the start (`_sweep_start`), which reads it
+    under the work's own key."""
+    key = sweep_cache_key(sweep.kind, req)
+    hit = None if key is None else _SWEEP.get(key, remote_ok=False)
+    return None if hit is None else _answer(sweep, hit, render)
+
+
 async def _sweep_within_deadline(sweep: _CachedSweep, req: Any, render: bool) -> Any:
     req = await _scoped(req)
+    hit = await asyncio.to_thread(_stored_answer, sweep, req, render)
+    if hit is not None:
+        return hit
     return await within_deadline(
         f"{sweep.kind}:{render}:" + call_key(_run_sweep, (req,), {}),
         lambda: _run_sweep(sweep, req, render))
@@ -910,10 +927,12 @@ async def parallel_sweep_response(req: InferenceParallelSweepRequest) -> Respons
 
 async def parallel_frontier_response(req: ParallelFrontierRequest) -> dict:
     """`/inference/parallel-sweep/frontier`'s response: a view of the
-    sweep's decode point cloud (`decode_frontier`), read off the sweep's own
-    cache entry — the view keys nothing and computes no point."""
+    sweep's throughput point cloud (`cloud_view`: one phase of it as a
+    frontier or as lines), read off the sweep's own cache entry — the view
+    keys nothing and computes no point."""
     sweep = await _sweep_within_deadline(_PARALLEL, req.sweep, False)
-    return decode_frontier(sweep[_PARALLEL.cloud], fix=req.fix, group_by=req.group_by)
+    return cloud_view(sweep[_PARALLEL.cloud], phase=req.phase, form=req.form,
+                      x=req.x, fix=req.fix, group_by=req.group_by)
 
 
 #: The Compare page's views of its rows' cloud, each a grouping at every
@@ -926,7 +945,7 @@ _COMPARE_VIEWS = {"by_batch": ("context", "batch_key"), "by_row": ("context", "r
 async def compare_frontier_response(req: CompareFrontierRequest) -> dict:
     """`/inference/estimate-sweep/frontier`'s response: the compared rows'
     decode points (each row's sweep answer's cloud, read as the page reads
-    it — `CapacitySweepPlan.decode_cloud`, tagged with its `row`) and, per
+    it — `CapacitySweepPlan.throughput_cloud`, tagged with its `row`) and, per
     track, each of `_COMPARE_VIEWS`: its lines, each line its Pareto front."""
     answers = await asyncio.gather(*(_sweep_within_deadline(_ESTIMATE, s, False)
                                      for s in req.sweeps))

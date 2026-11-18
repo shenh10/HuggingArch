@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import sys
 
 from backend.code_trace.provider import TRACED_EXCLUDE, TracedFunctions
 

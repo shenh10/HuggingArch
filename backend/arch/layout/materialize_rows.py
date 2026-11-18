@@ -35,7 +35,8 @@ from .value import ONLINE_ATTENTION, SUM
 _LSE_BYTES = 4.0
 
 
-def reduction_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective:
+def reduction_row(mat: Any, record: Redistribute, world: str, *,
+                  source_event: Optional[str] = None) -> PhysicalCollective:
     """A finalized Partial(sum): all_reduce, anchored at the
     contraction/join producer declared by propagation, moving the
     full-shaped partial."""
@@ -47,12 +48,7 @@ def reduction_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollect
         )
     producer = record.producer if record.producer >= 0 else record.node
     port = flow_port(record.producer_port)
-    routed = _routed_flow(mat, record, world, producer, port)
-    if routed is not None:
-        flow_in = flow_out = routed
-    else:
-        flow_in = local_shape(mat, producer, record.arrived, port)
-        flow_out = local_shape(mat, producer, record.required, port)
+    flow_in, flow_out = _flows(mat, record, producer, port)
     provenance = mat._partial_provenance(record, value)
     dedup_key = None
     if record.site in (
@@ -98,9 +94,11 @@ def reduction_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollect
         dedup_key=dedup_key,
         count=mat._value_count(record),
         family=value.group,
+        **_chained(source_event),
     )
 
-def scatter_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective:
+def scatter_row(mat: Any, record: Redistribute, world: str, *,
+                source_event: Optional[str] = None) -> PhysicalCollective:
     """Finalize a sum while restoring a sequence-parallel row cut."""
     value = record.arrived.value
     if value is None or value.reducer != SUM:
@@ -110,8 +108,7 @@ def scatter_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollectiv
         )
     producer = record.producer if record.producer >= 0 else record.node
     port = flow_port(record.producer_port)
-    flow_in = local_shape(mat, producer, record.arrived, port)
-    flow_out = local_shape(mat, producer, record.required, port)
+    flow_in, flow_out = _flows(mat, record, producer, port)
     provenance = mat._partial_provenance(record, value)
     dedup_key = None
     if record.site in (
@@ -143,6 +140,7 @@ def scatter_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollectiv
         dedup_key=dedup_key,
         count=mat._value_count(record),
         family=value.group,
+        **_chained(source_event),
     )
 
 def exchange_row(
@@ -154,6 +152,13 @@ def exchange_row(
     A route exchange may consume an expert-tensor-parallel reduction of the
     same value. ``source_event`` names that ordered dependency; its expert
     buffer is locally packed into the exchange's row-major rows.
+
+    A ROUTE exchange also carries the dispatch's top-k fan-out
+    (`RouteFanout`, off the routed-load evidence this leg already reads):
+    it sends a token once per distinct destination, not once per pick, and
+    this is the one place that fact reaches an event. Every other exchange
+    — the Ulysses CP pair — carries none and is priced as a flat
+    all-to-all, which is what it is.
     """
     size = mat._family_size(world)
     port = flow_port(record.producer_port)
@@ -173,6 +178,7 @@ def exchange_row(
     else:
         anchor = record.node
         producer = record.producer
+    route_fanout = None
     if is_route:
         if route_evidence is None or not same(
             route_evidence.group, family
@@ -186,14 +192,21 @@ def exchange_row(
             if record.arrived.workload is not None
             else record.required
         )
-        local_experts = (
-            route_evidence.num_experts // family.group_size
-        )
-        route_flow = routed_flow_shape(mat, 
-            producer, evidence_state, local_experts, port
-        )
+        route_flow = routed_flow_shape(mat, producer, evidence_state, port)
         flow_in = route_flow
         flow_out = route_flow
+        # The payload is the rows AS DISPATCHED — one copy of each. A leg
+        # whose rows a layout gathered carries several copies of a row, and
+        # the fan-out counts destinations per TOKEN, so the two readings
+        # would multiply. No such leg exists (a gather inside the zone is
+        # its own collective and the exchange takes the rows back first),
+        # and this says so rather than silently pricing one.
+        if evidence_state.workload.row_replication != 1:
+            raise ValueError(
+                f"{mat._node(record.node).display_path}: a route exchange "
+                "moves the rows as dispatched; these carry "
+                f"{evidence_state.workload.row_replication} copies of each")
+        route_fanout = evidence_state.workload.fanout
     else:
         flow_in = local_shape(mat, producer, record.arrived, port)
         flow_out = local_shape(mat, producer, record.required, port)
@@ -210,36 +223,47 @@ def exchange_row(
         collective_out_shape=flow_out,
         flow_out_shape=flow_out,
         payload_shape=flow_in,
+        route_fanout=route_fanout,
         meta=meta,
         attribution_uid=anchor,
-        **({} if source_event is None else {
-            "source": None,
-            "source_event": source_event,
-            "tree_anchor_event": source_event,
-        }),
+        **_chained(source_event),
     )
 
 
-def _routed_flow(mat: Any, record: Redistribute, world: str,
-                 producer: int, port: str) -> Optional[List[Any]]:
-    """The one packed routed-row buffer every expert-zone collective moves.
+def _chained(source_event: Optional[str]) -> dict:
+    """The event fields of an ordered chain: the collective reads what the
+    earlier event handed out (`source_event`) in place of the producer's
+    value — `_event` checks the two are exclusive and anchors it. Nothing
+    for an unchained event."""
+    if source_event is None:
+        return {}
+    return {"source": None, "source_event": source_event}
 
-    Inside an expert-parallel routed zone, the EP exchange and an expert
-    tensor-parallel reduction read the same `ExpectedRoutedLoad` record
-    through `RoutedLaunch`; neither re-projects the routed tensor's
-    expert-major shape. Returning None means this event is not on that routed
-    zone and keeps the ordinary tensor projection.
+
+def _flows(mat: Any, record: Redistribute, producer: int,
+           port: str) -> Tuple[List[Any], List[Any]]:
+    """The buffer a collective takes in and hands out.
+
+    Inside a routed zone — both states carry routed-load evidence — that is
+    the packed routed-row buffer (`routed_flow_shape`), each side read off
+    its own state: a row gather grows it, a reduce_scatter (or the slice
+    after an all_reduce) shrinks it back to the rows as dispatched, and the
+    busiest rank's load and whole rows are read the same way on every
+    collective of the zone, whatever world it runs on. Outside a zone the
+    ordinary per-rank tensor. A collective with evidence on one side only
+    leaves or enters the zone without passing its boundary, and is refused.
     """
-    family = mat.analysis.rule.families.get(world)
-    workload = record.arrived.workload or record.required.workload
-    if family is None or workload is None or workload.group is None:
-        return None
-    state = (record.arrived if record.arrived.workload is not None
-             else record.required)
-    node = mat.analysis.program.by_uid(producer)
-    dispatch = mat.analysis.program.dispatch_of(node)
-    local_experts = mat.analysis.routed[dispatch].local_experts
-    return routed_flow_shape(mat, producer, state, local_experts, port)
+    arrived, required = record.arrived.workload, record.required.workload
+    if arrived is None and required is None:
+        return (local_shape(mat, producer, record.arrived, port),
+                local_shape(mat, producer, record.required, port))
+    if arrived is None or required is None:
+        raise ValueError(
+            f"{mat._node(record.node).display_path}: a collective carries "
+            "routed-load evidence on one side only — routed rows enter and "
+            "leave a zone only at its dispatch and combine")
+    return (routed_flow_shape(mat, producer, record.arrived, port),
+            routed_flow_shape(mat, producer, record.required, port))
 
 
 def _cross_replica_family(record: Redistribute, world: str):
@@ -253,16 +277,12 @@ def _cross_replica_family(record: Redistribute, world: str):
     return None
 
 
-def gather_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective:
+def gather_row(mat: Any, record: Redistribute, world: str, *,
+               source_event: Optional[str] = None) -> PhysicalCollective:
     """A whole-axis materialization: anchored at the consumer."""
     producer = record.producer if record.producer >= 0 else record.node
     port = flow_port(record.producer_port)
-    routed = _routed_flow(mat, record, world, producer, port)
-    if routed is not None:
-        flow_in = flow_out = routed
-    else:
-        flow_in = local_shape(mat, producer, record.arrived, port)
-        flow_out = local_shape(mat, producer, record.required, port)
+    flow_in, flow_out = _flows(mat, record, producer, port)
     dedup_key = None
     if record.site in (
         RedistributeSite.EDGE,
@@ -295,6 +315,7 @@ def gather_row(mat: Any, record: Redistribute, world: str) -> PhysicalCollective
         family=derived_family,
         dedup_key=dedup_key,
         count=mat._value_count(record),
+        **_chained(source_event),
     )
 
 def output_width(mat: Any, uid: int, payload: Any) -> Optional[float]:

@@ -20,7 +20,7 @@ import {
 import { visibleSpan, type DeclarationRow } from "../declarations";
 import { foldDepth, foldKey, hasFoldChildren, visibleFold } from "../moduleFold";
 import { completeTotal, coverageText, fmtMeasured, groupMeasured, partialCoverageText, phaseCoverage, rowMeasured, stateCounts, stateKeysText } from "../measured";
-import type { AbsorbedOp, Estimate, FusionDelta, ModuleFoldRow, Occurrence, OpTableTotal, PerOpRow, PhaseMetrics, RowBound, SourceBadge, SpeculativeDraftTerm } from "./ResultSummary";
+import type { AbsorbedOp, Estimate, FusionDelta, ModuleFoldRow, Occurrence, OpTableTotal, PerOpRow, PhaseMetrics, RowBound, SourceBadge, SpeculativeDraftTerm, WeightOperand } from "./ResultSummary";
 import { SourceAnchor } from "../SourceAnchor";
 
 /** The step a per-op table describes: a language-model phase, or an
@@ -36,15 +36,47 @@ function tensorList(v: unknown): string[] {
   return Array.isArray(v) && v.length && Array.isArray(v[0]) ? v.map((x) => fmtShape(x)) : [fmtShape(v)];
 }
 
-function ShapeFlow({ from, to }: { from: unknown; to?: unknown }) {
-  const side = (v: unknown) =>
+function Dtype({ dtype }: { dtype?: string | null }) {
+  return dtype ? <span className="ml-0.5 text-10 text-amber-700" data-dtype="">{dtype}</span> : null;
+}
+
+/** A stored tensor's short name: its module's last part and the tensor
+ *  (`o_proj.weight`), which tells a fused kernel's operands apart. */
+function weightLabel(name: string): string {
+  return name.split(".").slice(-2).join(".");
+}
+
+/** `from → to`, each tensor followed by its element dtype where the row
+ *  states one (`fromDtypes` / `toDtypes`, one per tensor), and the weights
+ *  the kernel streams beside its inputs, each named. */
+function ShapeFlow({ from, to, fromDtypes, toDtypes, weights }: {
+  from: unknown;
+  to?: unknown;
+  fromDtypes?: (string | null)[] | null;
+  toDtypes?: (string | null)[] | null;
+  weights?: WeightOperand[] | null;
+}) {
+  const plus = <span className="text-gray-400">+ </span>;
+  const side = (v: unknown, dtypes?: (string | null)[] | null) =>
     tensorList(v).map((t, i) => (
-      <span key={i}>{i > 0 ? <span className="text-gray-400">+ </span> : null}<span className="whitespace-nowrap">{t}</span>{" "}</span>
+      <span key={i}>
+        {i > 0 ? plus : null}
+        <span className="whitespace-nowrap">{t}<Dtype dtype={dtypes?.[i]} /></span>{" "}
+      </span>
     ));
+  const operands = (weights || []).map((w, i) => (
+    <span key={`w${i}`} data-weight="">
+      {plus}
+      <span className="whitespace-nowrap" title={w.name}>
+        <span className="text-gray-400">{weightLabel(w.name)}</span>{fmtShape(w.shape)}<Dtype dtype={w.dtype} />
+      </span>{" "}
+    </span>
+  ));
   return (
     <>
-      {side(from)}
-      {to !== undefined ? <><span className="text-gray-400">→ </span>{side(to)}</> : null}
+      {from != null ? side(from, fromDtypes) : null}
+      {operands}
+      {to !== undefined ? <><span className="text-gray-400">→ </span>{side(to, toDtypes)}</> : null}
     </>
   );
 }
@@ -123,6 +155,10 @@ function foldAsPerOp(row: ModuleFoldRow): PerOpRow {
     comm_bw_bytes_per_sec: row.comm_bw_bytes_per_sec,
     comm_phases: row.comm_phases,
     shape_outs: row.shape_outs,
+    input_dtypes: row.input_dtypes,
+    port_dtypes: row.port_dtypes,
+    output_dtype: row.output_dtype,
+    weights: row.weights,
     shape_in_full: row.shape_in_full,
     shape_out_full: row.shape_out_full,
     cut: row.cut,
@@ -273,9 +309,16 @@ function LeafOpRow({ row, target, phase, depth = 0, perLayer = 1, totals, measur
 }) {
   const div = perLayer > 1 ? perLayer : 1;
   const per = (v: number | null | undefined) => (v == null ? v : v / div);
-  const shapeText = row.shape_in != null && row.shape_out != null && row.shape_in !== row.shape_out
-    ? <ShapeFlow from={row.shape_in} to={row.shape_out} />
-    : <ShapeFlow from={row.shape_in ?? row.shape_out} />;
+  // The output is the one `shape_out`, else every port of a multi-output
+  // leaf (`shape_outs`, a list on per-op rows); each with its own dtype.
+  const ports = Array.isArray(row.shape_outs) && row.shape_outs.length ? row.shape_outs : null;
+  const out = row.shape_out ?? ports;
+  const outDtypes = row.shape_out != null ? [row.output_dtype ?? null] : row.port_dtypes;
+  const shapeText = row.shape_in != null && out != null
+    ? <ShapeFlow from={row.shape_in} to={out} fromDtypes={row.input_dtypes} toDtypes={outDtypes} weights={row.weights} />
+    : row.shape_in != null
+      ? <ShapeFlow from={row.shape_in} fromDtypes={row.input_dtypes} weights={row.weights} />
+      : <ShapeFlow from={out} fromDtypes={outDtypes} />;
   // Shape hover: the unsharded global form when TP/EP shards the per-rank
   // shape the cell shows, plus the outputs of a multi-output leaf. The
   // backend ships shape_outs in two forms: a list of shape lists (per-op

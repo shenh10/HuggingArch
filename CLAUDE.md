@@ -270,6 +270,8 @@ Component yaml / inline `blocks:` 里**不能出现 quant sibling tensor 名**�
 
 **Ruff 抓 bug 不抓风格**：gate 开 correctness 家族（`F, B, PLE, PLW, SIM, PERF, PIE, RUF`），纯审美族（`E / W / I / N / UP / COM`）刻意关闭。选用理由 + 本仓刻意约定的 ignore（中文注释 `RUF001-003`、FastAPI `Depends` 白名单等）都写在 `pyproject.toml` 的注释里；改规则前先读那段，别顺手加审美类。
 
+**门的范围是整个仓库**：三个 workflow 一律 `ruff check .`，不是 `ruff check backend/`。曾经只查 `backend/`，于是 `kernel_bench/`（生产代码）、`tools/`、`scripts/`、`tests/` 里的 18 条无人看见——包括 `rms_normalise` 定义了两遍、smoke 的两个 dim 用不同值声明了两遍（后一条静默胜出）。1215 个文件约 60 ms，没有理由再收窄。某条规则真的和某个目录的惯用法冲突时，写 `[tool.ruff.lint.per-file-ignores]` 并注明理由，**不要把目录排除在检查之外**——没人查的目录就是上次漏掉的那个。
+
 ### 5.5 测试
 
 - **测试目录镜像源码目录**：`backend/arch/eval/` 的测试在 `tests/backend/arch/eval/`，`kernel_bench/` 的在 `tests/kernel_bench/`，`web/` 的在 `tests/frontend/`。**改了 `<pkg>/` 就跑 `tests/<pkg>/`**，不用 grep 也不用记。唯一没有源码对应物的是 `tests/meta/` —— 那几个测的是仓库自身的规则（结构债、eval/service 边界、README 数字对不对）。`tests/` 自己是包（有 `__init__.py`），所以 `tests/backend/` 不会遮蔽真的 `backend`；共享 helper 在 `tests/snapshots.py` / `tests/corpus_row.py`（`from tests.snapshots import …`）。测试文件仍自带 `sys.path` 引导，可以单独 `python tests/backend/arch/eval/test_eval_flops.py` 跑。模块设计文档跟代码同目录（`backend/arch/DESIGN.md`、`backend/inference/DESIGN.md`）。

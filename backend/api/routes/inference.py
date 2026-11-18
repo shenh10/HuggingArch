@@ -608,16 +608,19 @@ async def inference_estimate_parallel_sweep(req: InferenceParallelSweepRequest,
                                             authorization: Optional[str] = Header(None)):
     """Deployment-scale sweep for the Scaling panel.
 
-    Holds model + context + batch fixed and sweeps the parallelism DEGREE
-    (EP for dp_ep/cp_ep/tp_ep, TP for tp_tp), one series per GPU type,
-    reporting PER-GPU throughput. `modes` batches several axes into one
-    process-pool pass (env resolved once). Each point is an independent
-    `estimate_capacity` (parallel is part of the seq-invariant preparation,
-    so there is no prelude reuse).
+    Holds model + batch fixed and sweeps the parallelism DEGREE (EP for
+    dp_ep/cp_ep/tp_ep, TP for tp_tp, each from one GPU), one series per GPU
+    type, at every context of `contexts`, reporting PER-GPU prefill
+    throughput. `modes` batches several axes into one process-pool pass (env
+    resolved once). Each deployment is one cell (parallel is part of the
+    seq-invariant preparation); inside it one walk per card class prices every
+    card and context. Decode is the sweep's decode point cloud, kept on the
+    server and read through `/inference/parallel-sweep/frontier`.
 
     One mode: `{"mode", "moe_enabled", "series": [...], "by_mode": {...}}`.
     Several modes: `{"moe_enabled", "modes", "by_mode": {mode: {series…}}}`.
-    EP modes on a dense model return an empty series.
+    A series' points name their `context`. EP modes on a dense model return
+    an empty series.
     """
     if not req.model_id:
         raise HTTPException(status_code=400, detail="model_id required")
@@ -652,17 +655,23 @@ async def inference_estimate_sweep_frontier(req: CompareFrontierRequest,
 async def inference_parallel_sweep_frontier(req: ParallelFrontierRequest,
                                             request: Request,
                                             authorization: Optional[str] = Header(None)):
-    """A decode Pareto frontier of the Scaling panel's parallel sweep: the
-    sweep's decode point cloud with some dimensions held to a set of values
-    (`fix`: cards, modes, GPU counts, batches) and the rest grouped into lines
-    (`group_by`), each line its Pareto front. The cloud is SOL only, so the
-    view reads the sweep's SOL answer (the panel's body with `sol_only`,
-    its cache entry); computes it on a miss."""
+    """A view of the Scaling panel's parallel sweep's throughput point
+    cloud: one `phase` of it (prefill or decode), some dimensions held to a
+    set of values (`fix`: cards, modes, GPU counts, contexts, batches) and
+    the rest grouped into lines (`group_by`), each line its Pareto front
+    (`form="frontier"`) or its points along `x` — GPU count, per-GPU decode
+    batch or context (`form="line"`).
+
+    The view reads the cache entry of the sweep BODY the caller posts and
+    computes no point of its own: a `sol_only` body is the SOL answer (what
+    the panel draws by default, and all a decode rung ever has), and the
+    panel's measured body is the measured answer, whose prefill carries the
+    measured track its fold wrote. Computed on a miss, as the sweep
+    endpoint would."""
     if not req.sweep.model_id:
         raise HTTPException(status_code=400, detail="model_id required")
-    sol = req.sweep.model_copy(update={"sol_only": True})
     req = req.model_copy(update={"sweep": await with_measurement_scope(
-        sol, request, authorization)})
+        req.sweep, request, authorization)})
     try:
         return await parallel_frontier_response(req)
     except IndivisibleHeadRepartition as e:

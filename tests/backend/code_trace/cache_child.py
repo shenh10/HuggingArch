@@ -83,7 +83,7 @@ def _point(model: str, entry: str) -> dict:
             assert response.status_code == 200, response.text
             out = response.json()
     blob = json.dumps({k: v for k, v in out.items()
-                       if k not in ("code_version", "decode_cloud")},
+                       if k not in ("code_version", "throughput_cloud")},
                       sort_keys=True, default=str)
     return {"trace": rec["trace"].to_json(),
             "result": hashlib.sha256(blob.encode()).hexdigest(),

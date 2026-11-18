@@ -18,7 +18,6 @@ from backend.arch.eval.analysis import TensorRow
 from backend.arch.eval.dim import (algebra, exact, require_equal,
                                    require_multiple, same_law, value_of)
 from backend.arch.eval.refusal import SpecRefusal
-from backend.arch.eval.routed import RoutedLaunch
 from backend.arch.eval.rule import Rule
 from backend.arch.eval.transition import InputRequirements, KernelGeometry
 from backend.arch.eval.values import Shape
@@ -40,7 +39,7 @@ from .foldlaw import (
     ReductionHomomorphism,
     may_defer_reduction,
 )
-from .groups import ProcessGroupFamily, same
+from .groups import ProcessGroupFamily, joint_components, same
 from .layout import (
     AxisLayout,
     Block,
@@ -53,7 +52,9 @@ from .layout import (
     Unknown,
     aligned,
     axis_fully_replicated,
+    block,
     physical_local_extent,
+    product,
     sharded,
 )
 from .resolver import families_for, layout_for_symbol, pipeline_family_for
@@ -72,7 +73,7 @@ from backend.arch.eval.storage import is_expert_axis
 from .persistent import STORED
 from .lower import cache_write_endpoint as _cache_write, lower_diff as _price
 from .persistent import physical_artifacts, resident_weights
-from .physical import (_output_state, local_dims, physical_shapes,
+from .physical import (physical_shapes,
                        rank_definitions)
 from .weight_endpoints import (
     PlacementContext,
@@ -455,28 +456,6 @@ class LayoutPropagation(Rule):
     def resident_weights(self, analysis: Any) -> Any:
         """The `eval.capacity.Weights` ledger of this rule's rank."""
         return resident_weights(physical_artifacts(analysis))
-
-    def routed(self, analysis: Any) -> Dict[int, RoutedLaunch]:
-        """Each dispatch's boundary at this rule's rank: its token operand
-        as the rank holds it and the buffer it writes there — the buffer's
-        rows the busiest rank's share of the routed-load evidence
-        (`ExpectedRoutedLoad`), exactly as the per-rank shapes read them
-        (`physical._local_dims`). A rule that distributes nothing records
-        no states, and its rank is the walk's: the identity answer."""
-        if self.is_trivial:
-            return super().routed(analysis)
-        out: Dict[int, RoutedLaunch] = {}
-        for uid, shape in analysis.shapes.values.items():
-            node = analysis.program.by_uid(uid)
-            if node is None or node.op != DISPATCH_OP:
-                continue
-            where = node.display_path
-            token = local_dims(shape.ins[0], analysis.input_states[(uid, 0)],
-                                self, f"{where}.in[0]")
-            buffer = local_dims(shape.out, _output_state(analysis, uid, "out"),
-                                 self, f"{where}.out")
-            out[uid] = RoutedLaunch.of(uid, token, buffer)
-        return out
 
     def _prepare_node(
         self,
@@ -919,13 +898,13 @@ class LayoutPropagation(Rule):
             group: Optional[ProcessGroupFamily]) -> bool:
         if group is None:
             return True
-        for owners in self._axis_owner_cells(axis):
+        for owners in self.axis_owner_cells(axis):
             for rank in owners:
                 if not frozenset(group.group_of(rank)) <= owners:
                     return False
         return True
 
-    def _axis_owner_cells(self, axis: AxisLayout) -> Tuple[frozenset, ...]:
+    def axis_owner_cells(self, axis: AxisLayout) -> Tuple[frozenset, ...]:
         """Owner sets for every structurally distinct shard of one axis.
 
         A Block pattern repeats over every group in its family, so one logical
@@ -945,14 +924,14 @@ class LayoutPropagation(Rule):
             return tuple(
                 owners
                 for _offset, _extent, child in axis.segments
-                for owners in self._axis_owner_cells(child))
+                for owners in self.axis_owner_cells(child))
         if isinstance(axis, Product):
             cells = (frozenset(axis.cuts[0].group.ranks()),)
             for cut in axis.cuts:
                 cells = tuple(
                     left & right
                     for left in cells
-                    for right in self._axis_owner_cells(cut)
+                    for right in self.axis_owner_cells(cut)
                     if left & right)
             return cells
         if isinstance(axis, Flattened):
@@ -961,7 +940,7 @@ class LayoutPropagation(Rule):
                 cells = tuple(
                     left & right
                     for left in cells
-                    for right in self._axis_owner_cells(factor)
+                    for right in self.axis_owner_cells(factor)
                     if left & right)
             return cells
         raise TypeError(axis)
@@ -984,30 +963,89 @@ class LayoutPropagation(Rule):
         return all(self._axis_group_invariant(axis, self.route_family)
                    for axis in token_state.layout[:2])
 
-    def route_preserved_cuts(
-            self, token_state: EdgeState) -> Tuple[Block, ...]:
-        """Static token cuts invariant inside a route group survive flatten."""
+    def routed_rows_layout(
+            self, token_state: EdgeState) -> Tuple[AxisLayout, int]:
+        """Where the dispatched rows live: the rows axis of the routed buffer
+        and how many distinct row shards it has.
+
+        The route all_to_all moves rows only inside a route group, so after it
+        a rank holds exactly the rows of the tokens some member of its route
+        group held — the token owner partition JOINED with the route groups.
+        A token cut is not kept or absorbed whole: the part of it that varies
+        inside a route group is absorbed (the exchange), the part that varies
+        across route groups survives (`dp_attention` = 8 under `ep_moe` = 2
+        keeps a 4-way row cut; `cp` orthogonal to `ep_moe` survives whole).
+
+        The surviving cut is a cut of the family whose coordinate fibers are
+        the route groups — the ranks holding the same experts' different
+        rows, the ones a later row gather runs over (`tp_moe_expert`). Without
+        expert parallelism nothing is exchanged and every static cut
+        survives as it arrived."""
         cuts: List[Block] = []
         for axis in token_state.layout[:2]:
             if isinstance(axis, Replicated):
                 continue
             if isinstance(axis, Block):
-                candidates = (axis,)
+                cuts.append(axis)
             elif isinstance(axis, Product):
-                candidates = axis.cuts
+                cuts.extend(axis.cuts)
             else:
                 raise ValueError(
                     "route token axes support only Replicated, Block, or "
                     f"Product layouts, got {axis!r}")
-            for cut in candidates:
-                if self._axis_group_invariant(cut, self.route_family):
-                    if cut.pad_to is not None:
-                        raise ValueError(
-                            "a padded token cut cannot be preserved on the "
-                            "routed-rows axis")
-                    cuts.append(cut)
-        return tuple(cuts)
+        if not cuts:
+            return self.replicated(), 1
+        owners = (frozenset(self.universe),)
+        for axis in token_state.layout[:2]:
+            owners = tuple(left & right for left in owners
+                           for right in self.axis_owner_cells(axis)
+                           if left & right)
+        route = self.route_family
+        blocks = list(owners)
+        if route is not None:
+            token_owners = ProcessGroupFamily(
+                id="token_owners",
+                groups=tuple(tuple(sorted(cell)) for cell in owners))
+            blocks = [frozenset(b) for b in
+                      joint_components((token_owners, route), self.universe)]
+        if len(blocks) == 1:
+            return self.replicated(), 1
+        if any(cut.pad_to is not None for cut in cuts):
+            raise ValueError(
+                "a padded token cut cannot be preserved on the "
+                "routed-rows axis")
+        if set(blocks) == set(owners):
+            # Nothing was absorbed: every cut survives as it arrived.
+            return product(cuts), len(blocks)
+        family = self._route_fiber_family(route)
+        cells = []
+        for members in blocks:
+            coords = frozenset(family.coordinate(r) for r in members)
+            if any(frozenset(g[c] for c in coords) != members & set(g)
+                   for g in family.groups):
+                raise AssertionError(
+                    f"rows held by {sorted(members)} are not a cut of "
+                    f"{family.id!r}")
+            cells.append(tuple(sorted(coords)))
+        return block(family, tuple(sorted(cells))), len(blocks)
 
+    def _route_fiber_family(
+            self, route: ProcessGroupFamily) -> ProcessGroupFamily:
+        """The registered world whose coordinates are the route groups: its
+        c-th group takes the c-th member of every route group. Membership
+        names it (`groups.same`), so its events carry that world's name."""
+        fibers = ProcessGroupFamily(
+            id=route.id + "^fiber",
+            groups=tuple(
+                tuple(g[c] for g in sorted(route.groups))
+                for c in range(route.group_size)))
+        for family in (self.families or {}).values():
+            if same(family, fibers):
+                return family
+        raise ValueError(
+            f"a token cut survives the {route.id!r} exchange across route "
+            f"groups, and no world spans the route groups' fibers "
+            f"{fibers.groups!r} to hold it")
 
     def _validate_routed_state(self, node: Any, state: EdgeState,
                                shape: Optional[Sequence[Any]]) -> None:

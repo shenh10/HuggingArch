@@ -682,6 +682,15 @@
   },
   {
     "identifiers": [
+      "XiaomiMiMo__MiMo-V2-Flash",
+      "meta-llama__Llama-3.2-3B"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_parallel_sweep.py",
+    "name": "_ORACLE_CASES"
+  },
+  {
+    "identifiers": [
       "deepseek-ai__DeepSeek-V3.json",
       "meta-llama__Llama-3.2-3B.json"
     ],
@@ -867,6 +876,25 @@
     "kind": "curated",
     "module": "tests/backend/inference/test_precision_launch_selection.py",
     "name": "_PACK_STEMS"
+  },
+  {
+    "identifiers": [
+      "Qwen/Qwen3-30B-A3B",
+      "deepseek-ai/DeepSeek-V3"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_route_dedup_oracle.py",
+    "name": "CROSS_NODE"
+  },
+  {
+    "identifiers": [
+      "Qwen/Qwen3-30B-A3B",
+      "deepseek-ai/DeepSeek-V3",
+      "moonshotai/Kimi-K2.5"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_route_dedup_oracle.py",
+    "name": "ONE_NODE"
   },
   {
     "identifiers": [

@@ -1,9 +1,11 @@
 """ProcessGroupFamily — a world resolved to explicit process-group members.
 
-The layout algebra asks every group question by membership, never by name:
-`alias_map`'s normalization is `same`, `contains` is `refines`, and the
-partial-overlap case that today has no answer gets one (`overlaps`) that
-lowering must either plan for or reject aloud. A family is a few hundred
+The layout algebra asks every group question by membership, never by name
+or by stride arithmetic: two worlds over the same ranks are `same`, one
+whose groups lie inside another's `refines` it, and the partial-overlap
+case gets a name (`overlaps`) that lowering must either plan for or reject
+aloud. These are the only statements of those relations — the mesh hands
+over spans (`mesh.spans`) and nothing else. A family is a few hundred
 integers per deployment — smaller than the model graph — and is built
 once per deployment and cached by the caller.
 

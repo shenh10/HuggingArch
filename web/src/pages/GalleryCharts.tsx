@@ -423,7 +423,11 @@ export function KvBarChart({
   );
 }
 
-/** One point of a decode Pareto frontier (`/gallery/frontier`). */
+/** One point of a Pareto frontier (`/gallery/frontier`,
+ *  `/inference/parallel-sweep/frontier`). The decode rates are the fields a
+ *  point has carried since the cloud had one phase; a point that also
+ *  prices prefill carries that phase's pair under its own names, and the
+ *  chart is told which pair to draw (`FrontierAxes`). */
 export type FrontierPt = {
   tok_s_per_user: number;
   tok_s_per_gpu: number;
@@ -443,6 +447,28 @@ export type FrontierPt = {
   tpot_partial_s?: number | null;
   partial_measured_share?: number | null;
 };
+
+/** Which fields of a point a frontier is drawn from, per track: the rate
+ *  one request sees and the rate per GPU. The backend names them with every
+ *  view it serves (`frontier.AXES`), so no page restates the vocabulary;
+ *  the Gallery draws decode and passes nothing. */
+export type FrontierAxes = {
+  sol: [string, string];
+  measured?: [string, string] | null;
+  partial?: [string, string] | null;
+};
+
+const DECODE_AXES: FrontierAxes = {
+  sol: ["tok_s_per_user", "tok_s_per_gpu"],
+  measured: ["tok_s_per_user_measured", "tok_s_per_gpu_measured"],
+  partial: ["tok_s_per_user_partial", "tok_s_per_gpu_partial"],
+};
+
+/** A point's value on one of its axes; NaN-free: absent reads as null. */
+function at(p: FrontierPt, field: string): number | null {
+  const v = (p as unknown as Record<string, unknown>)[field];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
 
 export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
   key: string;
@@ -464,12 +490,22 @@ export type FrontierSeries<P extends FrontierPt = FrontierPt> = {
  *  Log on both axes — twenty models span decades on each. */
 export function FrontierChart<P extends FrontierPt = FrontierPt>({
   title, subtitle, series, controls, height = 480, empty = "no curve", stale, footer,
-  onPoint, bare,
+  onPoint, bare, axes = DECODE_AXES,
+  xTitle = "Interactivity (tok/s per user)",
+  yTitle = "Output throughput (tok/s per GPU)",
+  hover,
 }: {
   title: string;
   subtitle?: string;
   series: FrontierSeries<P>[];
   controls?: ReactNode;
+  /** The fields each track is drawn from; decode's by default. */
+  axes?: FrontierAxes;
+  xTitle?: string;
+  yTitle?: string;
+  /** The line of hover text under the series name, in place of the decode
+   *  one (batch · TPOT). */
+  hover?: (p: P) => string;
   height?: number;
   empty?: ReactNode;
   stale?: ReactNode;
@@ -482,15 +518,19 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
   bare?: boolean;
 }) {
   const [box, width] = useWidth<HTMLDivElement>();
-  const drawn = series.filter((s) => s.points.length);
-  const head = (
+  const drawn = series.filter(
+    (s) => s.points.some((p) => at(p, axes.sol[0]) != null
+      && at(p, axes.sol[1]) != null));
+  // A caller that draws its own header (the Scaling panel: one header for
+  // every form of its section) passes neither, and gets no empty row.
+  const head = title || controls ? (
     <div className="flex flex-wrap items-baseline justify-between gap-2 mb-1">
       {bare
         ? <div className="text-sm font-medium text-gray-800">{title}</div>
         : <h2 className="text-base font-semibold text-gray-800">{title}</h2>}
       {controls}
     </div>
-  );
+  ) : null;
   const shell = bare ? "mb-6" : "card p-5 mb-6";
   const staleNote = stale
     ? <div className="g-stale-note text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2">{stale}</div>
@@ -520,6 +560,9 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
   });
   const perUser = (n: number) => `${fmtCompact(n)} tok/s/user`;
   const perGpu = (n: number) => `${fmtCompact(n)} tok/s/GPU`;
+  const [xField, yField] = axes.sol;
+  const xOf = (p: FrontierPt) => at(p, xField) ?? 0;
+  const yOf = (p: FrontierPt) => at(p, yField) ?? 0;
   // Linear axes from zero: both rates are non-negative, and a shared zero
   // keeps the gaps between curves proportional to the rates themselves.
   const linearSpan = {
@@ -550,15 +593,17 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         const lines = [
           `<b>${escapeHtml(s.full || s.label)}</b>`,
           escapeHtml(`${p.num_gpus}×GPU · ${p.layout}`),
-          `batch ${p.batch ?? "—"} / GPU${p.concurrent_requests != null ? ` · ${p.concurrent_requests} concurrent` : ""} · TPOT ${(p.tpot_s * 1000).toPrecision(3)} ms`,
-          `${perUser(p.tok_s_per_user)} · ${perGpu(p.tok_s_per_gpu)}`,
+          escapeHtml(hover ? hover(p)
+            : `batch ${p.batch ?? "—"} / GPU${p.concurrent_requests != null ? ` · ${p.concurrent_requests} concurrent` : ""} · TPOT ${(p.tpot_s * 1000).toPrecision(3)} ms`),
+          `${perUser(xOf(p))} · ${perGpu(yOf(p))}`,
         ];
-        if (p.tok_s_per_user_measured != null && p.tok_s_per_gpu_measured != null) {
-          lines.push(`measured ${perUser(p.tok_s_per_user_measured)} · ${perGpu(p.tok_s_per_gpu_measured)}`);
-        }
-        if (p.tok_s_per_user_partial != null && p.tok_s_per_gpu_partial != null) {
-          const share = p.partial_measured_share;
-          lines.push(`partial measured ${perUser(p.tok_s_per_user_partial)} · ${perGpu(p.tok_s_per_gpu_partial)}`
+        for (const [name, pair] of [["measured", axes.measured],
+                                    ["partial measured", axes.partial]] as const) {
+          const u = pair ? at(p, pair[0]) : null;
+          const g = pair ? at(p, pair[1]) : null;
+          if (u == null || g == null) continue;
+          const share = name === "partial measured" ? p.partial_measured_share : null;
+          lines.push(`${name} ${perUser(u)} · ${perGpu(g)}`
             + (share != null ? ` (${(share * 100).toFixed(0)}% of time measured)` : ""));
         }
         return lines.join("<br/>");
@@ -566,11 +611,11 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
     },
     legend: legendOpts(drawn.map((s) => s.label)),
     xAxis: {
-      ...axis("value", "Interactivity (tok/s per user)", fmtCompact, 28), ...linearSpan,
+      ...axis("value", xTitle, fmtCompact, 28), ...linearSpan,
       axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
     },
     yAxis: {
-      ...axis("value", "Output throughput (tok/s per GPU)", fmtCompact, 52), ...linearSpan,
+      ...axis("value", yTitle, fmtCompact, 52), ...linearSpan,
       axisLabel: { ...AXIS.axisLabel, formatter: (v: string | number) => fmtCompact(Number(v)), showMinLabel: true, showMaxLabel: false },
     },
     series: [
@@ -579,10 +624,11 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         name: s.label,
         // The best layout is named where it changes along the curve;
         // hovering a curve names every point.
-        data: [...s.points]
-          .sort((a, b) => a.tok_s_per_user - b.tok_s_per_user)
+        data: s.points
+          .filter((p) => at(p, xField) != null && at(p, yField) != null)
+          .sort((a, b) => xOf(a) - xOf(b))
           .map((p, i, sorted) => ({
-            value: [p.tok_s_per_user, p.tok_s_per_gpu],
+            value: [xOf(p), yOf(p)],
             pt: p,
             label: { show: i === 0 || sorted[i - 1].layout !== p.layout },
           })),
@@ -601,19 +647,17 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         emphasis: { focus: "series" as const, label: { show: true } },
       })),
       ...drawn.flatMap((s) => {
-        const pts = (s.measured || []).filter(
-          (p) => p.tok_s_per_user_measured != null && p.tok_s_per_gpu_measured != null,
+        const pair = axes.measured;
+        const pts = !pair ? [] : (s.measured || []).filter(
+          (p) => at(p, pair[0]) != null && at(p, pair[1]) != null,
         );
-        if (!pts.length) return [];
+        if (!pair || !pts.length) return [];
         return [{
           type: "line" as const,
           name: s.label,
           data: [...pts]
-            .sort((a, b) => (a.tok_s_per_user_measured ?? 0) - (b.tok_s_per_user_measured ?? 0))
-            .map((p) => ({
-              value: [p.tok_s_per_user_measured, p.tok_s_per_gpu_measured],
-              pt: p,
-            })),
+            .sort((a, b) => (at(a, pair[0]) ?? 0) - (at(b, pair[0]) ?? 0))
+            .map((p) => ({ value: [at(p, pair[0]), at(p, pair[1])], pt: p })),
           showSymbol: true,
           symbolSize: 5,
           lineStyle: { width: 1.4, type: "dashed" as const, color: s.color },
@@ -621,19 +665,17 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
         }];
       }),
       ...drawn.flatMap((s) => {
-        const pts = (s.partial || []).filter(
-          (p) => p.tok_s_per_user_partial != null && p.tok_s_per_gpu_partial != null,
+        const pair = axes.partial;
+        const pts = !pair ? [] : (s.partial || []).filter(
+          (p) => at(p, pair[0]) != null && at(p, pair[1]) != null,
         );
-        if (!pts.length) return [];
+        if (!pair || !pts.length) return [];
         return [{
           type: "line" as const,
           name: s.label,
           data: [...pts]
-            .sort((a, b) => (a.tok_s_per_user_partial ?? 0) - (b.tok_s_per_user_partial ?? 0))
-            .map((p) => ({
-              value: [p.tok_s_per_user_partial, p.tok_s_per_gpu_partial],
-              pt: p,
-            })),
+            .sort((a, b) => (at(a, pair[0]) ?? 0) - (at(b, pair[0]) ?? 0))
+            .map((p) => ({ value: [at(p, pair[0]), at(p, pair[1])], pt: p })),
           showSymbol: true,
           symbol: "triangle",
           symbolSize: 5,
@@ -643,11 +685,13 @@ export function FrontierChart<P extends FrontierPt = FrontierPt>({
       }),
       // The name rides the most interactive end, as LineChart's end labels.
       ...drawn.map((s) => {
-        const last = s.points.reduce((a, b) => (b.tok_s_per_user > a.tok_s_per_user ? b : a));
+        const last = s.points
+          .filter((p) => at(p, xField) != null && at(p, yField) != null)
+          .reduce((a, b) => (xOf(b) > xOf(a) ? b : a));
         return {
           type: "scatter" as const,
           name: s.label,
-          data: [{ value: [last.tok_s_per_user, last.tok_s_per_gpu], name: s.label, itemStyle: { color: s.color } }],
+          data: [{ value: [xOf(last), yOf(last)], name: s.label, itemStyle: { color: s.color } }],
           symbolSize: 6,
           label: {
             show: true,

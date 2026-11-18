@@ -1013,7 +1013,7 @@ def _flashmla_fp8_operands(inv, inputs):
     read (`cache_seqlens`)."""
     import torch
     q, c = inputs["q"], inputs["c"]
-    B, Sq, N, Dqk = q.shape
+    B, _Sq, _N, Dqk = q.shape
     Lq = c.shape[1]
     page = resolve_kv_block_size(inv, _FLASHMLA_BLOCK_SIZES)
     blocks_per_seq = -(-Lq // page)
@@ -1040,7 +1040,7 @@ def _vllm_flashmla_fp8_build(inv, env, inputs) -> BenchCase:
     _require_cuda()
     from vllm.v1.attention.ops.flashmla import (
         flash_mla_with_kvcache_fp8, get_mla_metadata_dense_fp8)
-    B, Sq, N, _ = inputs["q"].shape
+    _B, Sq, N, _ = inputs["q"].shape
     ops = _flashmla_fp8_operands(inv, inputs)
     meta, splits = get_mla_metadata_dense_fp8(ops["cache_seqlens"], Sq * N, 1)
     return BenchCase(

@@ -2556,8 +2556,15 @@ class TestGroupedGemmMoE:
                   and Fraction(j["launch_rows_exact"]) < j["launch_rows"]]
         assert padded, ("the zone is not padded at this point, so this "
                         "proves nothing", dropped)
-        a2a = [j for j in jobs if j["signature"] == "all_to_all"]
+        # The routed exchange's own signature: a dispatch sends a token once
+        # per distinct destination its top-k reaches, so its per-peer split
+        # is ragged and it is not the flat `all_to_all` cell
+        # (`benchmark_identity.resolve_op`, selected by the row's own
+        # `comm_route_fanout`).
+        a2a = [j for j in jobs if j["signature"] == "routed_all_to_all"]
         assert a2a, dropped
+        assert not [j for j in jobs if j["signature"] == "all_to_all"], (
+            "a routed exchange must not key as the flat one", dropped)
         for job in a2a:
             assert not job["moe_block_member"], job["node_spec_id"]
             assert job["launch_rows"] == Fraction(job["launch_rows_exact"]), (

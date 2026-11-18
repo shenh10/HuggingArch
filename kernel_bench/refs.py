@@ -636,7 +636,7 @@ def _delta_rule_reference(inputs: Dict[str, Any]) -> Any:
     """
     q, k, v = inputs["q"].float(), inputs["k"].float(), inputs["v"].float()
     g, beta = inputs["g"].float(), inputs["beta"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -734,7 +734,7 @@ def gdn_gates(a, b, A_log, dt_bias):
 
 def _gdn_decode_reference(inputs: Dict[str, Any]) -> Any:
     q = inputs["q"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -872,7 +872,7 @@ def kda_bounded_gates(f, b, A_log, dt_bias, lower_bound):
 
 def _kda_decode_reference(inputs: Dict[str, Any]) -> Any:
     q = inputs["q"].float()
-    B, T = q.shape[0], q.shape[1]
+    T = q.shape[1]
     _refuse_unaffordable_scan(
         "delta-rule", steps=T,
         elements=inputs["v"].numel() + inputs["initial_state"].numel())
@@ -1114,7 +1114,7 @@ def _ssd_scan(x, dt, A, B, C, D, dt_bias):
 
 def _mamba2_scan_reference(inputs: Dict[str, Any]) -> Any:
     x = inputs["x"].float()
-    B, T = x.shape[0], x.shape[1]
+    T = x.shape[1]
     _refuse_unaffordable_scan(
         "mamba2", steps=T,
         elements=x.numel() + inputs["B"].numel() + inputs["C"].numel())
@@ -1452,7 +1452,8 @@ register_ref("rmsnorm_gated",
 
 def rms_normalise(x: Any, w: Any, eps: float) -> Any:
     """`x · rsqrt(mean(x²) + eps) · w` over the last axis, in fp32 — the
-    one RMSNorm the fused-norm oracles below compose (`w=None`: no gain)."""
+    one RMSNorm every oracle below composes, fused-norm and fused-span
+    alike (`w=None`: no gain)."""
     import torch
     x = x.float()
     y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
@@ -2739,7 +2740,6 @@ def _qk_mrope_reference(inputs: Dict[str, Any]) -> Any:
     half = int(inputs["d_rope"]) // 2
     lane = _mrope_axis(inputs["sections"], bool(inputs["interleaved"])
                        ).to(pos.device)
-    cols = torch.arange(half, device=pos.device)
 
     def gather(table):
         streams = torch.stack([table.index_select(0, pos[axis])
@@ -4257,15 +4257,6 @@ register_ref("fused_inv_rope",
 #     that `kv` slot.
 # ---------------------------------------------------------------------------
 
-def rms_normalise(x: Any, w: Any, eps: float) -> Any:
-    """`x · rsqrt(mean(x²) + eps) · w` over the last axis, in fp32 — the
-    one RMSNorm the fused-span oracles compose (`w=None`: no gain)."""
-    import torch
-    x = x.float()
-    y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return y if w is None else y * w.float()
-
-
 def _boundary_positions(tokens: int, compress_ratio: int, device: str,
                         batch: int = 1) -> Any:
     """The position of each pooled row's closing token, `(i+1)·ratio − 1`,
@@ -5253,6 +5244,16 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     provider reads, the way `allreduce_fused_rmsnorm` already passes its
     group.
 
+    A ROUTED exchange (`routed_all_to_all`) states three more scalars: the
+    top-k picks, the destinations they are drawn from and the ones that hold
+    weights. They change no shape either, and they are what makes the
+    launch the ragged one its cell names — how many distinct destinations a
+    token goes to, and so what the per-peer split is. A provider that
+    builds the split lists for a DeepEP dispatch reads them; without them it
+    could only build the flat equal split, which is the OTHER cell. Passed
+    for whichever of them the signature's cell declares, so the flat
+    exchange's inputs do not change.
+
     No oracle. On one process every one of these collectives is the
     identity, so an oracle here would agree with a provider that never
     communicated — which is exactly how a fused all-reduce once
@@ -5261,12 +5262,22 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     """
     import torch
     dims = _dims(inv)
-    return {
+    out = {
         "payload": torch.randn(*_shape(inv, "payload"),
                                dtype=_dtype(inv.dtype), device=device, generator=gen),
         "n_comm_ranks": int(dims["n_comm_ranks"]),
         "n_comm_stride": int(dims["n_comm_stride"]),
     }
+    # Only what this signature's cell declares: the flat exchange's inputs
+    # must not so much as LOOK at a routing axis, or every collective would
+    # read dims its cell does not have
+    # (`test_cell_dims_are_what_the_reference_reads`).
+    from backend.inference.op_signatures import get_signature
+    cell = getattr(get_signature(inv.signature), "cell_dims", ())
+    for axis in ("n_experts_active", "n_route_targets", "n_route_experts"):
+        if axis in cell:
+            out[axis] = int(dims[axis])
+    return out
 
 
 # Which signatures those are is the catalog's own declaration — the

@@ -253,6 +253,42 @@ class PlanPoint:
                 "rho": self.ep_load_factor}
 
 
+@dataclass(frozen=True)
+class _Forward:
+    """One forward a step runs, beside the point THAT forward runs at.
+
+    A step is not one forward. A speculative step runs the target's verify
+    forward over K + 1 positions and, when the deployment drafts with the
+    model's own graph, the draft's forwards — and a recursive draft forward
+    is one token per sequence whatever K the step verifies
+    (`SpeculativeDraft.forward_width`). So a cell's forwards are not all
+    read at the step's point: each is read at its own, which is why a
+    forward carries where to ask for it rather than leaving its reader to
+    assume the step's point answers every walk in the step. (The estimate
+    has carried the same pairing all along — `walk_of_rows` names each walk
+    and keys its rows off `walk.workload`.) Assuming it answered all of
+    them keyed the draft's rows at the verify's width and, once a plan
+    asked more than one width of one cell, made the whole cell unreadable:
+    `batch_sweep.rows_at` refuses a row walked with a count as a number (a
+    verify width of 1) at another value of it.
+    """
+
+    analysis: Any
+    #: The draft this forward belongs to (`SpeculativeDraft`), or None for
+    #: the step's own forward — the one the point names directly.
+    draft: Optional[Any] = None
+
+    def point(self, step: PlanPoint) -> PlanPoint:
+        """The point this forward runs at when the step runs at `step`: the
+        step's own, except that a draft forward runs over the tokens its
+        style drafts per forward and not the step's verify width (the step
+        verifies K + 1 positions; K is `s_verify - 1`)."""
+        if self.draft is None:
+            return step
+        return replace(step, s_verify=self.draft.forward_width(
+            step.s_verify - 1))
+
+
 def _prefill_chunk_provenance(endpoint_index: int, chunk: Any) -> Dict[str, Any]:
     endpoint = chunk.endpoint
     return {
@@ -475,6 +511,8 @@ def _build_jobs_over_points(
     # point's context at the largest batch any point asks there.
     if not points:
         raise ValueError("a plan names at least one point")
+    from backend.arch.eval.program import Program
+    from backend.inference.speculative_draft import SpeculativeDraft
     from backend.inference.step_eval import evaluate_step
     from backend.inference.step_eval import prefix_refusal
     profile = (precision if isinstance(precision, PrecisionProfile)
@@ -482,13 +520,14 @@ def _build_jobs_over_points(
     shared = shared_walk_cells(resolved, parallel, profile, model_id=model_id)
     resolved = shared.resolved
     cells = shared.cells
+    program = Program.of(resolved)
 
-    def _analyze_cell(point: PlanPoint) -> List[List[Any]]:
+    def _analyze_cell(point: PlanPoint) -> List[List[_Forward]]:
         if phase == "encode":
             return [_encode_results(point.batch)]
         return _step_results(point)
 
-    def _encode_results(batch_size: int) -> List[Any]:
+    def _encode_results(batch_size: int) -> List[_Forward]:
         # Each encoder over the stated media, in its own encode phase: the
         # shapes its kernels run at grow from the media's axes.
         if not media:
@@ -502,7 +541,7 @@ def _build_jobs_over_points(
         stacks = sorted({entry.stack for name, entry
                          in program.model_inputs.items()
                          if name in media and entry.stack is not None})
-        return [analyze(
+        return [_Forward(analyze(
             resolved, parallel=parallel, framework_binding=binding,
             batch_size=batch_size, phase=phase,
             step_eval=evaluate_encode(resolved, parallel, stack=stack,
@@ -512,9 +551,9 @@ def _build_jobs_over_points(
             precision=precision,
             gpu=card,
             breakdown=False,
-        ) for stack in stacks]
+        )) for stack in stacks]
 
-    def _step_results(point: PlanPoint) -> List[List[Any]]:
+    def _step_results(point: PlanPoint) -> List[List[_Forward]]:
         if point.s_verify > 1 and phase != "decode":
             raise ValueError(
                 "a speculative verify width belongs to a decode step; pass "
@@ -524,16 +563,18 @@ def _build_jobs_over_points(
                                  s_prefix_cached=point.s_prefix_cached)
         if refusal is not None:
             raise ValueError(refusal)
-        draft = None
-        if point.s_verify > 1:
-            from backend.arch.eval.program import Program
-            from backend.inference.speculative_draft import SpeculativeDraft
-            draft = SpeculativeDraft.of(
-                Program.of(resolved), style="recursive",
-                draft_tokens=point.s_verify - 1)
+        # Which draft forwards a step of this model at this width runs is the
+        # draft's own statement, not a reading of the width: a step verifies
+        # K + 1 positions against whatever proposed them, and a model with no
+        # draft graph proposes with none of its own (`drafted_by` answers
+        # None — K = 0 included). The style is the default serving path's,
+        # vLLM's MTP proposer, which is recursive; a request that names
+        # another one is the estimate's to refuse, not a condition key here.
+        draft = SpeculativeDraft.drafted_by(
+            program, style="recursive", draft_tokens=point.s_verify - 1)
 
-        def at_stage(stage: Optional[int]) -> Any:
-            return analyze(
+        def at_stage(stage: Optional[int]) -> _Forward:
+            return _Forward(analyze(
                 resolved, parallel=parallel, framework_binding=binding,
                 batch_size=point.batch,
                 # Every stage reads the one walk of the cell (`StepCells`).
@@ -565,12 +606,10 @@ def _build_jobs_over_points(
                 precision=precision,
                 gpu=card,
                 breakdown=False,
-            )
+            ))
 
-        def draft_analysis() -> Any:
-            if draft is None:
-                raise ValueError("internal error: no draft to walk")
-            return analyze(
+        def draft_forward() -> _Forward:
+            return _Forward(analyze(
                 resolved, parallel=parallel, framework_binding=binding,
                 batch_size=point.batch,
                 step_eval=draft.step(
@@ -589,7 +628,7 @@ def _build_jobs_over_points(
                 precision=precision,
                 gpu=card,
                 breakdown=False,
-            )
+            ), draft)
 
         # One rank per pipeline stage. A per-layer kernel's `count_per_step`
         # is then the layers THIS rank holds — 15 or 16 of DeepSeek-V3's 61
@@ -599,12 +638,18 @@ def _build_jobs_over_points(
         # parallel signature carries `pp`, so the rows got their own key and
         # were found, with numbers no rank runs) and by a factor that grows
         # with pp.
-        if parallel.pp > 1:
-            ranks = [[at_stage(s)] for s in range(parallel.pp)]
-            ranks[-1].append(draft_analysis())
-            return ranks
-        return [[at_stage(None), draft_analysis()]] if draft is not None else [
-            [at_stage(None)]]
+        #
+        # The draft's forwards go on the rank that runs its stack — the last
+        # stage, which is also the whole model when there is no pipeline —
+        # and there are none to add when this step drafts nothing. Both
+        # facts are read here once: a per-pipeline branch that re-decided
+        # whether a draft exists is how the pp path came to ask for one on
+        # every step.
+        stages = list(range(parallel.pp)) if parallel.pp > 1 else [None]
+        ranks = [[at_stage(stage)] for stage in stages]
+        if draft is not None:
+            ranks[-1].append(draft_forward())
+        return ranks
 
 
     # Per-rank shapes come from analyze's own rows: its walk applies the
@@ -668,8 +713,7 @@ def _build_jobs_over_points(
             s_prefix_cached=point.s_prefix_cached,
             s_verify=point.s_verify)["s_query"]))
 
-    def _jobs_from(results: List[Tuple[Any, List[Dict[str, Any]]]],
-                   step_seq: int
+    def _jobs_from(results: List[Tuple[Any, List[Dict[str, Any]], int]]
                    ) -> Tuple[List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
                               List[str], List[Dict[str, Any]]]:
         """Jobs for one rank at one batch, from each analysis and the per-op
@@ -709,7 +753,7 @@ def _build_jobs_over_points(
         # estimate's measured overlay — see `calibration_overlay.point_keys`.
         # It refuses (`NoShapeLaw`) a measurable row re-read at a batch its
         # walk stated no shape law for.
-        for ar, rows in results:
+        for ar, rows, step_seq in results:
             workload = WorkloadShape.of_walk(ar, seq_len=step_seq)
             # The rows keyed at each page the plan measures at. A row whose
             # kernel reads no paged cache keys alike under every page and is
@@ -1041,14 +1085,15 @@ def _build_jobs_over_points(
                     }))
         return jobs, dropped, unplaced
 
-    def _jobs_over_ranks(ranks: List[List[Any]], rows_of: Any,
-                         step_seq: int
+    def _jobs_over_ranks(ranks: List[List[_Forward]], rows_of: Any,
+                         step_seq: Any
                  ) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
         """`_jobs_from` for each rank of the deployment, folded back into one
-        job per launch."""
-        per_rank = [_jobs_from([(ar, rows_of(ar)) for ar in analyses],
-                               step_seq)
-                    for analyses in ranks]
+        job per launch. Each forward of a rank is read, and its workload
+        stated, at the point THAT forward runs at (`_Forward.point`)."""
+        per_rank = [_jobs_from([(fw.analysis, rows_of(fw), step_seq(fw))
+                                for fw in forwards])
+                    for forwards in ranks]
         dropped: List[str] = []
         unplaced: List[Dict[str, Any]] = []
         said: Set[str] = set()
@@ -1129,7 +1174,12 @@ def _read_group(points, _analyze_cell, _jobs_over_ranks, _step_seq, parallel,
     walk is symbolic, so caller order was never allowed to change its meaning;
     making the anchor canonical also keeps two callers from splitting the same
     walk family by their input order. A point the deployment refuses before the
-    walk contributes its own dropped note and does not become the anchor."""
+    walk contributes its own dropped note and does not become the anchor.
+
+    A cell's forwards are read each at the point it runs at (`_Forward`), so a
+    step whose forwards are not all at the step's point — a speculative step,
+    whose draft forwards run at the draft's own width — is read as the walks
+    it is, not as one."""
     from backend.arch.eval.analysis import Point
     from backend.inference.batch_sweep import rows_at
     from backend.inference.comm_cost import Fabric
@@ -1169,30 +1219,45 @@ def _read_group(points, _analyze_cell, _jobs_over_ranks, _step_seq, parallel,
         if walked is None:
             raise RuntimeError(
                 "a point was admitted after the walk found no anchor")
-        if point == anchor:
-            out[point] = _jobs_over_ranks(walked, lambda ar: ar.per_op_timing,
-                                          _step_seq(point))
-            continue
-        if phase != "encode":
+        if point != anchor and phase != "encode":
             refusal = prefix_refusal(parallel, phase=phase,
                                      input_tokens=point.seq_len,
                                      s_prefix_cached=point.s_prefix_cached)
             if refusal is not None:
                 raise ValueError(refusal)
-        at = Point(point.counts(phase))
-        for analyses in walked:
-            for ar in analyses:
-                at.admit(ar)
+        # Each forward of the cell is read at the point IT runs at — the
+        # step's own, except a draft forward's (`_Forward.point`) — and only
+        # where that is not the point its walk ran at. So there is one
+        # reading per distinct forward point, not one for the cell: a step's
+        # verify forward moves to this point's verify width while the
+        # recursive draft forward beside it stays the one-token walk it is at
+        # every width, and reading that one at the verify's width is refused
+        # (`batch_sweep.rows_at`).
+        reading: Dict[PlanPoint, Any] = {}
+        for forwards in walked:
+            for fw in forwards:
+                read_at = fw.point(point)
+                if read_at == fw.point(anchor):
+                    continue
+                at = reading.get(read_at)
+                if at is None:
+                    at = reading[read_at] = Point(read_at.counts(phase))
+                at.admit(fw.analysis)
+
         # The rows at the point, read off the walk's laws: the plan keys
         # kernels by the rows' shapes and prices nothing, so on no card and
         # no fabric.
+        def rows_of(fw, reading=reading, point=point):
+            at = reading.get(fw.point(point))
+            if at is None:
+                return fw.analysis.per_op_timing
+            return rows_at(fw.analysis.per_op_timing, at, cell=fw.analysis,
+                           peak_flops=None, peak_bw=None,
+                           fabric=Fabric(None, None, None), breakdown=False)
+
         out[point] = _jobs_over_ranks(
-            walked,
-            lambda ar, at=at: rows_at(
-                ar.per_op_timing, at, cell=ar,
-                peak_flops=None, peak_bw=None,
-                fabric=Fabric(None, None, None), breakdown=False),
-            _step_seq(point))
+            walked, rows_of,
+            lambda fw, point=point: _step_seq(fw.point(point)))
     return out
 
 

@@ -68,6 +68,24 @@ Re-keyed rows are counted `rekeyed` (slots dropped), `rekeyed_output`
 (slots dropped, the filler `output` replaced where it was, and the record
 the provider declares added).
 
+What this does NOT migrate, and why: the routed MoE exchange's cell. A
+dispatch now keys as `routed_all_to_all` with three routing axes in its
+shape (`benchmark_identity._collective_identity`), so a row measured under
+the flat `all_to_all` cell is under a key nobody asks for — the same
+situation as the dtype slots above. Two reasons it is not here. It is not
+this migration's SHAPE: every rewrite above changes `dtype_env_json`, one
+column, in one `UPDATE`, while this one changes `op` and `shape_json`,
+which are INPUT KEY columns (`service/bench/store._INPUT_COLUMNS`) whose
+hash is `input_id` — so it would have to register new inputs under
+`inputs_lock()`, remap `input_id` on the measurement rows and refresh the
+derived annotations. And it has no subjects: the lake holds 4,436,047
+measurement rows and NOT ONE of them is any bare collective (no
+`all_to_all`, `all_reduce`, `all_gather`, `reduce_scatter` or `send_recv`
+row, and none whose `kernel_impl` names an exchange or DeepEP), because no
+provider serves one — the fused all-reduce is the only collective anyone
+has measured. The first routed-exchange row will be written after a
+provider exists, i.e. already under the new cell.
+
 Which plans: the model as shipped and, for each plain weight dtype the old
 rows were stored at, every weight at that dtype — a BF16 run of an FP8
 checkpoint was a BF16 kernel, and its leaves are keyed as the BF16 profile

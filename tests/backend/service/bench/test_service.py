@@ -451,6 +451,7 @@ def test_the_service_serves_without_torch(tmp_path):
     answers lookups, and never loads torch (it grew the process from ~73 to
     ~540 MiB for its whole life)."""
     import subprocess
+    import os
     import sys
     from pathlib import Path
     root = Path(__file__).resolve().parents[4]
@@ -479,6 +480,14 @@ print("torch" in sys.modules)
            "BENCH_LAKE_DATA": str(tmp_path / "l" / "data"), "BENCH_LAKE_LEASE": "off",
            "BENCH_LAKE_BACKUP": "off", "HUGGINGARCH_BENCH_MAINTENANCE": "off",
            "PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}
+    # A fresh HOME also means a fresh DuckDB extension directory. Preserve
+    # only the standard proxy transport, when this checkout needs one, so
+    # ICU/DuckLake can autoload without handing the child the parent process's
+    # otherwise-unbounded environment.
+    env.update({name: os.environ[name] for name in (
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "no_proxy",
+    ) if os.environ.get(name)})
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=env, timeout=300, check=False)
     assert out.returncode == 0, out.stderr[-3000:]

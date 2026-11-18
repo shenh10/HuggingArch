@@ -240,8 +240,17 @@ quantises inside the dispatch kernel (vLLM `prepare_finalize/deepep_ll.py`,
 and the graph **over-bills** that launch (T·K reads at activation width, T·K
 writes at record width). Where it has one, the cast still runs for the shared
 expert while the dispatch reads the wide tokens, so the graph **under-bills**
-the dispatch read by T·K × (activation width − record width). Wire bytes are
-correct in both cases.
+the dispatch read by T·K × (activation width − record width).
+
+Wire bytes are not correct in this mode either, and in the other direction:
+low latency sends a token once per EXPERT it picked to keep the kernel
+dispatch-free, while the graph prices the deduped dispatch — one send per
+distinct destination — so the exchange is **under-billed** by up to 1.51x at
+top-8 ([cost model](inference_cost_model.md#the-moe-exchange-sends-a-token-once-per-destination):
+0.579 of the payload against the 0.875 a per-pick send moves at EP 8).
+That is the modelled form's own assumption, not an oversight — the graph
+prices the better implementation — and it matters here because sglang's
+`--deepep-mode` defaults to `auto`, which selects low latency for DECODE.
 
 **Fix.** A fusion plan that takes the cast, the permute and the exchange into
 one DeepEP dispatch launch, with a binding conditioned on the all-to-all

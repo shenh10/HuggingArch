@@ -53,7 +53,8 @@ class TestBorrowedTermsAddOnce(unittest.TestCase):
             shapes=SimpleNamespace(values={}),
             formats=SimpleNamespace(values={}),
             resolved_precision=precision,
-            program=program)
+            program=program,
+            local_tensors=lambda: iter(()))
         layer = SimpleNamespace(values={uid: Traffic(
             weight_reads=100, metadata_reads=10,
             borrowed_weight_reads=7, borrowed_metadata_reads=3)})

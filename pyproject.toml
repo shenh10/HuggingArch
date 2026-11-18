@@ -83,12 +83,24 @@ dev-dependencies = [
 # default-arg (B008), redefined loop vars (PLW2901), implicit Optional in
 # signatures (RUF013), plus dead imports/vars (F401/F841).
 #
+# Scope: the whole repository (`ruff check .` in all three workflows). It used
+# to be `ruff check backend/`, so the gate measured one package and said
+# nothing about the rest — `kernel_bench/` (production code: the
+# measured-kernel producer), `tools/`, `scripts/` and `tests/`. 18 findings
+# had collected there unseen, among them a `rms_normalise` defined twice and
+# two smoke-cell dims declared twice with different values (the second
+# silently winning). 1,215 files, ~60 ms; nobody should ever want a narrower
+# spelling. A rule that genuinely fights an idiom of one directory gets a
+# `[tool.ruff.lint.per-file-ignores]` entry with its reason stated (there are
+# none today — widening needed no exemption), never an excluded directory: an
+# unchecked directory is how this happened the first time.
+#
 # Pure-aesthetic families stay OFF on purpose — line length (E501), import
 # order (I), trailing commas (COM), whitespace (W), naming (N, which would
 # fight our deliberate math notation N/D/Sq/Lq/TP). They'd bury the signal
 # under thousands of taste-only diffs. Modernization (UP: PEP-585/604) is
-# also kept out of the gate — it's ~2.3k mechanical rewrites; run
-# `ruff check backend --select UP --fix` as a standalone one-shot if the team
+# also kept out of the gate — ~2.3k mechanical rewrites in `backend/` alone;
+# run `ruff check . --select UP --fix` as a standalone one-shot if the team
 # wants it, don't fold churn of that size into a bug gate.
 #
 # The original motivating bug: a missing `from collections import Counter` in

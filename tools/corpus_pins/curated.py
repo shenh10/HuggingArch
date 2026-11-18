@@ -276,6 +276,30 @@ CURATED_OUT_OF_SCOPE: Tuple[CuratedSet, ...] = (
                'mesh, a compressed window, a hybrid, and decode; a new model '
                'is held to the equivalence by the default case and the '
                'engine, not by this list'),
+    CuratedSet('tests/backend/inference/test_parallel_sweep.py',
+               '_ORACLE_CASES',
+               'three (model, cards, layout, context, card) tuples whose '
+               'cloud point is checked against its own Context x Batch '
+               'walk: one priced on the card it was walked on, one '
+               'restamped onto another card of its class at a context the '
+               'walk was not taken at, and one under pp=4 where the card '
+               'checked is not the walk card; not a corpus sweep '
+               '(registered with the branch that folded it into the '
+               'manifest, a9d78a4de added the list)'),
+    CuratedSet('tests/backend/inference/test_route_dedup_oracle.py',
+               'ONE_NODE',
+               'route groups that fit inside one node, where the whole '
+               'exchange is the one inside it: a dense-MoE pair and one '
+               'beside an unrouted Ulysses exchange on the same world; a '
+               'new model is held to the simulation by the engine, not by '
+               'this list'),
+    CuratedSet('tests/backend/inference/test_route_dedup_oracle.py',
+               'CROSS_NODE',
+               'route groups that span nodes, one per thing that can change '
+               'how one is PLACED — a card whose nodes hold four GPUs, four '
+               'nodes of eight, and a group spaced by expert tensor '
+               'parallelism; kept apart from the one-node list because the '
+               'partition across fabrics is only a claim here'),
     CuratedSet('tests/backend/inference/test_scaling_payload.py', '_GOLDEN',
                'four deployments whose Scaling payload is held to its pinned '
                'bytes point by point — an expert mesh, a dense model, a '
@@ -537,6 +561,12 @@ PARAMETERS: Tuple[Parameter, ...] = (
     Parameter("tests/backend/inference/test_sol_surface_golden.py", "pytestmark",
               "the seconds one measurement of the whole corpus is given, a "
               "property of what the surface costs to take, not a model's value"),
+    Parameter("tests/backend/inference/test_row_roofline.py",
+              "TestAWithheldStepStaysWithheld.WALKED_CONTEXT",
+              "the request length at which that deployment's KV leaves no "
+              "room for one request — a chosen request size, not a measured "
+              "value (registered with the branch that folded the module's "
+              "literals into the manifest; a9d78a4de added it)"),
     Parameter("tests/backend/inference/test_capacity_golden.py", "_REL_TOL", _TOL),
     Parameter("tests/backend/inference/test_capacity_golden.py", "_SEQS", _REQUEST),
     Parameter("tests/backend/inference/test_activation_peak_parallel.py", "SEQ", _REQUEST),

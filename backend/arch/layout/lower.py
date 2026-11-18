@@ -34,7 +34,7 @@ def lower_diff(rule: Any, arrived: EdgeState, required: EdgeState, *,
             f"lower_diff across ranks {len(arrived.layout)} != "
             f"{len(required.layout)}")
 
-    exclusive = reduce_scatter(arrived, required)
+    exclusive = reduce_scatter(rule, arrived, required)
     if exclusive is not None:
         return exclusive
 
@@ -67,9 +67,19 @@ def lower_diff(rule: Any, arrived: EdgeState, required: EdgeState, *,
     return tuple(out)
 
 def reduce_scatter(
-        arrived: EdgeState, required: EdgeState
+        rule: Any, arrived: EdgeState, required: EdgeState
         ) -> Optional[Tuple[Tuple[str, str], ...]]:
-    """SUM finalize that is also the unique Replicated→Block of that group."""
+    """A SUM finalize whose one layout change cuts a whole axis exactly the
+    way a reduce_scatter over the reducing group leaves it.
+
+    A reduce_scatter over group family G hands member i of every group the
+    i-th shard, so the cut it produces is the one whose owner cells are G's
+    coordinate fibers. The target is recognised by those owner cells —
+    membership — not by how it is spelled: a Block of G itself, a Block of a
+    family with the same fibers, or a Product of cuts that together own them
+    (`cp` x `dp_attention` over the ranks of `tp_moe_expert`). Owner cells
+    are compared as sets, so the match holds up to which shard index a cell
+    carries — a relabelling of the shards, which moves no bytes."""
     if arrived.value is None or required.value is not None:
         return None
     if arrived.value.reducer != SUM:
@@ -84,10 +94,14 @@ def reduce_scatter(
     if len(changed) != 1:
         return None
     got, need = changed[0]
-    if not (isinstance(got, Replicated) and isinstance(need, Block)
-            and need.is_sharded_on(arrived.value.group)):
+    group = arrived.value.group
+    if not (isinstance(got, Replicated) and isinstance(need, (Block, Product))
+            and group.group_size > 1):
         return None
-    return ((arrived.value.group.id, "reduce_scatter"),)
+    if set(rule.axis_owner_cells(need)) \
+            != set(rule.axis_owner_cells(sharded(group))):
+        return None
+    return ((group.id, "reduce_scatter"),)
 
 def finalize_value(
         arrived: EdgeState, required: EdgeState
@@ -131,20 +145,25 @@ def axis_collective(rule: Any, got: AxisLayout, need: AxisLayout, arrived: EdgeS
         return (cross_replica_family(
             got.group, got.replica_cells).id, "all_gather")
     if isinstance(need, Replicated) and isinstance(got, Product):
+        # One gather over the family whose coordinate fibers are the
+        # product's owner cells — membership names it (as sets: up to a
+        # relabelling of the shards, which moves no bytes). Families with the
+        # same members are one group; inside a routed zone the expert-TP
+        # name is the world's, as for a Block above.
+        cells = set(rule.axis_owner_cells(got))
+        worlds = [family for family in rule.families.values()
+                  if set(rule.axis_owner_cells(sharded(family))) == cells]
         expert_tp = rule.families.get("tp_moe_expert")
-        if (arrived.workload is not None and expert_tp is not None
-                and all(cut.group.ranks() <= expert_tp.ranks()
-                        for cut in got.cuts)
-                and frozenset().union(*(cut.group.ranks()
-                                        for cut in got.cuts))
-                    == expert_tp.ranks()):
+        if arrived.workload is not None and expert_tp in worlds:
             return (expert_tp.id, "all_gather")
+        if worlds and all(same(family, worlds[0]) for family in worlds):
+            return (worlds[0].id, "all_gather")
     if isinstance(need, Replicated) and isinstance(got, Segmented):
         return segmented_gather(got)
     # Every rank already holds every position — a Replicated axis, or a
     # concat's Segmented record whose every segment is replicated — so a cut
     # is a free local slice.
-    if axis_fully_replicated(got) and isinstance(need, Block):
+    if axis_fully_replicated(got) and isinstance(need, (Block, Product)):
         return None
     if added_cut(got, need) is not None:
         return None

@@ -265,6 +265,7 @@ class _Session:
                 stage.rows(self.program.included_stack_names(
                     include_aux=True)))
         self._event_seq = 0
+        self._emitted: Dict[str, PhysicalCollective] = {}
         self._node_order = {
             node.uid: index for index, node in enumerate(self.program.nodes())
         }
@@ -414,6 +415,7 @@ class _Session:
         payload_dtype_bytes: Optional[float] = None,
         post_transform: PostTransform = PostTransform.NONE,
         binding_gap: Optional[LogicalBindingGap] = None,
+        route_fanout: Optional[Any] = None,
         meta: Tuple[Tuple[str, Any], ...] = (),
         source: Any = _DEFAULT_SOURCE,
         source_event: Optional[str] = None,
@@ -461,7 +463,7 @@ class _Session:
         # The emitter's typed payload is the one source: the integer shape
         # above and the bytes below are both its value (`payload_fields`).
         payload = payload_fields(op, group_size, count, payload_shape,
-                                 dtype_bytes)
+                                 dtype_bytes, fanout=route_fanout)
         resolved_site = record_site if site is None else site
         if not isinstance(resolved_site, RedistributeSite):
             raise TypeError(f"event {event_id} has invalid site {resolved_site!r}")
@@ -475,16 +477,32 @@ class _Session:
             raise TypeError(
                 f"event {event_id} has invalid flow source {resolved_source!r}"
             )
-        return PhysicalCollective(
+        resolved_placement_uid = (default_placement_uid
+                                  if placement_uid is None else placement_uid)
+        resolved_placement = (default_placement
+                              if placement is None else placement)
+        if tree_anchor_event is None and source_event is not None:
+            # A chained event stands under the event it reads where both
+            # stand at one placement (the combine's reduction, then its
+            # exchange); one at its own consumer (the gather after the
+            # dispatch's exit exchange) stands there.
+            earlier = self._emitted.get(source_event)
+            if earlier is None:
+                raise ValueError(
+                    f"event {event_id} reads {source_event!r}, which was "
+                    "not emitted before it")
+            if (earlier.placement_uid == resolved_placement_uid
+                    and earlier.placement == resolved_placement):
+                tree_anchor_event = source_event
+        event = PhysicalCollective(
             event_id=event_id,
             site=resolved_site,
             op=op,
             source=resolved_source,
             source_event=source_event,
             rewrites=default_rewrites if rewrites is None else rewrites,
-            placement_uid=(default_placement_uid
-                           if placement_uid is None else placement_uid),
-            placement=default_placement if placement is None else placement,
+            placement_uid=resolved_placement_uid,
+            placement=resolved_placement,
             attribution_uid=(anchor_uid
                              if attribution_uid is None else attribution_uid),
             report_anchor_uid=anchor_uid,
@@ -510,9 +528,12 @@ class _Session:
             ),
             post_transform=post_transform,
             binding_gap=binding_gap,
+            route_fanout=route_fanout,
             meta=meta,
             dedup_key=dedup_key,
         )
+        self._emitted[event_id] = event
+        return event
 
     def _payload_symbols(
         self,
@@ -541,6 +562,7 @@ class _Session:
     def events(self) -> List[PhysicalCollective]:
         """Lower records, coalescing one SSA finalize without losing targets."""
         self._event_seq = 0
+        self._emitted: Dict[str, PhysicalCollective] = {}
         raw: List[PhysicalCollective] = []
         terminal_events: Dict[int, str] = {}
         indices_by_identity = {
@@ -716,15 +738,18 @@ class _Session:
                     f"lowering for collective {name!r} "
                     f"(record {record.collectives!r})"
                 )
-            if source_event is not None and name != "all_to_all":
+            if source_event is not None and builder is send_row:
                 raise ValueError(
-                    f"{self._node(record.node).display_path}: an ordered "
-                    f"transition to {name!r} has no chained lowering")
-            if name == "all_to_all":
-                out.append(exchange_row(
-                    self, record, world, source_event=source_event))
-            else:
+                    f"{self._node(record.node).display_path}: a pipeline "
+                    "hop has no ordered-chain lowering")
+            if builder is send_row:
                 out.append(builder(self, record, world))
+            else:
+                # An ordered chain reads what the earlier event handed out;
+                # `_event` checks source/source_event exclusivity and anchors
+                # it after that event, for every collective alike.
+                out.append(builder(self, record, world,
+                                   source_event=source_event))
         return out
 
     def _family_size(self, label: str) -> int:

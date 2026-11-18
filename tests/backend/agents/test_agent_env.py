@@ -7,6 +7,8 @@ import sys
 import threading
 from unittest import mock
 
+import httpx
+
 from backend.agents.claude import ClaudeBackend
 from backend.agents.codex import CodexBackend
 from backend.agents.kimi import KimiBackend
@@ -497,28 +499,64 @@ def test_runner_kimi_repair_resume_keeps_leaf_cwd(tmp_path, monkeypatch):
                for e in events if e.get("type") == "log")
 
 
-def test_kimi_byok_env_passes_through_as_kimi_model_family(tmp_path, monkeypatch):
-    """The BYOK overlay is already named KIMI_MODEL_* (AGENT_ENV_VARS) and
-    reaches the child env verbatim."""
-    captured = {}
-    fake_proc = mock.Mock()
-    fake_proc.stdin = mock.Mock()
+_KIMI_BYOK = {"KIMI_MODEL_API_KEY": "sk-u", "KIMI_MODEL_BASE_URL": "https://api.example/v1",
+              "KIMI_MODEL_NAME": "kimi-user-model"}
+
+
+def _kimi_child_env(env, models):
+    """The env a Kimi spawn hands its child, with the endpoint's `/models`
+    answering `models` (a listing, or an exception to raise). Returns the env
+    and the `/models` requests made."""
+    captured, requests = {}, []
 
     def fake_popen(cmd, **kwargs):
-        captured["cmd"] = cmd
         captured["kwargs"] = kwargs
-        return fake_proc
+        return mock.Mock()
 
-    with mock.patch("backend.agents.kimi.subprocess.Popen", side_effect=fake_popen):
-        KimiBackend().spawn(
-            "prompt",
-            env={"KIMI_MODEL_API_KEY": "sk-u", "KIMI_MODEL_BASE_URL": "https://api.example/v1",
-                 "KIMI_MODEL_NAME": "kimi-user-model"},
-        )
-    env = captured["kwargs"]["env"]
+    def fake_get(url, **kwargs):
+        requests.append((url, kwargs["headers"]["Authorization"]))
+        if isinstance(models, Exception):
+            raise models
+        return mock.Mock(raise_for_status=lambda: None,
+                         json=lambda: {"data": models})
+
+    with mock.patch("backend.agents.kimi.subprocess.Popen", side_effect=fake_popen), \
+            mock.patch("backend.agents.kimi.httpx.get", side_effect=fake_get):
+        KimiBackend().spawn("prompt", env=env)
+    return captured["kwargs"]["env"], requests
+
+
+def test_kimi_byok_env_passes_through_as_kimi_model_family():
+    """The BYOK overlay is already named KIMI_MODEL_* (AGENT_ENV_VARS) and
+    reaches the child env verbatim."""
+    env, _ = _kimi_child_env(_KIMI_BYOK, [])
     assert env["KIMI_MODEL_NAME"] == "kimi-user-model"
     assert env["KIMI_MODEL_API_KEY"] == "sk-u"
     assert env["KIMI_MODEL_BASE_URL"] == "https://api.example/v1"
+
+
+def test_a_kimi_model_runs_with_the_window_its_endpoint_lists():
+    """kimi-code assumes 262144 tokens for a model named by KIMI_MODEL_NAME;
+    k3 has 1048576, and a review compacting at a quarter of it restarted
+    from scratch and ran out of time."""
+    env, requests = _kimi_child_env(_KIMI_BYOK, [
+        {"id": "kimi-user-model-256k", "context_length": 262144},
+        {"id": "kimi-user-model", "context_length": 1048576}])
+    assert env["KIMI_MODEL_MAX_CONTEXT_SIZE"] == "1048576"
+    assert requests == [("https://api.example/v1/models", "Bearer sk-u")]
+
+
+def test_a_kimi_window_the_endpoint_does_not_give_is_not_invented():
+    unlisted, _ = _kimi_child_env(_KIMI_BYOK, [{"id": "other", "context_length": 8192}])
+    down, _ = _kimi_child_env(_KIMI_BYOK, httpx.ConnectError("down"))
+    assert "KIMI_MODEL_MAX_CONTEXT_SIZE" not in unlisted
+    assert "KIMI_MODEL_MAX_CONTEXT_SIZE" not in down
+
+
+def test_a_kimi_window_set_by_hand_is_kept_and_not_looked_up():
+    env, requests = _kimi_child_env({**_KIMI_BYOK, "KIMI_MODEL_MAX_CONTEXT_SIZE": "500000"},
+                                    [{"id": "kimi-user-model", "context_length": 1048576}])
+    assert env["KIMI_MODEL_MAX_CONTEXT_SIZE"] == "500000" and requests == []
 
 
 def test_host_run_in_a_private_home_without_credentials_is_refused(monkeypatch, tmp_path):

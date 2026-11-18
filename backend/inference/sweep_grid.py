@@ -92,16 +92,26 @@ SCALING_BATCH_GRID: List[Dict[str, Any]] = [
     {"key": "max", "prefill_batch_size": 1, "decode_batch_size": None},
 ]
 
+# What the Scaling panel's Context × Batch body still asks of that grid now
+# that its decode chart is a view of the parallel sweep's cloud: one request
+# (the prefill-vs-context chart) and each card's KV-bound ceiling (the KV
+# storage chart) — the rungs whose decode batch is one request or the
+# ceiling. Compare keeps the whole grid.
+SCALING_PANEL_BATCH_GRID: List[Dict[str, Any]] = [
+    bp for bp in SCALING_BATCH_GRID if bp["decode_batch_size"] in (1, None)
+]
+
 # The curated context subset: every other decade. The Gallery renders an
 # N-model matrix at it, and the Scaling dropdown offers it. 64K is not on the
 # measured grid, so no page may offer it until a campaign adds the measurement.
 CURATED_CONTEXTS: Tuple[int, ...] = (1024, 4096, 16384, 131072, 1048576)
 GALLERY_SEQ_LENS: List[int] = list(CURATED_CONTEXTS)
 
-# The Scaling panel's context dropdown. The panel reads it from
-# `/inference/defaults`, and the warm job (backend.api.warm --sweeps) reads it
-# here, so a warmed entry lands on the exact key a first visitor's POST
-# produces.
+# The Scaling panel's context dropdown (the Prefill-vs-GPUs chart's context
+# and the Throughput section's default context hold). The panel reads it from
+# `/inference/defaults`. Not a request axis: the parallel sweep prices every
+# context of `ROUTINE_SEQ_LENS` in one request, so the dropdown picks a slice
+# of an answer it already has.
 SCALING_CONTEXTS: List[int] = list(CURATED_CONTEXTS)
 
 # The largest deployment the parallel sweep enumerates: degrees are powers of
@@ -294,11 +304,9 @@ AUDIT_PARALLEL: Dict[str, int] = {"ep_moe": 8, "dp_attention": 8}
 #: capability 9.0, B200/GB200 at 10.0, B300 at 10.3 — so a model is walked
 #: three times for the six cards (`parallel_sweep.class_cards`).
 #:
-#: Deliberately NOT the sweep series (`parallel_sweep.DEFAULT_SWEEP_GPUS`),
-#: which also carries RTX-4090: the 4090 is the card Kernel Bench measures
-#: on, so the Scaling panel and the estimate pages keep it — its measured
-#: rows are the comparison against theory and the coverage counts on it —
-#: while the Gallery, which publishes serving frontiers, does not offer it.
+#: Deliberately NOT the sweep series (`parallel_sweep.DEFAULT_SWEEP_GPUS`,
+#: every card of the sheet — the RTX-4090 Kernel Bench measures on among
+#: them): the Gallery publishes serving frontiers for this curated set.
 GALLERY_GPUS: List[str] = ["H20", "H100-SXM", "H200", "B200", "B300", "GB200"]
 
 # Parallel presets `web/src/gallery/axes.json` still ships

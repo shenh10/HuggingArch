@@ -12,11 +12,12 @@ projection.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Sequence
+from typing import Any, Dict, Iterator, Optional, Sequence
 
 from ..ops import DISPATCH_OP
 from .capacity import UnpricedTensor, Weights
 from .routed import RoutedLaunch
+from .storage import is_expert_axis
 from .values import Extent
 
 
@@ -140,15 +141,48 @@ class Rule:
                        buffers=buffers, by_stack=by_stack, by_uid=by_uid)
 
     def routed(self, analysis: Any) -> Dict[int, RoutedLaunch]:
-        """Each dispatch's boundary on the rank (`RoutedLaunch`), by the
-        dispatch's uid: read off its own token operand and the buffer it
-        writes — the walk's shapes, which are the rank's when nothing is
-        distributed. `LayoutPropagation` reads the same two tensors at its
-        rank."""
+        """Each leaf on a MoE routed buffer, by uid, and the launch it
+        runs on the rank (`RoutedLaunch`): its dispatch's token operand, and
+        the routed buffer the leaf itself is handed — its first input with
+        an expert axis (`storage.is_expert_axis`), or, for the dispatch,
+        the buffer it writes. Each leaf reads its own tensor, so rows a
+        layout gathered inside the zone are the rows that leaf launches.
+
+        The tensors are found on the walk's shapes (an axis's identity) and
+        read at the rank on the one per-rank projection
+        (`Analysis.physical_shapes`, the walk's own shapes where nothing is
+        distributed), at the same positions — so this record and every
+        per-rank shape reader see one number."""
+        program = analysis.program
+        shapes = analysis.shapes.values
+        rank = analysis.physical_shapes().values
         out: Dict[int, RoutedLaunch] = {}
-        for uid, shape in analysis.shapes.values.items():
-            node = analysis.program.by_uid(uid)
-            if node is None or node.op != DISPATCH_OP:
+
+        def expert_axis(dims: Any) -> Optional[int]:
+            return next((axis for axis, extent in enumerate(dims or ())
+                         if is_expert_axis(extent)), None)
+
+        for uid, shape in shapes.items():
+            node = program.by_uid(uid)
+            if node is None or node.children:
                 continue
-            out[uid] = RoutedLaunch.of(uid, shape.ins[0], shape.out)
+            dispatch = program.dispatch_of(node)
+            if dispatch is None or dispatch not in shapes:
+                continue
+            if node.op == DISPATCH_OP:
+                axis, buffer = expert_axis(shape.out), rank[uid].out
+            else:
+                index = next((i for i, dims in enumerate(shape.ins)
+                              if expert_axis(dims) is not None), None)
+                if index is None:
+                    continue
+                axis = expert_axis(shape.ins[index])
+                buffer = rank[uid].ins[index]
+            if axis is None:
+                raise ValueError(
+                    f"{node.display_path}: the dispatch writes no buffer "
+                    "with an expert axis")
+            out[uid] = RoutedLaunch.of(dispatch, rank[dispatch].ins[0],
+                                       buffer, axis,
+                                       where=node.display_path)
         return out

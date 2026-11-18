@@ -155,6 +155,37 @@ class Deployment:
 ROW_LISTS = ("per_op_timing", "per_op_timing_decode", "per_op_timing_draft")
 
 
+#: The context a parity layout walks BEFORE the one it is asked for.
+#: A sweep prices many contexts off few walks: the first context of a
+#: stage takes the walk and every later one substitutes its length into
+#: that walk's laws (`capacity.ContextAnchors.at`, `own` False). Asked for
+#: one context only, the oracle compares the anchor walk itself and never
+#: prices a substitution — the mechanism every swept point past the first
+#: context stands on, and the one this harness exists to hold to a direct
+#: estimate (CLAUDE.md §1.5: cross-point repricing is compared row for
+#: row, not by `t_sol` alone).
+WARM_UP_CONTEXT = 512
+
+
+def layout_at(payload: Mapping[str, Any], *,
+              warm_up: int = WARM_UP_CONTEXT) -> Dict[str, dict]:
+    """`parallel_sweep._estimate_layout` at the context a direct estimate's
+    arguments name (`avg_input_tokens`), read off a walk taken at ANOTHER
+    context (`warm_up`, priced first): `{card: entry}`, each
+    `{"context", "sol", "measures", "ladder"}` (or the card's error).
+
+    So the entry compared is a substituted point, which is what a swept
+    point is. `warm_up=<the asked-for context>` asks for the anchor walk
+    itself, for a caller that wants to compare that."""
+    from backend.inference import parallel_sweep as ps
+    want = int(payload["avg_input_tokens"])
+    body = {k: v for k, v in payload.items() if k != "avg_input_tokens"}
+    contexts = [int(warm_up), want] if int(warm_up) != want else [want]
+    out = ps._estimate_layout({**body, "contexts": contexts})
+    at = contexts.index(want)
+    return {card: entries[at] for card, entries in out.items()}
+
+
 def response_cell(book: Any = None) -> Any:
     """The walk a response's rows are read off, as `batch_sweep.rows_at`
     and `phase_at` take it (`cell`): their laws, read back off their text

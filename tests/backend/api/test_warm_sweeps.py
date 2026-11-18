@@ -26,7 +26,6 @@ from backend.inference.sol_pool import SolPool
 from tests.snapshots import snapshot_config
 
 MODEL = "Qwen/Qwen3-30B-A3B"  # MoE → EP modes produce real series; bf16 weights
-CTX = 4096
 
 
 @pytest.fixture
@@ -66,11 +65,11 @@ def isolated(monkeypatch, tmp_path):
         cells = ()
 
         @classmethod
-        def of(cls, *, modes, context_len, batch, gpu_skus, base_env,
+        def of(cls, *, modes, contexts, batch, gpu_skus, base_env,
                ep_load_factor=1.0):
             calls["n"] += 1
             plan = cls()
-            plan.modes, plan.context_len = list(modes), context_len
+            plan.modes, plan.contexts = list(modes), list(contexts)
             return plan
 
         def measurement(self):
@@ -78,7 +77,7 @@ def isolated(monkeypatch, tmp_path):
 
         def assemble(self, results):
             return {"results": ["marker"], "modes": self.modes,
-                    "context_len": self.context_len}
+                    "contexts": self.contexts}
 
     monkeypatch.setattr(sweep_rt, "ParallelSweepPlan", _FakeParallelPlan)
 
@@ -101,7 +100,7 @@ def isolated(monkeypatch, tmp_path):
                 return {"max": [{"marker": "batch"} for _ in self.seq_lens]}
             return [{"marker": "kv"} for _ in self.seq_lens]
 
-        def decode_cloud(self, results):
+        def throughput_cloud(self, results):
             return []
 
     monkeypatch.setattr(sweep_rt, "CapacitySweepPlan", _FakeCapacityPlan)
@@ -109,18 +108,20 @@ def isolated(monkeypatch, tmp_path):
     return inf, warm, calls
 
 
-def _frontend_first_visitor_body(model_id: str, context_len: int) -> dict:
+def _frontend_first_visitor_body(model_id: str) -> dict:
     """The literal SOL POST body the Scaling panel sends on first load — mirrored
     from web/src/pages/ScalingPanel.tsx (fetch body) + Inference.tsx (seeded
     defaults: frac 0.9, selection 'envelope', and Plan's output length
     `outTok` = 256, the routine grid's; precision as shipped, which the panel sends as no
-    `precision` at all). The panel does NOT send gpu_skus;
+    `precision` at all). Its contexts are the routine grid (`SWEEP_SEQ_LENS`),
+    whichever context its dropdown shows. The panel does NOT send gpu_skus;
     framework defaults to '' → not sent. gpu_sku is a real SKU but is dropped
     from the parallel key."""
     return {
         "model_id": model_id,
         "gpu_sku": "H100-SXM",
-        "context_len": context_len,
+        "contexts": [1024, 2048, 4096, 8192, 16384, 32768, 131072, 262144,
+                     1048576],
         "modes": ["dp_ep", "cp_ep", "tp_ep", "tp_tp"],
         "gpu_memory_fraction": 0.9,
         "avg_output_tokens": 256,
@@ -133,13 +134,13 @@ def _frontend_batch_body(model_id: str, gpu: str, mode: str, degree: int) -> dic
     """Literal Context × Batch SOL POST from ScalingPanel.tsx + compare.ts grids."""
     from backend.inference.sweep_grid import (
         ROUTINE_SEQ_LENS,
-        SCALING_BATCH_GRID,
+        SCALING_PANEL_BATCH_GRID,
     )
     return {
         "model_id": model_id,
         "gpu_sku": gpu,
         "seq_lens": list(ROUTINE_SEQ_LENS),
-        "batch_grid": [dict(bp) for bp in SCALING_BATCH_GRID],
+        "batch_grid": [dict(bp) for bp in SCALING_PANEL_BATCH_GRID],
         "avg_output_tokens": 256,
         "parallel_preset": {"mode": mode, "degree": degree},
         "gpu_memory_fraction": 0.9,
@@ -153,9 +154,9 @@ def test_warm_request_matches_frontend_first_visitor_key(isolated):
     inf, warm, _ = isolated
     from backend.api._models import InferenceParallelSweepRequest
 
-    warm_req = warm.default_scaling_sweep_request(MODEL, CTX)
+    warm_req = warm.default_scaling_sweep_request(MODEL)
     frontend_req = InferenceParallelSweepRequest(
-        **_frontend_first_visitor_body(MODEL, CTX)
+        **_frontend_first_visitor_body(MODEL)
     )
     warm_key = inf._sweep_cache_key("parallel", warm_req)
     frontend_key = inf._sweep_cache_key("parallel", frontend_req)
@@ -207,16 +208,25 @@ def test_warm_then_serve_is_a_hit_not_a_recompute(isolated):
     )
 
     ok = asyncio.run(warm.warm_sweeps(
-        models=[MODEL], contexts=[CTX], gpus=["B200"], modes=["dp_ep"], degrees=[8],
+        models=[MODEL], gpus=["B200"], modes=["dp_ep"], degrees=[8],
     ))
     assert ok == 2  # one parallel + one batch
     assert calls["n"] == 1
     assert calls["sweep"] == 1
 
     frontend_req = InferenceParallelSweepRequest(
-        **_frontend_first_visitor_body(MODEL, CTX)
+        **_frontend_first_visitor_body(MODEL)
     )
-    served = asyncio.run(sweep_rt.compute_parallel_sweep_cached(frontend_req))
+    # A stored answer starts no work, so the rate limiter (which counts
+    # starts, `offload.set_start_hook`) is not charged for serving it.
+    import backend.api.offload as offload
+    starts = []
+    offload.set_start_hook(lambda: starts.append(1))
+    try:
+        served = asyncio.run(sweep_rt.compute_parallel_sweep_cached(frontend_req))
+    finally:
+        offload.set_start_hook(None)
+    assert starts == []
     assert served["results"] == ["marker"]
     assert served["code_version"]
     assert calls["n"] == 1
@@ -238,45 +248,47 @@ def test_pool_only_warm_bakes_laws_without_response_documents(isolated, monkeypa
 
     monkeypatch.setattr(warm, "ensureSharedWalks", laws)
     monkeypatch.setattr(warm, "poolOnly", True)
-    assert asyncio.run(warm.warm_sweeps(models=[MODEL], contexts=[CTX])) == 1
+    assert asyncio.run(warm.warm_sweeps(models=[MODEL])) == 1
     assert calls["n"] == 0
     assert calls.get("sweep", 0) == 0
 
 
-def test_sweep_jobs_include_default_model_and_scaling_contexts(monkeypatch):
+def test_parallel_jobs_include_default_model_once_with_every_context(monkeypatch):
     """The default landing model (DeepSeek-V3) is warmed even if it is not in
-    the featured set — the single most common first hit — and the context grid
-    is the panel's SCALING_CONTEXTS, not GALLERY_SEQ_LENS."""
+    the featured set — the single most common first hit — with ONE parallel
+    sweep that prices the routine context grid (the decode cloud's contexts,
+    `ROUTINE_SEQ_LENS`), not one sweep per dropdown context."""
     import backend.api.warm as warm
-    from backend.inference.sweep_grid import DEFAULT_INFER_MODEL, SCALING_CONTEXTS
+    from backend.inference.sweep_grid import DEFAULT_INFER_MODEL, ROUTINE_SEQ_LENS
 
     monkeypatch.setattr(
         "backend.api.gallery_overview.featured_examples",
         lambda *a, **k: ["org/Featured-A", DEFAULT_INFER_MODEL, "org/Featured-B"],
     )
-    jobs = warm.sweep_jobs()
-    models = [m for m, _ in jobs]
+    jobs = [(label, req) for kind, label, req in warm.scaling_jobs(
+        gpus=["B200"], modes=["dp_ep"], degrees=[8]) if kind == "parallel"]
+    models = [req.model_id for _, req in jobs]
     assert models[0] == DEFAULT_INFER_MODEL              # default first
-    assert models.count(DEFAULT_INFER_MODEL) == len(SCALING_CONTEXTS)  # deduped (once)
-    ctxs = sorted({c for _, c in jobs})
-    assert ctxs == sorted(SCALING_CONTEXTS)
-    assert 65536 not in ctxs                             # no page offers an unmeasured 64K rung
-    assert 1048576 in ctxs                               # panel upper bound is 1M
+    assert models.count(DEFAULT_INFER_MODEL) == 1        # deduped (once)
+    for _, req in jobs:
+        assert req.contexts == list(ROUTINE_SEQ_LENS)
+        assert 65536 not in req.contexts                 # no unmeasured 64K rung
+        assert 1048576 in req.contexts                   # upper bound is 1M
 
 
 def test_scaling_jobs_cover_parallel_and_batch(monkeypatch):
-    """`--sweeps` fills every Scaling dropdown: ctx (parallel) plus
-    GPU × parallel × degree (Context × Batch). KV storage reuses the batch
-    payload, so it is not a third kind."""
+    """`--sweeps` fills every Scaling dropdown: one parallel sweep per model
+    (every context inside) plus GPU × parallel × degree (Context × Batch).
+    KV storage reuses the batch payload, so it is not a third kind."""
     import backend.api.warm as warm
     from backend.inference.parallel_sweep import ALL_MODES, DEFAULT_SWEEP_GPUS
-    from backend.inference.sweep_grid import SCALING_CONTEXTS, SCALING_DEGREES
+    from backend.inference.sweep_grid import SCALING_DEGREES
 
     jobs = warm.scaling_jobs(models=[MODEL])
     kinds = {k for k, _, _ in jobs}
     assert kinds == {"parallel", "batch"}
     n_mid = 1
-    assert sum(1 for k, _, _ in jobs if k == "parallel") == n_mid * len(SCALING_CONTEXTS)
+    assert sum(1 for k, _, _ in jobs if k == "parallel") == n_mid
     assert sum(1 for k, _, _ in jobs if k == "batch") == (
         n_mid * len(DEFAULT_SWEEP_GPUS) * len(ALL_MODES) * len(SCALING_DEGREES)
     )
@@ -319,7 +331,7 @@ def test_only_an_answer_that_reads_no_measurement_is_keyed(monkeypatch):
 
     def par(mode, shared, **kw):
         return scoped(InferenceParallelSweepRequest(
-            model_id="x/y", gpu_sku="", context_len=4096, modes=["dp_ep"],
+            model_id="x/y", gpu_sku="", contexts=[4096], modes=["dp_ep"],
             selection_mode=mode, **kw), shared)
     assert inf._sweep_cache_key("parallel", par("latest", 1)) is None
     assert inf._sweep_cache_key("parallel", par("latest", 1, sol_only=True)) == inf._sweep_cache_key(
@@ -343,7 +355,7 @@ def test_parallel_key_carries_every_field_a_point_reads(monkeypatch):
     monkeypatch.setattr(sweep_rt, "resolved_spec_for", lambda m: object())
 
     def key(**kw):
-        body = {"model_id": "x/y", "gpu_sku": "H100-SXM", "context_len": 4096,
+        body = {"model_id": "x/y", "gpu_sku": "H100-SXM", "contexts": [4096],
                 "modes": ["tp_tp"], "selection_mode": "theoretical_only", **kw}
         return sweep_rt.sweep_cache_key(
             "parallel", InferenceParallelSweepRequest(**body))
@@ -369,7 +381,7 @@ def test_routing_imbalance_keys_both_sweeps_and_reaches_every_point(monkeypatch)
 
     def par(**kw):
         return InferenceParallelSweepRequest(
-            model_id="x/y", gpu_sku="H100-SXM", context_len=4096,
+            model_id="x/y", gpu_sku="H100-SXM", contexts=[4096],
             modes=["dp_ep"], selection_mode="theoretical_only", **kw)
 
     assert (sweep_rt.sweep_cache_key("parallel", par(ep_load_factor=1.5))
@@ -432,7 +444,7 @@ def test_a_preset_and_no_precision_share_one_sweep_key(isolated):
     and as shipped implied are one entry, and another profile is another."""
     inf, _warm, _ = isolated
     from backend.api._models import InferenceParallelSweepRequest
-    body = _frontend_first_visitor_body(MODEL, 4096)
+    body = _frontend_first_visitor_body(MODEL)
     plain = InferenceParallelSweepRequest(**body)
     named = InferenceParallelSweepRequest(
         **body, precision={"preset": "as_shipped"})

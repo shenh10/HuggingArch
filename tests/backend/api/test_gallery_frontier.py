@@ -20,7 +20,6 @@ from backend.measure.auto_sweep import MeasuredFormula, PointMeasure
 from backend.measure.lookup import Key
 from backend.inference.parallel_config import ParallelConfig
 from backend.inference.row_roofline import FloorForm
-from backend.inference.parallel_sweep import class_cards
 from backend.inference.sweep_grid import (
     FRONTIER_BATCH_GRID,
     FRONTIER_DRAFT_TOKENS,
@@ -958,7 +957,8 @@ def _covered_item(seq, *, batch, tpot, coverage):
     """A theory point and the coverage the measured fold states of it; a
     fully measured point gets a measured rate."""
     rates = {"concurrent_requests": batch,
-             "sol": {"time_per_output_token_s": tpot, "per_gpu": batch / tpot}}
+             "sol": {"time_per_output_token_s": tpot, "per_request": 1 / tpot,
+                     "per_gpu": batch / tpot}}
     return {"seq": seq, "label": f"b{batch}", "num_gpus": 1,
             "sol": {"phases": {"decode": {"batch": batch, "throughput": rates}}},
             "floors": _one_term(tpot),
@@ -991,7 +991,8 @@ def _read_folded(monkeypatch, items):
         batch = dec["batch"]
         return {**item, "sol": {"phases": {"decode": {**dec, "throughput": {
             **dec["throughput"], "measured": {
-                "time_per_output_token_s": t, "per_gpu": batch / t}}}}}}
+                "time_per_output_token_s": t, "per_request": 1 / t,
+                "per_gpu": batch / t}}}}}}
     monkeypatch.setattr(f, "measure_points", apply)
     monkeypatch.setattr(f, "_at_view", at_view)
     return f._read_entry({"model_id": "m", "layouts": [], "error": None,

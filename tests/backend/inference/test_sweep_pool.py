@@ -104,7 +104,7 @@ class TestBrokenPoolRecovery(unittest.TestCase):
             num_gpus=8, avg_output_tokens=256, parallel=None,
             selection_mode="theoretical_only", model_id=_MODEL,
         )
-        kw = dict(mode="tp_tp", context_len=1024, gpu_skus=["B300"], base_env=env)
+        kw = dict(mode="tp_tp", contexts=[1024], gpu_skus=["B300"], base_env=env)
         serial = estimate_parallel_sweep(**kw)
 
         def _broken(*_a, **_k):

@@ -279,6 +279,10 @@ class TestPerOpTimingShape(unittest.TestCase):
             "comm_collective_in_shape", "comm_collective_out_shape",
             "comm_payload_shape", "comm_payload_role",
             "comm_payload_dtype_bytes", "is_comm",
+            # A routed exchange's top-k placement fan-out. None for every
+            # non-routing collective; the communication identity and cost
+            # both read this one published fact.
+            "comm_route_fanout",
             "act_dtype", "comm_op", "comm_tensor_bytes",
             "comm_base_stride",
             # The quantised copy of its own operand a matmul's kernel needs
@@ -385,6 +389,9 @@ class TestPerOpTimingShape(unittest.TestCase):
             # Multi-port outputs: {port: shape} for ops that emit more than
             # one tensor (fused chains); `shape_out` stays the primary output.
             "shape_outs",
+            # Dtypes follow the same input/output port structure as the
+            # shapes, and weights name each stored operand beside its dtype.
+            "input_dtypes", "port_dtypes", "weights",
             # The PARAM's shape, beside the activations': `shape_in` is
             # activations only, so a linear's weight geometry has nowhere else
             # to appear, and kernel_bench's plan joins on it.
