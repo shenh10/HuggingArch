@@ -166,6 +166,75 @@ class TestSchemeRegistryLoad(unittest.TestCase):
             "a.qweight", "I32", 4, QUANT_SCHEMES["gptq"]), 8)
 
 
+class TestHeaderPackingDtype(unittest.TestCase):
+    def test_every_packed_variant_requires_its_declared_storage_dtype(self):
+        from backend.arch.quant_schemes import QUANT_SCHEMES, packed_unpack_factor
+        for scheme in QUANT_SCHEMES.values():
+            for variant in scheme.format_variants.values():
+                factors = (variant.packing_factor_per_num_bits or
+                           {4: variant.packing_factor})
+                for bits, factor in factors.items():
+                    if not factor or factor <= 1:
+                        continue
+                    dtype = (variant.storage_dtype or
+                             variant.storage_dtype_per_num_bits[bits])
+                    name = "layer.proj" + variant.weight_storage_suffix
+                    with self.subTest(scheme=scheme.name, variant=variant.name, bits=bits):
+                        self.assertEqual(packed_unpack_factor(name, dtype, bits, scheme), factor)
+                        self.assertEqual(packed_unpack_factor(name, "BF16", bits, scheme), 1)
+
+    def test_plain_u8_packing_and_dtype_aliases_are_preserved(self):
+        from backend.arch.quant_schemes import scheme_named, packed_unpack_factor
+        scheme = scheme_named("mxfp4-pack-quantized")
+        for suffix in (".weight", ".weight_packed"):
+            self.assertEqual(packed_unpack_factor("x" + suffix, "uint8", 4, scheme), 2)
+            self.assertEqual(packed_unpack_factor("x" + suffix, "bfloat16", 4, scheme), 1)
+        # The old generic compressed-tensors I32 variant cannot classify U8
+        # as eight INT4 parameters; the correct MXFP4 scheme is required.
+        self.assertEqual(packed_unpack_factor(
+            "x.weight_packed", "U8", 4, scheme_named("compressed-tensors")), 1)
+
+    def test_no_packing_does_not_require_a_bit_width(self):
+        from backend.arch.quant_schemes import scheme_named, packed_unpack_factor
+        for dtype in ("BF16", "I8", "F8_E4M3"):
+            self.assertEqual(packed_unpack_factor(
+                "x.weight", dtype, 0, scheme_named("compressed-tensors")), 1)
+        self.assertEqual(packed_unpack_factor(
+            "x.qweight", "BF16", 0, scheme_named("gptq")), 1)
+
+    def test_unknown_header_dtype_returns_one_instead_of_raising(self):
+        from backend.arch.quant_schemes import scheme_named, packed_unpack_factor
+        self.assertEqual(packed_unpack_factor(
+            "x.weight_packed", "CUSTOM_VENDOR_WORD", 4,
+            scheme_named("mxfp4-pack-quantized")), 1)
+
+    def test_missing_storage_dtype_on_packed_variant_refuses(self):
+        from backend.arch.quant_schemes import (
+            FormatVariant, QuantScheme, packed_unpack_factor,
+        )
+        broken = QuantScheme(
+            name="broken",
+            format_variants={
+                "default": FormatVariant(
+                    name="default", packing_factor=2,
+                    weight_storage_suffix=".weight_packed"),
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "without a storage_dtype"):
+            packed_unpack_factor("x.weight_packed", "U8", 4, broken)
+
+    def test_every_snapshot_quant_scheme_matches_resolve_scheme(self):
+        import json
+        from pathlib import Path
+        from backend.arch.quant_schemes import resolve_scheme
+        snap_dir = Path(__file__).resolve().parents[4] / "backend" / "arch" / "snapshots"
+        for path in sorted(snap_dir.glob("*.json")):
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            resolved, _bits, _unknown = resolve_scheme(doc["config"])
+            with self.subTest(snapshot=path.name):
+                self.assertEqual(doc["metadata"]["quant_scheme"], resolved.name)
+
+
 class TestSchemeYamlValidation(unittest.TestCase):
     """Validators trip on malformed yamls."""
 
@@ -212,6 +281,20 @@ class TestSchemeYamlValidation(unittest.TestCase):
             """)
         with self.assertRaisesRegex(ValueError, "EITHER `storage_dtype` OR"):
             _try_load_with_yaml(bad)
+
+    def test_missing_packing_factor_or_storage_dtype_rejected(self):
+        no_pf = dedent("""\
+            format_variants:
+              default: { storage_dtype: U8 }
+            """)
+        with self.assertRaisesRegex(ValueError, "EITHER `packing_factor` OR"):
+            _try_load_with_yaml(no_pf)
+        no_sd = dedent("""\
+            format_variants:
+              default: { packing_factor: 2 }
+            """)
+        with self.assertRaisesRegex(ValueError, "EITHER `storage_dtype` OR"):
+            _try_load_with_yaml(no_sd)
 
     def test_unreachable_numeric_format_rejected(self):
         bad = dedent("""\

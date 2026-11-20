@@ -68,14 +68,16 @@ cache:
     # torch.float32)`, `inplace_final_state=False` at :477). The conv states
     # stay at the model's dtype.
     - { state: recurrent_state, kind: recurrent_state, carrier: delta_rule, shape: [n_lin_v_heads, d_lin_v_head, d_lin_k_head], dtype: F32 }
+    # s_conv_history is declared by the model: FLA retains kernel_size,
+    # SGLang retains kernel_size - 1 (configs/mamba_utils.py KimiLinearStateShape).
     # Each short conv keeps its own window, [C, kernel_size], resolved in the
     # conv's own frame: q/k/v_conv1d are fla `ShortConvolution`s
     # (modeling_kimi_linear.py:504-516, caches returned at :583-597), whose
     # cache is `[N, D, W]` with W the kernel size (fla/modules/conv/short_conv.py
     # `cache = x.new_zeros(N, D, W)`).
-    - { state: q_conv_state, kind: conv_state, carrier: q_conv1d, shape: [C, kernel_size] }
-    - { state: k_conv_state, kind: conv_state, carrier: k_conv1d, shape: [C, kernel_size] }
-    - { state: v_conv_state, kind: conv_state, carrier: v_conv1d, shape: [C, kernel_size] }
+    - { state: q_conv_state, kind: conv_state, carrier: q_conv1d, shape: [C, s_conv_history] }
+    - { state: k_conv_state, kind: conv_state, carrier: k_conv1d, shape: [C, s_conv_history] }
+    - { state: v_conv_state, kind: conv_state, carrier: v_conv1d, shape: [C, s_conv_history] }
 graph:
   # --- Q / K / V projections, each with its own depthwise short conv ---
   q_proj:   { op: linear, in: x, dims: { in: d_model, out: "n_lin_v_heads * d_lin_k_head" }, weight_axes: [{ world: attention, parts: n_lin_v_heads, fit: replica_cells }, { replicated: true }] }
