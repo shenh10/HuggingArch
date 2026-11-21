@@ -10,8 +10,10 @@ primary_region = 'nrt'
   dockerfile = 'Dockerfile'
 
 [env]
-  ANALYZE_RPM = '60'
-  INFERENCE_RPM = '120'
+  # Host sizing only: what the image's processes may use on this VM. The
+  # host-independent runtime configuration (cache directories, artifact
+  # bucket, trace provider, bench restore, rate limits) is the image's
+  # (Dockerfile, runtime stage), shared with deploy/mac/docker-compose.yml.
   # The container's processes on one 6 GiB VM (docs/measured_calibration.md
   # §8.3): the Kernel Bench service (~220 MiB), the API
   # (~110 MiB) and its compute pool, the runtime cache warm (~110 MiB) and
@@ -42,41 +44,16 @@ primary_region = 'nrt'
   # the lookup cells file's reads (measured on a 4.28M-row lake: ~555 MB in
   # use, nothing spilled; the bench process peaks ~2.3 GB of the 8 GB box).
   BENCH_LAKE_MEMORY_LIMIT = '1536MB'
-  HA_GALLERY_CACHE_DIR = '/app/.cache/huggingarch/gallery-cache'
   # The gallery cache shares the 10 GB volume with the bench lake, the sol
   # pool and the sweep cache; this is its whole share (the tiers under the
   # directory split it, oldest entries evicted first) — its frontier share
   # (65%, ~1.3 GiB) holds every gallery GPU's frontier entry set locally
   # (~0.4 GB gzip-compressed; ~2.3 GB as JSON).
   HA_GALLERY_CACHE_BYTES = '2GiB'
-  # The immutable canonical law pool is machine state, not image state.  It
-  # lives on the persistent volume and is bootstrapped from the versioned
-  # Supabase artifact by backend.sol_pool_artifact at container start.
-  HA_SOL_POOL_DIR = '/app/.cache/huggingarch/sol-pool'
   # Serving-walk records stay parsed per process that reads walks (the API,
   # each compute worker, a warm): the cost is this budget × those processes,
   # so it is sized against the VM's memory, not the pool's records.
   HA_SOL_POOL_PIN_BYTES = '192MiB'
-  # Empty means “read this engine version's index”. Empty overrides stale
-  # machine-level values left by earlier Fly configurations.
-  HA_SOL_POOL_ARTIFACT = ''
-  HA_ARTIFACT_BUCKET = 'sol-pool'
-  # The Scaling sweep's answers: on the volume (nothing is baked into the
-  # image for them — the builder's warm runs with HA_SOL_POOL_ONLY, which
-  # stores no sweep answer), merged at start from the engine's published
-  # artifact (backend.sweep_cache_artifact) and extended by requests.
-  HA_SWEEP_CACHE_DIR = '/app/.cache/huggingarch/sweep-cache'
-  # The code-trace bodies the cached entries above name: an entry is served
-  # only while its trace can be read, so they persist beside the entries.
-  HA_CODE_TRACE_DIR = '/app/.cache/huggingarch/code-traces'
-  # The functions trace provider: cache keys name data, not code — a
-  # code edit no longer invalidates walks or entries. The SOL store is
-  # excluded from traces; one cold refill at the switch.
-  HA_CODE_TRACE = 'functions' 
-  # Kernel Bench: on an empty volume, restore the lake from the backup's
-  # latest snapshot before serving (docs/measured_calibration.md §4.7);
-  # with a lake already on the volume it does nothing.
-  HUGGINGARCH_BENCH_RESTORE = 'on'
 
 [[mounts]]
   source = 'huggingarch_cache'

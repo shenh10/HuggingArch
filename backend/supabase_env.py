@@ -76,7 +76,7 @@ def browser_auth_available() -> bool:
 
 
 def trust_proxy_headers() -> bool:
-    """Whether edge-injected headers (`Fly-Client-IP`, `X-Forwarded-Proto`)
+    """Whether edge-injected headers (`client_ip_header()`, `X-Forwarded-Proto`)
     are trustworthy. On Fly the edge overwrites them, so a client cannot
     spoof them; anywhere else they are client-controlled unless the operator
     opts in (their own proxy strips/sets them). Auto-detects Fly via its
@@ -87,6 +87,17 @@ def trust_proxy_headers() -> bool:
     if v in ("0", "false", "no"):
         return False
     return bool(os.environ.get("FLY_APP_NAME"))
+
+
+def client_ip_header() -> Optional[str]:
+    """The one request header the edge proxy writes the client's address
+    into, or None when proxy headers are not trusted. Exactly one header
+    counts: behind Cloudflare (`CF-Connecting-IP`) a `Fly-Client-IP` is
+    client-supplied, and on Fly the reverse. HA_CLIENT_IP_HEADER names it;
+    `Fly-Client-IP` when unset."""
+    if not trust_proxy_headers():
+        return None
+    return (os.environ.get("HA_CLIENT_IP_HEADER") or "").strip() or "Fly-Client-IP"
 
 
 def secure_request(request) -> bool:

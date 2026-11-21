@@ -92,8 +92,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # state also lives on the persistent volume and is merged from the
     # versioned shared artifact by scripts/entrypoint.sh.
     HA_GALLERY_CACHE_DIR=/app/.cache/huggingarch/gallery-cache \
-    HA_SOL_POOL_DIR=/app/var/sol-pool \
+    # The immutable canonical law pool is machine state, not image state: it
+    # lives on the persistent volume and is bootstrapped from the versioned
+    # Supabase artifact (bucket HA_ARTIFACT_BUCKET) by
+    # backend.sol_pool_artifact at container start. An empty
+    # HA_SOL_POOL_ARTIFACT means "read this engine version's index".
+    HA_SOL_POOL_DIR=/app/.cache/huggingarch/sol-pool \
+    HA_SOL_POOL_ARTIFACT="" \
+    HA_ARTIFACT_BUCKET=sol-pool \
     HA_SOL_POOL_ONLY=0 \
+    # The functions trace provider: cache keys name data, not code — a code
+    # edit no longer invalidates walks or entries.
+    HA_CODE_TRACE=functions \
+    # Kernel Bench: on an empty volume, restore the lake from the backup's
+    # latest snapshot before serving (docs/measured_calibration.md §4.7);
+    # with a lake already on the volume it does nothing.
+    HUGGINGARCH_BENCH_RESTORE=on \
+    # Product rate limits (requests started per minute per client).
+    ANALYZE_RPM=60 \
+    INFERENCE_RPM=120 \
     # Nothing is baked for the sweep answers (the builder's warm runs with
     # HA_SOL_POOL_ONLY), so they live on the volume with the trace bodies
     # their entries name; scripts/entrypoint.sh merges the published artifact.

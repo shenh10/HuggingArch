@@ -352,3 +352,23 @@ class TestCoverage:
         r = client.post("/analyze", json={"model_id": "x"},
                         headers={"Fly-Client-IP": "2.2.2.2"})
         assert r.status_code == 429, "untrusted Fly-Client-IP rotated the bucket"
+
+    def test_configured_edge_header_is_the_only_one_trusted(self, client, monkeypatch):
+        """Behind a Cloudflare Tunnel the edge writes `CF-Connecting-IP`;
+        a `Fly-Client-IP` there is client-supplied. The spoofed header must
+        not rotate the bucket, and the configured one must separate clients."""
+        from backend.service import rate_limit
+        monkeypatch.delenv("FLY_APP_NAME")
+        monkeypatch.setenv("HA_TRUST_PROXY_HEADERS", "1")
+        monkeypatch.setenv("HA_CLIENT_IP_HEADER", "CF-Connecting-IP")
+        monkeypatch.setitem(rate_limit._LIMITS, "/analyze", 1)
+        _reset_buckets(monkeypatch)
+        _patch_clock(monkeypatch)
+        client.post("/analyze", json={"model_id": "x"},
+                    headers={"CF-Connecting-IP": "9.9.9.9", "Fly-Client-IP": "1.1.1.1"})
+        r = client.post("/analyze", json={"model_id": "x"},
+                        headers={"CF-Connecting-IP": "9.9.9.9", "Fly-Client-IP": "2.2.2.2"})
+        assert r.status_code == 429, "spoofed Fly-Client-IP escaped the bucket"
+        r = client.post("/analyze", json={"model_id": "x"},
+                        headers={"CF-Connecting-IP": "8.8.8.8"})
+        assert r.status_code != 429, "the configured edge header did not separate clients"
