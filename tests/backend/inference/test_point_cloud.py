@@ -148,6 +148,7 @@ def test_a_plan_point_maps_to_the_cloud_coordinates():
         "mode": "tp_tp", "num_gpus": 2, "layout": "TP2", "gpu_sku": "H100-SXM",
         "context": 16384, "batch_key": "b64", "draft_tokens": 7,
         "acceptance": 0.8, "ep_load_factor": 1.5,
+        "rho_dcp": 1.0, "dcp_failed_owners": 0,
     }
 
 
@@ -184,6 +185,7 @@ def test_an_estimate_cloud_states_coordinates_and_keeps_absences():
         "mode": "tp_tp", "num_gpus": 2, "layout": "TP2", "gpu_sku": "H100-SXM",
         "context": 1024, "batch_key": "b1", "draft_tokens": 2,
         "acceptance": 0.7, "ep_load_factor": 1.5,
+        "rho_dcp": 1.0, "dcp_failed_owners": 0,
     }
     absent = cloud[1]
     assert absent["refused"] == "capacity"
@@ -195,7 +197,8 @@ def _cloud_point(gpu: str, mode: str, n: int, ctx: int, key: str, batch: int,
                  per_gpu: float) -> dict:
     return {"mode": mode, "num_gpus": n, "gpu_sku": gpu, "context": ctx,
             "batch_key": key, "draft_tokens": 0, "acceptance": 1.0,
-            "ep_load_factor": 1.0, "batch": batch, "layout": f"{mode}{n}",
+            "ep_load_factor": 1.0, "rho_dcp": 1.0, "dcp_failed_owners": 0,
+            "batch": batch, "layout": f"{mode}{n}",
             "tok_s_per_user": 1000.0 / batch, "tok_s_per_gpu": per_gpu}
 
 

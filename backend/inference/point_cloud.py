@@ -64,19 +64,27 @@ class CloudRecord:
 def point_coordinates(
     *, parallel: Any, gpu_sku: str, context: int,
     batch_key: Any, draft_tokens: int, acceptance: float,
-    ep_load_factor: Any, num_gpus: Optional[int] = None,
+    ep_load_factor: Any, rho_dcp: Any = 1, dcp_failed_owners: Any = 0,
+    num_gpus: Optional[int] = None,
 ) -> dict[str, Any]:
     """The one coordinate mapping, including a plan point's ρ. The
     deployment's three coordinates — its mode, its GPU count and its name
     (`frontier.POINT_FIXES`) — are read off the one `parallel`; `num_gpus`
-    only for an estimate with no deployment of its own (`parallel` None)."""
+    only for an estimate with no deployment of its own (`parallel` None).
+
+    `rho_dcp` (the decode-context selected-position skew) and
+    `dcp_failed_owners` (the candidate-certificate fallback scenario) are
+    workload inputs the walk's laws read (`Workload.rho_dcp` /
+    `Workload.dcp_failed_owners`), stated beside `ep_load_factor` so a point
+    carries every coordinate it can be swept over."""
     from .frontier import layout_label, parallel_mode
     if parallel is not None:
         num_gpus = parallel.cluster_size
-    try:
-        rho = float(ep_load_factor)
-    except (TypeError, ValueError):
-        rho = str(ep_load_factor)
+    def _rho(value: Any) -> Any:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
     return {
         "mode": parallel_mode(parallel),
         "num_gpus": int(num_gpus or 1),
@@ -86,7 +94,9 @@ def point_coordinates(
         "batch_key": batch_key,
         "draft_tokens": max(0, int(draft_tokens)),
         "acceptance": float(acceptance),
-        "ep_load_factor": rho,
+        "ep_load_factor": _rho(ep_load_factor),
+        "rho_dcp": _rho(rho_dcp),
+        "dcp_failed_owners": int(dcp_failed_owners),
     }
 
 
@@ -136,6 +146,8 @@ def estimate_records(
     num_gpus: int,
     acceptance_rate: float,
     ep_load_factor: Any,
+    rho_dcp: Any = 1,
+    dcp_failed_owners: Any = 0,
     fits: Callable[..., bool],
 ) -> Iterable[CloudRecord]:
     """The context×batch cloud from a `CapacitySweepPlan`'s finished points.
@@ -155,7 +167,8 @@ def estimate_records(
                 context=seq,
                 batch_key=key if key is not None else "max",
                 draft_tokens=int(verify) - 1,
-                acceptance=acceptance_rate, ep_load_factor=ep_load_factor)
+                acceptance=acceptance_rate, ep_load_factor=ep_load_factor,
+                rho_dcp=rho_dcp, dcp_failed_owners=dcp_failed_owners)
             if not est:
                 yield CloudRecord.unanswered(
                     coordinates, "error", "the sweep returned no point")

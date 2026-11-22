@@ -832,7 +832,8 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         """vLLM runs DeepSeek-V4.1's CSA2 compressor as the pool + norm
         (`fused_save_compress_norm`) and then the rope + store
         (`rope_quant_insert`); the prefill and decode spellings of the pool
-        reach the same kernel. sglang binds neither."""
+        reach the same kernel. sglang binds the same pair on SM90+ (its
+        `fused_low_ratio_compress_supported` is capability major >= 9)."""
         program = _program("deepseek-ai__DeepSeek-V4.1-Flash")
         prefill = Deployment(program).at(input_tokens=128)
         deployment = ServingDeployment.at(gpu_sku="H100-SXM",
@@ -841,7 +842,7 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
                 (shared_walk(prefill), "fused_save_compress_norm"),
                 (shared_walk(prefill.during(DECODE, cache_len=4096)),
                  "fused_save_compress_norm_decode")):
-            for framework, expected in (("vllm", True), ("sglang", False)):
+            for framework, expected in (("vllm", True), ("sglang", True)):
                 fused, _ = Framework.of(
                     get_binding(framework).deployed(deployment),
                     FUSION_SCHEMES).rewrite(analysis.program, analysis)
@@ -1029,14 +1030,14 @@ class TestFrameworkDecidesWhichSchemesExist(unittest.TestCase):
         and stores DeepSeek-V4.1's index key in one launch, so the fused node
         ends at the indexer's `k_cache` store, one component above the norm
         and the rotation — on each of the three key-owning layer kinds (the
-        two gated sources and the candidate source). sglang runs no such
-        launch off SM100 and takes none."""
+        two gated sources and the candidate source). sglang runs the same
+        store on SM90+ and takes the same three."""
         walk = shared_walk(Deployment(_program("deepseek-ai__DeepSeek-V4.1-Flash")).at(
             input_tokens=128))
         chain = ("k_cache", "k_nope_slice", "k_norm", "k_pe_rope",
                  "k_pe_slice", "k_roped")
         self.assertEqual(self._index_key_launches(walk, "vllm"), [chain] * 3)
-        self.assertEqual(self._index_key_launches(walk, "sglang"), [])
+        self.assertEqual(self._index_key_launches(walk, "sglang"), [chain] * 3)
 
     @pytest.mark.regression          # a second V4.1 walk, at decode
     def test_vllms_index_key_launch_takes_the_store_in_decode(self):

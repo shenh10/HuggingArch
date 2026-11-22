@@ -102,7 +102,7 @@ _DEFAULT_INPUTS = BlockGraph.model_fields["inputs"].default
 #: same document, consumed by the caller (SpecLoader) rather than by this
 #: function.
 _BLOCK_GRAPH_SOURCE_KEYS = frozenset({
-    "attn_variant", "cache", "custom_ops",
+    "attn_variant", "cache", "custom_ops", "sparse_dcp",
     "decode_variant",
     "description", "formula", "graph", "inputs", "outputs", "params",
     "reads", "role", "secondary_outputs", "stream_out", "variant_phases",
@@ -272,7 +272,8 @@ def _parse_block_graph(raw: Dict[str, Any],
                       reads=reads,
                       stream_out=stream_out,
                       cache=cache,
-                      attn_variant=attn_variant)
+                      attn_variant=attn_variant,
+                      sparse_dcp=raw.get("sparse_dcp"))
 
 
 #: The library's tree: claims about library components live in its

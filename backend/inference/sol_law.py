@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, T
 import sympy as sp
 
 from backend.arch.law_text import read_walk_law
+from backend.arch.runtime_laws import windowed_admission_ceiling
 from backend.arch.eval.analysis import Point
 from backend.measure.auto_sweep import (
     _ExactPrinter, compile_law_float, compile_law_vector, exact_div,
@@ -178,6 +179,48 @@ def _read(text: str, local: frozenset[str]) -> sp.Expr:
         return law_symbol(name)
 
     return read_walk_law(text, symbol=symbol)
+
+
+def _windowed_batch_admission(graph: "LawGraph"):
+    """Compile scheduler admission from the parts and period of each window."""
+    texts = (*graph.definitions, *graph.outputs.items())
+    if not any("SparseWindow" in text for _, text in texts):
+        return lambda batch: True
+
+    definitions = {}
+    windows = set()
+    local = set()
+    for name, text in texts:
+        expr = _read(text, frozenset(local))
+        local.add(name)
+        if "SparseWindow" in text:
+            for node in sp.preorder_traversal(expr):
+                if node.func.__name__ == "SparseWindow":
+                    _, batch, parts, *lengths = node.args
+                    windows.add((batch, parts, len(lengths)))
+        definitions[name] = expr
+
+    def expand(expr):
+        return expr.xreplace({symbol: expand(definitions[symbol.name])
+                              for symbol in expr.free_symbols if symbol.name in definitions})
+
+    checks = []
+    for batch, parts, period in windows:
+        args = (expand(batch), expand(parts))
+        symbols = set().union(*(arg.free_symbols for arg in args))
+        if any(symbol.name != "B" for symbol in symbols):
+            raise ValueError("scheduler partition geometry requires a batch-only admission law")
+        batch_symbol = next(iter(symbols), sp.Symbol("B"))
+        checks.append((sp.lambdify(batch_symbol, args, modules="math"), period))
+
+    def admitted(batch):
+        for evaluate, period in checks:
+            requests, parts = evaluate(batch)
+            if requests > windowed_admission_ceiling(int(parts), range(period)):
+                return False
+        return True
+
+    return admitted
 
 
 @memoize(maxsize=1024)
@@ -1210,10 +1253,10 @@ def _lawPoint(cardValues: Mapping[str, float], *, batch: int, context: int,
     """The binding a phase's law is evaluated at: the card, then the
     request's batch, context, output length, prefix and verify width."""
     return {
+        "rho": 1, "rho_dcp": 1, "dcp_failed_owners": 0,
         **cardValues, "B": max(1, batch), "s_input": context,
         "s_output": outputTokens, "s_prefix": int(prefixCached),
         "s_verify": verifyWidth,
-        "rho": 1,
     }
 
 
@@ -1354,6 +1397,9 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                      prefillBatches: int | Sequence[int | None] = 1,
                      prefixCached: int | Sequence[int] = 0,
                      verifyWidth: int | Sequence[int] = 1,
+                     ep_load_factor: float = 1.0,
+                     dcp_selected_load_factor: float = 1.0,
+                     dcp_failed_owners: int = 0,
                      draftTokens: int = 0,
                      acceptanceRate: float = 1.0,
                      comm_latency_us: float, launch_floor_us: float,
@@ -1375,6 +1421,8 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
     cardValues = cardBinding(
         record, card, comm_latency_us=comm_latency_us,
         launch_floor_us=launch_floor_us)
+    cardValues = {**cardValues, "rho": ep_load_factor,
+                  "rho_dcp": dcp_selected_load_factor, "dcp_failed_owners": dcp_failed_owners}
     floorCard = FloorCard.of(record, card, comm_latency_us=comm_latency_us,
                              launch_floor_us=launch_floor_us)
     if (not isinstance(prefillBatches, int)
@@ -1394,8 +1442,14 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
         raise ValueError("verifyWidth must name one width per context")
     graphs = {name: LawGraph.from_json(record["phases"][name]["law"])
               for name in ("prefill", "decode")}
+    # A batch past the windowed scheduler's 48 KiB admission refuses ITS
+    # point only; the grid's other points stand. Read before the vector
+    # floor form runs, so an overrun never reaches a numpy-program element.
+    admitted = _windowed_batch_admission(graphs["decode"])
     prefillTimes: dict[tuple[int, int, int, int], float] = {}
     out: list[list[dict | None]] = []
+
+
     # Every decode point's floor form, the program run once per floor
     # setting for the whole grid (`floorForm_batch`), keyed by the point's
     # (context, batch) indices; the per-point loop reads it there.
@@ -1416,11 +1470,13 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                     requests=(int(decodeBatch) if decodeBatch is not None
                               else 1)):
                 continue
+            at = (int(decodeBatch) if decodeBatch is not None
+                  else int(facts["max_decode_batch"]))
+            if not admitted(at):
+                continue
             decodeKeys.append((context_index, batch_index))
             decodePoints.append(_lawPoint(
-                cardValues,
-                batch=(int(decodeBatch) if decodeBatch is not None
-                       else int(facts["max_decode_batch"])),
+                cardValues, batch=at,
                 context=int(context), outputTokens=outputTokens,
                 prefixCached=int(prefixes[context_index]),
                 verifyWidth=int(widths[context_index])))
@@ -1448,6 +1504,11 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
                     max_batch_per_gpu=facts["max_decode_batch"],
                     beyond_max_context=bool(facts["beyond_max_context"]),
                     requests=requests):
+                row.append(None)
+                continue
+            if (context_index, i) not in decodeForms:
+                # A batch past the windowed scheduler's 48 KiB admission:
+                # its own absence, the grid's valid points stand.
                 row.append(None)
                 continue
             prefillBatch = (

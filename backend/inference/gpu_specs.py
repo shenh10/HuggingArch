@@ -89,6 +89,8 @@ class GPUSpec:
     #: `is_device_capability_family(100)`). A generation name (`arch`) spans
     #: several capabilities, so it is its own column. Empty off CUDA.
     compute_capability: str = ""
+    #: Streaming multiprocessors reported by the device.
+    sm_count: Optional[float] = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -151,6 +153,7 @@ def load_gpu_specs() -> list[GPUSpec]:
         check_nvls(spec)
         check_rdma_hop_latency(spec)
         check_memory_bandwidth(spec)
+        check_sm_count(spec)
     return specs
 
 
@@ -191,6 +194,16 @@ def check_compute_capability(spec: GPUSpec) -> None:
             f"gpu_specs.csv: {spec.sku} (device cuda) states compute_capability "
             f"{spec.compute_capability!r}; every CUDA row needs one as "
             "`major.minor` (e.g. 9.0)")
+
+
+def check_sm_count(spec: GPUSpec) -> None:
+    """Validate observed SM counts. Schedulers that need a count require one."""
+    if spec.sm_count is None:
+        return
+    if spec.sm_count < 1 or int(spec.sm_count) != spec.sm_count:
+        raise ValueError(
+            f"gpu_specs.csv: {spec.sku} sm_count {spec.sm_count!r} is not a "
+            "positive integer")
 
 
 def get_gpu(sku: str) -> Optional[GPUSpec]:

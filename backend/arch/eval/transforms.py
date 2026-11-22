@@ -67,6 +67,8 @@ key on the graph that survived. `compute_model(batch, seq, ...)` grows a keyword
 argument per question anyone asks; this grows a field, and the fields compose.
 """
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
+from backend.arch.runtime_contract import SparseDcpRuntime
 
 from fractions import Fraction
 from dataclasses import dataclass, field, fields, replace
@@ -172,6 +174,10 @@ class Workload:
     #: rows (`ExpectedRoutedLoad.busiest_rank_load_factor`).
     ep_load_factor: Any = field(default=1, metadata={
         "symbol": ratio_symbol("rho", 1)})
+    dcp_selected_load_factor: Any = field(default=1, metadata={
+        "symbol": ratio_symbol("rho_dcp", 1)})
+    dcp_failed_owners: Any = field(default=0, metadata={
+        "symbol": sp.Symbol("dcp_failed_owners", integer=True, nonnegative=True)})
     logit_positions: Optional[int] = None
     #: The media each request carries this step, by model input name:
     #: `{"pixel_values": {"n_img": 2, "img_h": 672, "img_w": 672}}` — each
@@ -211,6 +217,8 @@ class Workload:
                             ("s_prefix_cached", self.s_prefix_cached),
                             ("s_verify", self.s_verify),
                             ("ep_load_factor", self.ep_load_factor),
+                            ("dcp_selected_load_factor", self.dcp_selected_load_factor),
+                            ("dcp_failed_owners", self.dcp_failed_owners),
                             ("logit_positions", self.logit_positions)):
             declared_workload(value, f"workload {what}", symbols.get(what))
 
@@ -275,7 +283,9 @@ class Workload:
             ("output_tokens", self.output_tokens),
             ("s_prefix_cached", self.s_prefix_cached),
             ("s_verify", self.s_verify),
-            ("ep_load_factor", self.ep_load_factor)))
+            ("ep_load_factor", self.ep_load_factor),
+            ("dcp_selected_load_factor", self.dcp_selected_load_factor),
+            ("dcp_failed_owners", self.dcp_failed_owners)))
         point = {}
         stated = {}
         for what, value, symbol in counts:
@@ -1060,6 +1070,30 @@ class Deployment:
     #: deployment choice somebody made.
     precision: Optional[Any] = None
 
+    runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED
+
+    #: The serving runtime's sparse-DCP contract, when this deployment binds
+    #: one (`SparseDcpRuntime`), else None. Plain data threaded from the
+    #: framework binding by the public entry; `arch` reads it, never
+    #: `inference`. None is "no runtime": the walk builds no sparse-DCP
+    #: allocations, which is what an architecture walk, vllm, or any
+    #: framework with no sparse-DCP contract gets.
+    runtime_contract: Optional[SparseDcpRuntime] = None
+
+    @property
+    def specializes_verification(self) -> bool:
+        """Whether this runtime requires a finite causal query block.
+
+        The one declaration of it: a runtime contract is bound (`runtime_contract`),
+        this is a decode walk at `dcp > 1`, and the program declares sparse-DCP
+        components the contract applies to. `sparse_dcp_components` is read off
+        the already-built program (a memoized property), not re-derived here.
+        """
+        return (self.runtime_contract is not None
+                and self.phase.kind == DECODE and self.config is not None
+                and self.config.dcp > 1
+                and bool(self.program.sparse_dcp_components))
+
     def binding(self) -> Binding:
         """Workload and phase only — the layout rule keeps extents global.
 
@@ -1142,13 +1176,23 @@ class Deployment:
         the point leaves free."""
         stated = (self.workload.batch, self.workload.input_tokens,
                   self.workload.output_tokens, self.workload.s_prefix_cached,
-                  self.workload.s_verify, self.phase.cache_len,
+                  self.workload.s_verify, self.workload.ep_load_factor,
+                  self.workload.dcp_selected_load_factor,
+                  self.workload.dcp_failed_owners, self.phase.cache_len,
                   *self.bindings.values())
         free = frozenset(
             symbol.name for value in stated
             if isinstance(value_of(value), sp.Basic)
             for symbol in value_of(value).free_symbols)
         workload, point = self.workload.symbolic()
+        if self.specializes_verification:
+            # Sparse verification has ragged per-query ownership; retain its
+            # finite width when compiling the context/batch laws. Serving
+            # cells include this width in their key for the same reason.
+            width = value_of(self.workload.s_verify)
+            if not isinstance(width, (int, sp.Integer)):
+                raise ValueError('sparse DCP requires a fixed verification width')
+            workload = replace(workload, s_verify=int(width))
         return replace(self, workload=workload), point, free
 
     # -- the media a step carries -------------------------------------------
@@ -1286,9 +1330,15 @@ class Deployment:
                 ("output_tokens", self.workload.output_tokens),
                 ("s_prefix_cached", self.workload.s_prefix_cached),
                 ("s_verify", self.workload.s_verify),
-                ("ep_load_factor", self.workload.ep_load_factor))
+                ("ep_load_factor", self.workload.ep_load_factor),
+                ("dcp_selected_load_factor", self.workload.dcp_selected_load_factor),
+                ("dcp_failed_owners", self.workload.dcp_failed_owners))
             if not (isinstance(count, sp.Basic) and count.free_symbols)
             and not Workload.walked_as_number(what, count))
+        if numbers == ['s_verify'] and self.specializes_verification:
+            # The sparse runtime plan is specialized to a finite verify
+            # width; its query-pair laws still vary with context and batch.
+            numbers = []
         if numbers:
             raise TypeError(
                 f"a walk of the workload's counts {numbers} as numbers: "
@@ -1324,7 +1374,10 @@ class Deployment:
             replicated_encoders=replicated_encoders(
                 program, parallel, self.phase.kind),
             expert_load=self.workload.ep_load_factor,
-            program=program)
+            dcp_selected_load_factor=self.workload.dcp_selected_load_factor,
+            dcp_failed_owners=self.workload.dcp_failed_owners,
+            program=program, runtime_profile=self.runtime_profile,
+            sparse_dcp_contract=self.runtime_contract)
         encoder_bindings = (
             {enc.phase.stack: enc.binding() for enc in self.encoders()}
             if checkpoint else {})

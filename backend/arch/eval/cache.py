@@ -131,6 +131,8 @@ class CacheGeometry:
     #: tensor parallelism divides of the cache in this deployment, measured
     #: by projecting it (`layout.physical_cache.cache_geometry`).
     tp_divided: FrozenSet[Tuple[int, int, str]] = frozenset()
+    # Components whose striped owners reserve a final partial position slot.
+    padded_position_components: FrozenSet[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.positions_over <= 0:
@@ -197,6 +199,8 @@ class CachedTensor:
     #: `carrier` — the leaf whose kernel reads and rewrites it each step, and
     #: so the one it is billed and drawn on.
     recurrent: bool = False
+    # Invocation-only projected read law; stored/read retain graph identity.
+    runtime_read_positions: Any = None
 
     def __post_init__(self) -> None:
         if self.positions_over <= 0:
@@ -205,11 +209,21 @@ class CachedTensor:
                 f"{self.positions_over}"
             )
 
+    def with_striped_positions(self) -> "CachedTensor":
+        """Reserve a position on every owner for the final partial stripe."""
+        if self.recurrent:
+            return self
+        length = self.stored if self.stored is not None else CACHE_LEN
+        occupied = sp.ceiling(algebra(length) / self.positions_over) * self.positions_over
+        return replace(self, stored=occupied)
+
     def positions(self, cache_len: Extent, *, read: bool = False) -> Extent:
         """The law, at a length. Substitution rather than a second evaluation of
         the op's lambda: the lambda closed over the frame's other dims when the
         walk recorded it, and re-running it here would need that frame back."""
         expr = self.read if read else self.stored
+        if read and self.runtime_read_positions is not None:
+            expr = self.runtime_read_positions
         if expr is None:
             return cache_len
         return substitute(expr, CACHE_LEN, cache_len)
@@ -485,11 +499,13 @@ def _per_call(
     for uid, entry in out.items():
         node = program.by_uid(uid)
         stack = program.stack_of(node)
+        tensors = entry.tensors
+        if geometry is not None and uid in geometry.padded_position_components:
+            tensors = tuple(t.with_striped_positions() for t in tensors)
         out[uid] = replace(entry, tensors=tuple(
             replace(t, format=bind_format(
-                precision.cache_format(t.kind, stack, t.declared),
-                analysis, node))
-            for t in entry.tensors))
+                precision.cache_format(t.kind, stack, t.declared), analysis, node))
+            for t in tensors))
     return out, absorbed
 
 

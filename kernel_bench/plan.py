@@ -517,10 +517,12 @@ def _build_jobs_over_points(
     from backend.inference.step_eval import prefix_refusal
     profile = (precision if isinstance(precision, PrecisionProfile)
                else PrecisionProfile.from_request(precision))
-    shared = shared_walk_cells(resolved, parallel, profile, model_id=model_id)
+    program = Program.of(resolved)
+    contract = binding.sparse_runtime_for(program, parallel)
+    shared = shared_walk_cells(resolved, parallel, profile, model_id=model_id,
+                               runtime_contract=contract)
     resolved = shared.resolved
     cells = shared.cells
-    program = Program.of(resolved)
 
     def _analyze_cell(point: PlanPoint) -> List[List[_Forward]]:
         if phase == "encode":

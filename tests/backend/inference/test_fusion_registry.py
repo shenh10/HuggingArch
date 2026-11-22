@@ -261,7 +261,8 @@ class TestShippedBindingsLoad(unittest.TestCase):
                          ["deepinfer", "sglang", "vllm"])
         for name, binding in FRAMEWORK_BINDINGS.items():
             self.assertEqual(binding.framework, name)
-            self.assertTrue(binding.audited_at.tag.startswith("v"), name)
+            self.assertTrue(binding.audited_at.tag.startswith("v") or
+                            binding.audited_at.tag == binding.audited_at.commit[:10], name)
             self.assertEqual(len(binding.audited_at.commit), 40, name)
         self.assertEqual(get_binding("vllm").audited_at.label("vllm"),
                          f"vllm (audited at {get_binding('vllm').audited_at.tag})")

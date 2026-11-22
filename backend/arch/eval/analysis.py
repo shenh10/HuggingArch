@@ -428,6 +428,7 @@ class Analysis:
     #: `Rule` (one rank, nothing distributed); the evaluator overwrites it
     #: with the rule the walk actually ran under.
     rule: Rule = field(default_factory=Rule)
+    striped_cache_owners: frozenset[int] = frozenset()
     #: The deployment's precision profile read against this program
     #: (`precision.ResolvedPrecision`) — what the walk priced weights at, and
     #: what every later layer asks for an edge's dtype, a matmul's dtype and

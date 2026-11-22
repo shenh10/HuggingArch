@@ -48,7 +48,8 @@ class Rate(NamedTuple):
     is the first times the tensor's bytes per position — a compressed pool
     adds a row every `m` tokens, a window adds nothing once full — and the
     second is the per-request constant. `storage_bytes_at` at any length
-    past the windows is their sum, so the two cannot disagree."""
+    past the windows follows this asymptotic slope; integer position
+    padding is retained by `storage_bytes_at`, not flattened into the slope."""
 
     per_token: Any
     fixed: int
@@ -360,7 +361,8 @@ class CacheView:
         compressed pool adds a row every `m` tokens, so `1/m` of a row)
         versus the positions held whatever the length (a full window, a
         recurrent state), billed once per request. Past every window,
-        `growth × L + floor` is `storage_bytes_at(L)`. Decided per TENSOR:
+        `growth × L + floor` is the asymptotic storage law; integer owner
+        padding remains in `storage_bytes_at(L)`. Decided per TENSOR:
         the law and the format are the tensor's, and a class label has no
         say."""
         growth = 0.0

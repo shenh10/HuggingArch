@@ -1566,6 +1566,12 @@ def compute_per_op_timing(
             # Humming's Hopper WGMMA launch explicitly declares the
             # alternative-family ladder; a quantised activation alone proves
             # nothing about the instruction.
+            # A source-declared runtime stage runs its own arithmetic at its
+            # own width (fp32 split-combine), overriding the leaf's activation
+            # dtype for the peak column below (`LeafAccess` has no such width).
+            local_comm_meta = ((comm_meta.values.get(uid) or {})
+                               if comm_meta is not None else {})
+            local_compute_dtype = local_comm_meta.get("runtime_compute_dtype")
             adt_name = ab.act_dtype if ab is not None else None
             converts = True
             op_peak: Optional[float] = None
@@ -1617,6 +1623,10 @@ def compute_per_op_timing(
                 # already handles (`NoPeakForDtype`).
                 raise NoPeakForDtype(gpu_sku or "This GPU", adt_name,
                                      peak_kind(adt_name))
+            if local_compute_dtype is not None:
+                adt_name = local_compute_dtype
+                op_peak = (peak_flops_for_op_fn(adt_name)
+                           if peak_flops_for_op_fn is not None else None)
             if op_peak is None:
                 op_peak = peak_flops_per_sec
             # Comm rooftop: a parallelism collective's per-rank traffic
@@ -1658,6 +1668,14 @@ def compute_per_op_timing(
                      if law_comm_meta is not None else {})
             comm_payload_one = (value_of(law_m["tensor_bytes_extent"])
                                 if is_comm and m else 0)
+            # A source-declared runtime stage's complete local memory floor
+            # replaces the generic copy-flow traffic (`LeafAccess`), so its
+            # operands are not double read; it is materialised by the stage's
+            # own contract (`RuntimeStageWork.metadata`), not derived here.
+            if "runtime_read_bytes" in law_m:
+                act_in_one = value_of(law_m["runtime_read_bytes"])
+            if "runtime_write_bytes" in law_m:
+                act_out_one = value_of(law_m["runtime_write_bytes"])
             # The row's law, over the workload and the card, built from the
             # walk's laws: the same at every point of the cell, so written
             # once (`ServingLayers.written`).
@@ -1675,6 +1693,7 @@ def compute_per_op_timing(
                 demand=asked_law,
                 weight_total=weight_total_pr, metadata_total=meta_total_pr,
                 comm_payload=comm_payload_one,
+                comm_active=value_of(law_m.get("collective_active", 1)),
                 comm_priced=is_comm and comm_world > 1,
                 # The algorithms its envelope ranges over: the time is
                 # their minimum on the card (`comm_cost.Envelope`).
@@ -1926,6 +1945,12 @@ def compute_per_op_timing(
                 "display_path": node.display_path,
                 "op": node.op,
                 "role": node.role,
+                # Source-declared runtime stages retain their identity and
+                # limitations in the public table, including unresolved SMs.
+                **{key: m[key] for key in (
+                    "runtime_stage_name", "runtime_work_basis", "runtime_source") if key in m},
+                **({"runtime_integer_ops": as_number(value_of(m["runtime_integer_ops"]))}
+                   if "runtime_integer_ops" in m else {}),
                 # This node's Invocation dims, carried on the row so the identity
                 # reads the constants a tensor shape can't (a rope rotation width
                 # hidden inside heads x width) off the row itself — not a global

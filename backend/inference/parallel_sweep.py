@@ -766,6 +766,8 @@ class ParallelSweepPlan:
     #: still names its own batch_key.
     batch: Any
     ep_load_factor: Any
+    dcp_selected_load_factor: Any
+    dcp_failed_owners: Any
     draft_tokens: int
     acceptance: float
     #: What the measured track is read under — the request's measurement
@@ -782,7 +784,9 @@ class ParallelSweepPlan:
             parallel=parallel, gpu_sku=gpu_sku,
             context=int(context), batch_key=batch_key,
             draft_tokens=self.draft_tokens, acceptance=self.acceptance,
-            ep_load_factor=self.ep_load_factor)
+            ep_load_factor=self.ep_load_factor,
+            rho_dcp=self.dcp_selected_load_factor,
+            dcp_failed_owners=self.dcp_failed_owners)
 
     @property
     def requested_batch_key(self) -> Any:
@@ -802,6 +806,8 @@ class ParallelSweepPlan:
         gpu_skus: Optional[List[str]] = None,
         base_env: Dict[str, Any],
         ep_load_factor: float = 1.0,
+        dcp_selected_load_factor: float = 1.0,
+        dcp_failed_owners: int = 0,
     ) -> "ParallelSweepPlan":
         """`base_env` is the `_resolve_estimate_environment` dict; its
         `parallel` / `gpu_sku` / `num_gpus` are ignored (overridden per
@@ -810,7 +816,9 @@ class ParallelSweepPlan:
         per-GPU batch for BOTH phases, or "max" (each config's own capacity
         max). `ep_load_factor` (max/mean expert load) is the batch's routing
         skew, a workload input carried into every point's estimate: the
-        sweep varies topology, not routing.
+        sweep varies topology, not routing. `dcp_selected_load_factor`
+        (`Workload.rho_dcp`) and `dcp_failed_owners`
+        (`Workload.dcp_failed_owners`) are the matching DCP decode inputs.
 
         Every mode's ladder starts at one GPU; the one-GPU deployment is one
         config whatever the mode, so it is one cell every mode reads."""
@@ -846,12 +854,16 @@ class ParallelSweepPlan:
                     "num_gpus": cfg.cluster_size, "parallel": cfg,
                     "contexts": [int(c) for c in contexts], **batch_kw,
                     "ep_load_factor": ep_load_factor,
+                    "dcp_selected_load_factor": dcp_selected_load_factor,
+                    "dcp_failed_owners": dcp_failed_owners,
                     "decode_ladder": SCALING_DECODE_LADDER,
                 }))
         return cls(wanted=tuple(wanted), gpu_skus=tuple(series), caps=caps,
                    skip_ep=tuple(skip_ep), cells=tuple(cells),
                    contexts=tuple(int(c) for c in contexts), batch=batch,
                    ep_load_factor=ep_load_factor,
+                   dcp_selected_load_factor=dcp_selected_load_factor,
+                   dcp_failed_owners=dcp_failed_owners,
                    draft_tokens=max(0, int(base_env.get("s_verify", 1)) - 1),
                    acceptance=float(base_env.get("acceptance_rate", 1.0)),
                    measured_under={
@@ -972,6 +984,8 @@ def estimate_parallel_sweep(
     gpu_skus: Optional[List[str]] = None,
     base_env: Dict[str, Any],
     ep_load_factor: float = 1.0,
+    dcp_selected_load_factor: float = 1.0,
+    dcp_failed_owners: int = 0,
 ) -> dict:
     """Sweep deployment degree for one or more parallel layouts at every
     context of `contexts`, in this process: the plan, its cells across the
@@ -980,5 +994,7 @@ def estimate_parallel_sweep(
     spread across its compute workers (`backend.api.sweep_runtime`)."""
     plan = ParallelSweepPlan.of(
         mode=mode, modes=modes, contexts=contexts, batch=batch,
-        gpu_skus=gpu_skus, base_env=base_env, ep_load_factor=ep_load_factor)
+        gpu_skus=gpu_skus, base_env=base_env, ep_load_factor=ep_load_factor,
+        dcp_selected_load_factor=dcp_selected_load_factor,
+        dcp_failed_owners=dcp_failed_owners)
     return plan.assemble(map_cells(run_layout_cell, list(plan.cells)))

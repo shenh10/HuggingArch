@@ -300,6 +300,8 @@ class InferenceEstimateRequest(PrecisionRequest):
     # (snapshot or HF).
     weight_bytes_total: Optional[float] = None
     gpu_sku: str
+    dcp_selected_load_factor: float = Field(1.0, ge=1.0, allow_inf_nan=False)
+    dcp_failed_owners: int = Field(0, ge=0)
     gpu_memory_fraction: float = 0.9
     # The GPU count is the parallel config's rank count. Optional: a stated
     # count that disagrees with the mesh is refused, never priced.

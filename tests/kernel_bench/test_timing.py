@@ -65,8 +65,18 @@ def test_unflushed_timing_still_reads_a_warm_cache():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
     from kernel_bench.timing import time_callable
-    x = torch.randn(16 * 2**20 // 4, device="cuda")
-    sink = torch.empty((), device="cuda")
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    l2_bytes = (getattr(props, "L2_cache_size", 0)
+                or getattr(props, "l2_cache_size", 0))
+    if not isinstance(l2_bytes, int) or l2_bytes <= 0:
+        pytest.skip("needs a reported L2 capacity to size a cache-resident working set")
+    # A fixed 16 MiB occupies only 13% of a 126.5 MiB L2: reduction/launch
+    # work can hide its HBM-vs-L2 difference. Use a fixed fraction of the
+    # reported cache, leaving headroom for reduction scratch and the scalar
+    # output. This size is chosen from hardware, never from timing results.
+    n = (3 * l2_bytes // 4) // 4
+    x = torch.randn(n, dtype=torch.float32, device="cuda")
+    sink = torch.empty((), dtype=torch.float32, device="cuda")
     hot = time_callable(lambda: torch.amax(x, dim=0, out=sink), flush_l2=False)
     cold = time_callable(lambda: torch.amax(x, dim=0, out=sink))
     assert cold.p50_us >= hot.p50_us * 1.1, (hot.p50_us, cold.p50_us)

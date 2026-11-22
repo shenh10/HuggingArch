@@ -68,14 +68,13 @@ cache:
     # torch.float32)`, `inplace_final_state=False` at :477). The conv states
     # stay at the model's dtype.
     - { state: recurrent_state, kind: recurrent_state, carrier: delta_rule, shape: [n_lin_v_heads, d_lin_v_head, d_lin_k_head], dtype: F32 }
-    # Each short conv keeps its own window, [C, kernel_size], resolved in the
-    # conv's own frame: q/k/v_conv1d are fla `ShortConvolution`s
-    # (modeling_kimi_linear.py:504-516, caches returned at :583-597), whose
-    # cache is `[N, D, W]` with W the kernel size (fla/modules/conv/short_conv.py
-    # `cache = x.new_zeros(N, D, W)`).
-    - { state: q_conv_state, kind: conv_state, carrier: q_conv1d, shape: [C, kernel_size] }
-    - { state: k_conv_state, kind: conv_state, carrier: k_conv1d, shape: [C, kernel_size] }
-    - { state: v_conv_state, kind: conv_state, carrier: v_conv1d, shape: [C, kernel_size] }
+    # The serving cache retains the previous kernel_size - 1 positions.
+    # The current token arrives as an input to the convolution. SGLang
+    # KimiLinearStateShape.create slices its packed QKV history this way
+    # (python/sglang/srt/configs/mamba_utils.py:347-354 at 1b2870d33d).
+    - { state: q_conv_state, kind: conv_state, carrier: q_conv1d, shape: [C, "kernel_size - 1"] }
+    - { state: k_conv_state, kind: conv_state, carrier: k_conv1d, shape: [C, "kernel_size - 1"] }
+    - { state: v_conv_state, kind: conv_state, carrier: v_conv1d, shape: [C, "kernel_size - 1"] }
 graph:
   # --- Q / K / V projections, each with its own depthwise short conv ---
   q_proj:   { op: linear, in: x, dims: { in: d_model, out: "n_lin_v_heads * d_lin_k_head" }, weight_axes: [{ world: attention, parts: n_lin_v_heads, fit: replica_cells }, { replicated: true }] }

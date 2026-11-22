@@ -14,7 +14,7 @@ import sympy as sp
 from sympy.printing.str import StrPrinter
 
 from backend.arch.eval.dim import as_number, bind_record, exact as exact_number
-from backend.arch.law_text import Cases, Quotient, read_law
+from backend.arch.law_text import Cases, Quotient, read_walk_law
 from backend.arch.layout.comm_volume import ring_factor, ring_factor_symbolic
 from backend.inference.intensity import arithmetic_intensity, intensity_formula
 
@@ -129,7 +129,10 @@ class FormulaDefs:
         declared = (self.definitions or {}).get(name)
         if declared is None:
             return {}
-        law = read_law(declared["law"])
+        # Physical projection can compose an authored definition with a
+        # workload-dependent share (e.g. sparse DCP's guarded quotient).
+        # These are serialized walk laws, including their conditional terms.
+        law = read_walk_law(declared["law"])
         values = {}
         for symbol in law.free_symbols:
             bound = declared["bindings"].get(symbol.name)

@@ -79,6 +79,8 @@ def resolve_estimate_environment(
         avg_output_tokens=req.avg_output_tokens,
         parallel=ParallelConfig.from_dict(parallel_fields),
         ep_load_factor=ep_load_factor,
+        dcp_selected_load_factor=req.dcp_selected_load_factor,
+        dcp_failed_owners=req.dcp_failed_owners,
         # The request's precision profile, canonical (`PrecisionProfile`):
         # every weight format, edge dtype and cache format is its answer.
         precision=req.precision_profile(),

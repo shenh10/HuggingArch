@@ -533,6 +533,7 @@ class Evaluator:
 
         analysis = walk.into_analysis(self.program, scope.binding)
         analysis.rule = self.rule
+        analysis.striped_cache_owners = self.rule.striped_cache_owners
         analysis.precision = self.precision
         analysis = self.rule.close_analysis(analysis)
         return analysis
@@ -2069,6 +2070,7 @@ class Evaluator:
             walk.kernel_shapes[node.uid] = Shape(
                 out=geometry.output,
                 ins=tuple(axes or () for axes in geometry.inputs),
+                pair_share=geometry.pair_share,
             )
         for index, state in enumerate(kernel_required):
             walk.input_states[(node.uid, index)] = state

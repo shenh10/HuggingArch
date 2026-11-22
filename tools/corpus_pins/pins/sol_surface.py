@@ -112,7 +112,7 @@ def reduce_ops(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 @dataclass(frozen=True)
 class SolSurfacePin(JsonMapPin):
     def missing_keys(self, doc, model: CorpusModel) -> list:
-        return [k for k in (cell_key(model.filename, d) for d in sorted(DEPLOYMENTS))
+        return [k for k in (cell_key(model.filename, d) for d in sorted(DUMP.deployments_for(model.filename)))
                 if k not in doc]
 
     def key_exists(self, key: str, stems, components) -> bool:
@@ -125,7 +125,7 @@ class SolSurfacePin(JsonMapPin):
     def measure(self, model: CorpusModel) -> Row:
         resolved = model.resolved(shared_loader())
         row: Row = {}
-        for deployment in sorted(DEPLOYMENTS):
+        for deployment in sorted(DUMP.deployments_for(model.filename)):
             cell = measure_case(model.config, DEPLOYMENTS[deployment], resolved)
             row[cell_key(model.filename, deployment)] = {
                 "model": cell["model"],

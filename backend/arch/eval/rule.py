@@ -25,6 +25,7 @@ class Rule:
     """Identity rule: nothing is distributed, so local == global."""
 
     #: Identity has no sequence cut and no cache family.
+    striped_cache_owners: frozenset[int] = frozenset()
     resident_sequence_family = None
     cache_family = None
     #: The phase the walk runs (`sharding.PREFILL` / `DECODE` / `ENCODE`),

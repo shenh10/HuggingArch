@@ -402,7 +402,7 @@ takes it (`KernelSignature.takes_state`). The following cells have no provider
 on the H100 plans:
 
 - **The compressor pool as plain ops.** sglang pools DeepSeek-V4.1's
-  low-ratio compressor in eager torch below SM100
+  low-ratio compressor in eager torch below SM90
   (`_low_ratio_compress_torch`), and DeepSeek-V4-Flash and Step-5-Preview plan
   the same `weighted` multiply unfused, because no plan groups vLLM's
   ratio-128 pool launch (`SparseAttnCompressC128Block8Kernel`). No `mul` kernel

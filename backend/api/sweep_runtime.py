@@ -232,6 +232,8 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             "kv_block_size": knobs.kv_block_size,
             "prefill_chunk_size": plan.prefill_chunk_size,
             "ep_load_factor": knobs.ep_load_factor,
+            "dcp_selected_load_factor": knobs.dcp_selected_load_factor,
+            "dcp_failed_owners": knobs.dcp_failed_owners,
             "comm_latency_us": knobs.comm_latency_us,
             "launch_floor_us": knobs.launch_floor_us,
         }
@@ -449,16 +451,19 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
 #: phases, not decode alone), and its point SET changed — `estimate_records`
 #: now asks `fits`, so a point that is beyond the model's published context
 #: or whose weights do not fit is a capacity absence instead of a served
-#: point. Compare's cloud loses those points.
-_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v7"
+#: point. Compare's cloud loses those points. v8: every cloud point states
+#: the DCP decode workload inputs (`rho_dcp`, `dcp_failed_owners`) beside
+#: `ep_load_factor`; the old cloud's points are missing them.
+_ESTIMATE_SWEEP_PAYLOAD = "estimate-sweep-v8"
 
 #: The parallel answer's server-side point cloud changed to the one coordinate
 #: vocabulary and began keeping absent points, so its cached answers move once.
 #: v3: the sweep prices every context of `contexts` (the cloud spans them, a
 #: chart point names its context and carries no decode fields), every mode's
 #: ladder starts at one GPU, and a context past the model's published length
-#: keeps its cloud points, flagged.
-_PARALLEL_SWEEP_PAYLOAD = "parallel-sweep-v3"
+#: keeps its cloud points, flagged. v4: every cloud point states the DCP
+#: decode workload inputs (`rho_dcp`, `dcp_failed_owners`).
+_PARALLEL_SWEEP_PAYLOAD = "parallel-sweep-v4"
 
 
 def served_sweep_point(result: Any) -> Any:
@@ -490,6 +495,8 @@ def _parallel_plan(req: InferenceParallelSweepRequest) -> ParallelSweepPlan:
         gpu_skus=req.gpu_skus,
         base_env=resolve_estimate_environment(req),
         ep_load_factor=req.ep_load_factor,
+        dcp_selected_load_factor=req.dcp_selected_load_factor,
+        dcp_failed_owners=req.dcp_failed_owners,
     )
 
 

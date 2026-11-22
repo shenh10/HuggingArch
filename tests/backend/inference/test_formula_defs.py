@@ -15,6 +15,20 @@ LLAMA = "meta-llama/Llama-3.2-3B"
 _COUNTS = re.compile(r"\b(B|s_input|s_output|s_prefix|s_verify)\b")
 
 
+@pytest.mark.parametrize("context", [0, 4096])
+def test_physical_pair_definition_reads_guarded_workload_share(context):
+    from backend.inference.phase_formulas import FormulaDefs
+
+    definitions = {"s_pairs": {
+        "law": "s_pairs * Quotient(Eq(s_input, 0), 0, ceiling(s_input / 8), s_input)",
+        "bindings": {"s_pairs": {"value": context}, "s_input": {"value": context}},
+    }}
+    defs = FormulaDefs(dims=None, point={}, value=None, definitions=definitions)
+    rendered = defs._defined("s_pairs", context // 8)
+    assert rendered["definition"]
+    assert not _COUNTS.search(rendered["formula"])
+
+
 @pytest.fixture(scope="module")
 def decode_rows():
     est = Deployment(LLAMA).direct(avg_input_tokens=4096, prefill_batch=1,

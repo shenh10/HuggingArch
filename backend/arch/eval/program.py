@@ -2726,6 +2726,11 @@ class Program:
         return frozenset(stack.name for stack in self.walk_stacks)
 
     @memo_property
+    def sparse_dcp_components(self) -> Tuple[SpecIRNode, ...]:
+        """Components declaring a sparse DCP runtime contract on this graph."""
+        return tuple(node for node in self.walked_nodes() if node.sparse_dcp is not None)
+
+    @memo_property
     def walked_components(self) -> FrozenSet[str]:
         """The components this program's walk invokes, at any depth."""
         out: set = set()

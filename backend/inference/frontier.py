@@ -29,6 +29,12 @@ from typing import (Any, Dict, List, Literal, Mapping, Optional, Sequence,
 PointDim = Literal[
     "mode", "num_gpus", "layout", "gpu_sku", "context", "batch_key",
     "draft_tokens", "acceptance", "ep_load_factor",
+    #: The decode-context selected-position skew (`Workload.rho_dcp`) and the
+    #: candidate-certificate fallback scenario (`Workload.dcp_failed_owners`).
+    #: Both are workload inputs a walk's laws read, so a point states them
+    #: beside `ep_load_factor`; the swept grid spans over neither (a sweep
+    #: varies topology, not routing or the owner scenario).
+    "rho_dcp", "dcp_failed_owners",
 ]
 POINT_DIMS: Tuple[str, ...] = get_args(PointDim)
 

@@ -60,6 +60,15 @@ def physical_axis_partition_audit(
     if sharding.is_trivial:
         return ()
     out = []
+    striped = sharding.sparse_dcp.striped_components
+    if striped:
+        from backend.arch.eval.cache import derive
+        position_owners = {
+            uid for uid, cache in derive(analysis).values.items()
+            if any(tensor.is_growing for tensor in cache.tensors)
+        }
+    else:
+        position_owners = set()
     for symbol in sorted(analysis.binding.symbols()):
         world = dim_registry.world_of(symbol)
         if world is None or world.bound_per_rank:
@@ -70,6 +79,12 @@ def physical_axis_partition_audit(
         extent = value_of(analysis.binding.raw(symbol))
         if same_law(extent, 0):
             # An axis the model leaves empty partitions nothing.
+            continue
+        if world.label == "dcp" and position_owners and position_owners <= striped:
+            # The cached-position axes all belong to striped owners. A KDA
+            # recurrent matrix has no position axis and cannot veto this cut.
+            out.append(AxisPartitionAudit(symbol, extent, family.group_size,
+                                          family.group_size, world.label))
             continue
         layout = layout_for_symbol(
             symbol,
@@ -757,6 +772,8 @@ def pairs_share(op: Optional[str], global_shape: Shape,
     the keys, Ulysses neither (it cuts heads), and a DSA indexer's rows
     follow the sequence cut under either prefill scheme. None for a node
     whose matrix has no query and key axis: nothing to scale."""
+    if local_shape.pair_share is not None:
+        return local_shape.pair_share
     kernel = attention_kernel(op)
     global_pairs = global_shape.pairs(kernel)
     local_pairs = local_shape.pairs(kernel)
@@ -822,8 +839,11 @@ def local_definitions(definitions: Optional[Mapping[str, Any]], *,
     out: Dict[str, Any] = {}
     for name, definition in definitions.items():
         if share is not None and _counts_score_pairs(name):
+            # Physical ownership ratios can read workload symbols (rounded
+            # local scans / skewed selection), not only constant cuts.
+            extra = {s.name: s for s in exact(share).free_symbols}
             out[name] = Definition(definition.law * share,
-                                   definition.bindings,
+                                   {**extra, **definition.bindings},
                                    definition.value * share)
             continue
         definition = at_rank.get(name, definition)
@@ -831,6 +851,16 @@ def local_definitions(definitions: Optional[Mapping[str, Any]], *,
                 and not same_law(definition.value, 0)):
             factor = sp.cancel(exact(carried[name]) / exact(definition.value))
             if varies(factor):
+                # Explicit runtime geometry may be a bounded, nonuniform
+                # ownership law rather than a constant tensor partition.
+                # Publish that law in workload names, not a fake fixed cut.
+                plan = (None if analysis.rule.is_trivial else
+                        analysis.rule.sparse_dcp.for_node(node))
+                if plan is not None and plan.decode:
+                    law = exact(carried[name])
+                    out[name] = Definition(
+                        law, {s.name: s for s in law.free_symbols}, law)
+                    continue
                 raise ValueError(
                     f"{node.display_path}: `{name}` = {definition.law} comes "
                     f"to {definition.value}, and the rank's axis holds "

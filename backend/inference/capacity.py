@@ -21,6 +21,8 @@ all_gathers K/V before the cache write. The displayed shard and replication
 factors are the ratio of the whole-model view to this rank's view.
 """
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
+from backend.arch.runtime_laws import WindowedSchedulerOverrun
 
 import threading
 import time
@@ -46,7 +48,7 @@ from .gpu_specs import (
 )
 from .defaults import COMM_LATENCY_US_DEFAULT, LAUNCH_FLOOR_US_DEFAULT
 from .card import Card, CardPrice
-from .framework_bindings import ServingDeployment
+from .framework_bindings import ServingDeployment, THEORY
 from .frontier import POINT_DIMS
 from .point_cloud import estimate_cloud
 from .kv_topology import _counted
@@ -68,6 +70,7 @@ from .phases import (PhaseInputs, Speculation,
 from .pipeline import leaf_peak
 from .weight_breakdown import per_rank_weight_breakdown
 from .calibration_overlay import (  # overlay stage, not a budget scalar
+    resolve_framework_binding,
     identity_columns,
     key_columns,
     looks_up,
@@ -382,6 +385,10 @@ class _CapacityPreparation:
     #: The batch's routing skew, max/mean expert load (`Workload.
     #: ep_load_factor`).
     ep_load_factor: Any
+    #: The decode-context selected-position skew (`Workload.rho_dcp`) and the
+    #: candidate-certificate fallback scenario (`dcp_failed_owners`).
+    dcp_selected_load_factor: Any = 1
+    dcp_failed_owners: Any = 0
     # The speculative draft this decode step counts, or None for the verify
     # forward alone (`speculative_draft.SpeculativeDraft`).
     draft: Optional[SpeculativeDraft] = None
@@ -463,6 +470,8 @@ class CapacityKnobs:
     #: as the symbol `rho`; 1 is balanced routing, and the response says
     #: it is an assumption (`assumptions.deployment_assumptions`).
     ep_load_factor: float = 1.0
+    dcp_selected_load_factor: float = 1.0
+    dcp_failed_owners: int = 0
     #: Count the speculative draft's forwards in the decode step, in this
     #: style (`speculative_draft.DraftStyle`); None prices the verify alone.
     speculative_draft: Optional[str] = None
@@ -1383,7 +1392,9 @@ class ModelCells(NamedTuple):
 
 
 def _model_cells(resolved: Any, parallel: ParallelConfig,
-                 precision: PrecisionProfile, *, model_id: Optional[str]
+                 precision: PrecisionProfile, *, model_id: Optional[str],
+                 runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED,
+                 runtime_contract: Any = None
                  ) -> ModelCells:
     """The cells of one model's spec, deployment and precision under this
     code (`fingerprint.result_version`: the code, the shared data, the
@@ -1402,7 +1413,8 @@ def _model_cells(resolved: Any, parallel: ParallelConfig,
     lock, so requests on several threads share one cell. With them, what a
     capacity preparation reads off the cells alone (`CellBasis`)."""
     shared = shared_walk_cells(resolved, parallel, precision,
-                               model_id=model_id)
+                               model_id=model_id, runtime_profile=runtime_profile,
+                               runtime_contract=runtime_contract)
     return shared.reader(
         "capacity", lambda: ModelCells(
             shared.resolved, shared.cells,
@@ -1418,6 +1430,7 @@ class _CapacityInput:
     resolved: Any
     parallel: ParallelConfig
     precision: PrecisionProfile
+    runtime_contract: Any = None
 
 
 def _capacity_input(*, config: dict, gpu_sku: str,
@@ -1435,15 +1448,18 @@ def _capacity_input(*, config: dict, gpu_sku: str,
             f"No spec matches {knobs.model_id!r}. "
             "Add a spec in backend/arch/models/ or run /generate-spec first.")
 
-    parallel = (knobs.parallel or ParallelConfig()).for_program(
-        Program.of(resolved))
+    program = Program.of(resolved)
+    parallel = (knobs.parallel or ParallelConfig()).for_program(program)
     errs = parallel.validate()
     if errs:
         raise ValueError("; ".join(errs))
     precision = (knobs.precision
                  if isinstance(knobs.precision, PrecisionProfile)
                  else PrecisionProfile.from_request(knobs.precision))
-    return _CapacityInput(card, resolved, parallel, precision)
+    _, binding = resolve_framework_binding(framework=knobs.framework, deployment=None)
+    contract = (binding.sparse_runtime_for(program, parallel, sm_count=card.spec.sm_count)
+                if binding is not None else None)
+    return _CapacityInput(card, resolved, parallel, precision, contract)
 
 
 def _weight_overflow_reason(*, gpu: Any, weight_bytes: float,
@@ -1510,7 +1526,10 @@ def _capacity_preparation(
     # reads the same ones, and so does every later request of the same
     # model, deployment and precision (`_model_cells`).
     resolved, cells, basis, shared = _model_cells(
-        resolved, parallel, precision, model_id=knobs.model_id)
+        resolved, parallel, precision, model_id=knobs.model_id,
+        runtime_profile=(RuntimeProfile.ARCHITECTURE if knobs.framework == THEORY
+                         else RuntimeProfile.DECLARED),
+        runtime_contract=capacity_input.runtime_contract)
     account_cells = shared.account
     analysis = basis.analysis
     resolved_precision = analysis.resolved_precision
@@ -1809,6 +1828,8 @@ def _capacity_preparation(
         s_verify=knobs.s_verify,
         acceptance_rate=knobs.acceptance_rate,
         ep_load_factor=knobs.ep_load_factor,
+        dcp_selected_load_factor=knobs.dcp_selected_load_factor,
+        dcp_failed_owners=knobs.dcp_failed_owners,
         draft=draft,
         refusal_reason=refusal_reason,
         cells=cells,
@@ -2163,6 +2184,8 @@ class CapacitySweepPlan:
             gpu_sku=self.gpu_sku, parallel=parallel, num_gpus=num_gpus,
             acceptance_rate=self.knobs.acceptance_rate,
             ep_load_factor=self.knobs.ep_load_factor,
+            rho_dcp=self.knobs.dcp_selected_load_factor,
+            dcp_failed_owners=self.knobs.dcp_failed_owners,
             fits=fits).points
 
 
@@ -2358,8 +2381,17 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
         for (_key, pb, db) in cell.points:
             batches = _direct_batches(ceilings, prefill_batch_override=pb,
                                       decode_batch_override=db)
-            rows = _point_rows(base, pw, batches, pending, at.point,
-                               breakdown=False)
+            try:
+                rows = _point_rows(base, pw, batches, pending, at.point,
+                                   breakdown=False)
+            except WindowedSchedulerOverrun as exc:
+                # A batch past the 48 KiB windowed-schedule admission
+                # (`runtime_laws.windowed_admits`) refuses THIS point only;
+                # its siblings stand. `{}` is the producer's "no estimate"
+                # marker, which `estimate_records` turns into an absent point.
+                points.append({"sol": {}, "measures": {},
+                               "refused": "layout", "reason": str(exc)})
+                continue
             rows, keys = pending.keyed_at(rows, gpu_sku=pw.gpu_sku)
             point = without_step({**shared, **_stamp_gpu_on_result(
                 base, pw, ceilings, pending.walked_on, batches=batches,
@@ -3328,6 +3360,7 @@ def _capacity_pending(
                     "ep_moe": parallel.ep_moe, "cp": parallel.cp,
                     "dp_attention": parallel.dp_attention,
                     "dp_replicas": parallel.dp_replicas,
+                    "dcp": parallel.dcp,
                 },
                 "gpu_memory_fraction": p.gpu_memory_fraction,
                 "weight_bytes_total": weight_bytes_total,
@@ -3385,6 +3418,8 @@ def _capacity_pending(
                 output_tokens=avg_output_tokens,
                 s_prefix_cached=p.s_prefix_cached, s_verify=p.s_verify,
                 ep_load_factor=p.ep_load_factor,
+                dcp_selected_load_factor=p.dcp_selected_load_factor,
+                dcp_failed_owners=p.dcp_failed_owners,
                 precision=p.precision, cells=p.cells)
             if _phase == "prefill":
                 prefill_step_eval = _ev
@@ -3606,6 +3641,7 @@ def _capacity_pending(
                 "tp_moe_expert": parallel.tp_moe_expert, "ep_moe": parallel.ep_moe,
                 "cp": parallel.cp, "dp_attention": parallel.dp_attention,
                 "dp_replicas": parallel.dp_replicas,
+                "dcp": parallel.dcp,
             },
             "gpu_memory_fraction": p.gpu_memory_fraction,
             "weight_bytes_total": weight_bytes_total,
@@ -3630,6 +3666,10 @@ def _capacity_pending(
             "assumptions": deployment_assumptions(
                 parallel, ep_load_factor=p.ep_load_factor,
                 has_dispatch_zone=has_dispatch_zone,
+                sparse_dcp=(decode_step_eval is not None
+                            and bool(decode_step_eval.analysis.striped_cache_owners)),
+                dcp_selected_load_factor=p.dcp_selected_load_factor,
+                dcp_failed_owners=p.dcp_failed_owners,
                 joined_streams=(
                     sorted(prefill_step_eval.analysis.program.joined_streams)
                     if prefill_step_eval is not None else ())),

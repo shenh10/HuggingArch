@@ -507,6 +507,27 @@ def resolve_block_input_ports(
 
 
 
+class SparseDcpSpec(BaseModel):
+    """The structural positions of a sparse-DCP runtime graph.
+
+    A component declaring this says which node of its graph plays each
+    position (`score` -> the node whose op is `dsa_attention_score`); it is
+    a STRUCTURAL fact, independent of any serving framework. Which OP the
+    runtime requires at each position, and the sizes/phases/loads its audited
+    kernels are built for, are a framework binding's facts
+    (`SparseDcpRuntime`), never the spec's. No framework name appears here.
+    """
+    query_projection: str
+    absorbed_query: str
+    stored_kv_projection: str
+    value_projection: str
+    score: str
+    softmax: str
+    apply: str
+    indexer_logits: str
+    indexer_topk: str
+
+
 class BlockGraph(BaseModel):
     """Computation DAG for a single transformer block.
 
@@ -529,6 +550,7 @@ class BlockGraph(BaseModel):
     # Omitted by every component whose decode form is its prefill form, which is
     # almost all of them.
     decode_variant: Optional[str] = None
+    sparse_dcp: Optional[SparseDcpSpec] = None
     # The phases that run `decode_variant` in place of this graph: decode
     # alone unless the component says otherwise. A sparse MLA attention
     # (DSA) also prefills absorbed — its query reads its selected rows of

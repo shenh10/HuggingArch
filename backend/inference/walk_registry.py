@@ -19,9 +19,10 @@ plan's measurable-launch projection and an estimate's served view share the
 symbolic walk without being forced to expose the same row subset.
 """
 from __future__ import annotations
+from backend.arch.runtime_profile import RuntimeProfile
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import threading
 from typing import Any, Callable, Optional
 
@@ -41,10 +42,13 @@ class WalkCellKey:
     config: str
     parallel: str
     precision: str
+    runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED
+
+    runtime_contract_key: str = ""
 
     def key(self) -> str:
         return make_key("walk-cells", self.model_id, self.version, self.config,
-                        self.parallel, self.precision)
+                        self.parallel, self.precision, self.runtime_profile.value, self.runtime_contract_key)
 
 
 @dataclass
@@ -98,7 +102,9 @@ WALK_CELLS = KeyedCache(
 
 
 def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
-                      model_id: Optional[str] = None) -> SharedWalkCells:
+                      model_id: Optional[str] = None,
+                      runtime_profile: RuntimeProfile = RuntimeProfile.DECLARED,
+                      runtime_contract: Any = None) -> SharedWalkCells:
     """The `StepCells` for one model, deployment and precision.
 
     `parallel` and `precision` are their canonical domain objects
@@ -107,6 +113,8 @@ def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
     The raw config is named beside the engine version because a framework
     binding may read checkpoint fields (the Mamba scan chunk, for example)
     that the model footprint digest does not change.
+
+    The selected serving contract determines the physical storage and launches.
     """
     p = provider()
     # The key is derivation, not a dependency of what the entry holds.
@@ -114,10 +122,15 @@ def shared_walk_cells(resolved: Any, parallel: Any, precision: Any, *,
         key = WalkCellKey(model_id=model_id, version=data_version(resolved),
                           config=json.dumps(resolved.config, sort_keys=True,
                                             default=str, separators=(",", ":")),
-                          parallel=repr(parallel), precision=precision.key)
+                          parallel=repr(parallel), precision=precision.key,
+                          runtime_profile=RuntimeProfile(runtime_profile),
+                          runtime_contract_key=(json.dumps(asdict(runtime_contract), sort_keys=True)
+                                                if runtime_contract is not None else ""))
 
     def build() -> SharedWalkCells:
-        return SharedWalkCells(resolved, StepCells(), key, key.key())
+        return SharedWalkCells(
+            resolved, StepCells(key.runtime_profile, runtime_contract),
+            key, key.key())
 
     entry = WALK_CELLS.get_or_compute(key.key(), build)
     p.attach(entry.trace)

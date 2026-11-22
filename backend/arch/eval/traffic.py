@@ -320,6 +320,7 @@ class TrafficGeometry:
     #: and the tensor it reads can be cut differently. Replacing `shapes`'
     #: program replaces it too.
     whole_shapes: Layer[Any]
+    cache_geometry: Optional[cache.CacheGeometry] = None
     #: Whole-cache view uid -> how many times fewer positions that view's
     #: invocation owns than the tensor landed on ITS edge in this program.
     #: The divisor is a ratio of two shape facts, not a property of the view
@@ -328,6 +329,8 @@ class TrafficGeometry:
     #: a fact of `shapes`' program: replacing `shapes` replaces it too.
     cache_view_frame_divisor: Mapping[int, Extent] = field(
         default_factory=dict)
+    # Runtime operand replicas can differ from checkpoint alias ownership.
+    read_aliases: Optional[Mapping[int, Mapping[int, Any]]] = None
 
     @staticmethod
     def _axis_identity(axis: Any, *, tracked_only: bool = False) -> Optional[str]:
@@ -480,7 +483,7 @@ class TrafficGeometry:
                 raise ValueError(
                     f"traffic geometry changed format identity for owner {uid}"
                 )
-        expected_cache = cache.derive(analysis)
+        expected_cache = cache.derive(analysis, geometry=self.cache_geometry)
         if set(self.cache.values) != set(expected_cache.values):
             raise ValueError("traffic geometry must project every cache owner")
         for uid, source in expected_cache.values.items():
@@ -1403,7 +1406,9 @@ def derive(analysis: Any, *,
         for tensor in entry.tensors if tensor.recurrent)
     effective_rewrite = analysis.rewrite if rewrite is None else rewrite
     origins = dict(effective_rewrite.origins or {})
-    read_aliases = program.read_aliases or {}
+    read_aliases = (geometry.read_aliases
+                    if geometry is not None and geometry.read_aliases is not None
+                    else program.read_aliases or {})
     borrowed_by = _borrowed_sources(program)
     # Each walked matmul whose weight is held wider than its activation —
     # the walk's own layer (`Analysis.weight_promotions`). Read for the

@@ -32,6 +32,7 @@ _DOT_STEMS = (
 _PACK_STEMS = (
     "XiaomiMiMo__MiMo-V2.6-Pro-RL",
     "moonshotai__Kimi-K3",
+    "moonshotai__Kimi-K3.1-Pro",
 )
 _GPT_OSS_STEM = "openai__gpt-oss-20b"
 _ALL_STEMS = (*_DOT_STEMS, *_PACK_STEMS, _GPT_OSS_STEM)
@@ -95,11 +96,13 @@ def _precision(stem: str, sku: str | None, *, peaks=(), flags=None,
             server_flags=flags,
             peak_families=tuple(peaks))
     binding = get_binding("vllm").deployed(deployment)
-    precision = ResolvedPrecision(AS_SHIPPED, shared_program(stem))
+    program = shared_program(stem)
+    precision = ResolvedPrecision(AS_SHIPPED, program)
     return binding, precision.with_launches(
-        binding.precision_launches_for(),
+        binding.precision_launches_for(program),
         peak_families=tuple(peaks),
-        unavailable_launches=binding.unavailable_precision_launches_for())
+        unavailable_launches=binding.unavailable_precision_launches_for(
+            program))
 
 
 def _selected(stem: str, **kwargs):
@@ -203,7 +206,8 @@ def test_pack_quantized_matrix_is_bit_for_bit_with_the_sm_selector(
         assert precision.launch_gap(
             None, "", coordinate.formats).startswith(
                 "missing_deployment_fact:mxfp4_pack_quantized_weight_only")
-        assert binding.unavailable_precision_launches_for()
+        assert binding.unavailable_precision_launches_for(
+            shared_program(stem))
     else:
         assert launch is not None
         assert launch.name == expected

@@ -194,14 +194,15 @@ def test_a_cardless_walk_takes_the_requirement_and_no_launch():
                                                       get_binding)
     from backend.inference.parallel_config import ParallelConfig
     from backend.inference.pipeline import analyze
-    from tests.snapshots import resolve_snapshot
+    from tests.snapshots import resolve_snapshot, shared_program
 
     # No card and no platform: the ordering table is absent, so a candidate
     # that needs one is unavailable rather than selected.
     binding = get_binding("vllm").deployed(
         ServingDeployment.of(activation_dtype="BF16"))
     assert binding.deployment.peak_families == (), "a walk with no card"
-    assert binding.unavailable_precision_launches_for(), (
+    assert binding.unavailable_precision_launches_for(
+        shared_program("deepseek-ai__DeepSeek-V4-Flash")), (
         "the case only bites where a candidate went unavailable"
     )
     result = analyze(

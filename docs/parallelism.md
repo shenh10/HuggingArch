@@ -356,3 +356,27 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
 | `auto_sweep.blend`, `t_partial_s` ("partial measured") | 自述词 | the step with each measured term at its measured time and every other term at its SOL time; never called measured, always shown with `partial_measured_share` |
 | `Seams`, seam (`eval/fusion.py`) | loop-carried dependence (the edge from one loop iteration to the next) | a formal a layer reads that the previous iteration — or, after the loop, its last iteration — wrote, read off the walk's references (`Program.threads_loop`); a fusion matches across it, once per pair of occurrences on one pipeline stage (`Rule.stage_of`) |
 | runs of a node (`FusedNode.iterations`, `FusedProgram.left`, `Rewrite.taken`) | 自述词(cf. loop peeling: the iterations a rewrite treats apart) | the iterations a node runs at, the one statement of how often it runs; a launch took the rest of a node with runs left, and every count is read off it (`Layer.rebase_counts`) |
+
+### Sparse decode context parallelism
+
+A striped cache assigns successive positions to successive DCP ranks. At
+sequence length L and degree D, the busiest rank can hold ceil(L / D)
+positions. Position padding accounts for the final partial stripe in the
+allocation. The read law counts the positions a query actually visits.
+
+The selected-position load factor (`rho_dcp`) is the busiest rank's number of
+selected keys divided by the average across ranks. A factor of one represents
+balanced ownership. At degree eight, a factor of eight puts all selected keys
+on one rank. A trace can supply the ownership distribution for a specific
+request.
+
+Each rank sends local top-k candidates. The candidate certificate tests
+whether those candidates suffice to recover the global top-k.
+`dcp_failed_owners` counts ranks whose remaining candidates must be exchanged
+after this test. The fallback round depends on the first exchange. The two
+rounds therefore contribute sequential communication time.
+
+FlashMLA partitions local attention into windows. Each partition produces
+a partial output and a log-sum-exp value. Online attention combine merges
+these partials into one normalized output. Runtime allocations include
+copies of projection weights prepared by the serving framework.

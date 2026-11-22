@@ -59,6 +59,12 @@ def test_a_write_is_quantised_by_what_came_before_it_in_place_or_assigned():
     # what the write stored.
 
 
+def test_native_kernel_evidence_does_not_disable_python_cache_write_check():
+    python = {"path": "model.py", "text": SOURCE}
+    native = {"path": "cache.cuh", "text": "template<typename T> __global__ void store(T* p) {}"}
+    assert quantised_writes([native, python]) == quantised_writes([python])
+
+
 def test_the_spec_is_asked_for_each_format_the_writes_need(monkeypatch):
     stem = "deepseek-ai__DeepSeek-V4.1-Flash"
     resolved = _resolved(stem)

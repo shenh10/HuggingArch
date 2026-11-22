@@ -491,7 +491,7 @@ def _exact(v: Any) -> sp.Expr:
 def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
                     convert: Any = 0, kv_read: Any = 0, demand: Any,
                     weight_total: float, metadata_total: float,
-                    comm_payload: Any = 0, comm_priced: bool = False,
+                    comm_payload: Any = 0, comm_priced: bool = False, comm_active: Any = 1,
                     comm_algorithms: Sequence[str] = (NCCL,)
                     ) -> Dict[str, sp.Expr]:
     """One row's law as expressions over the workload and the card symbols
@@ -531,7 +531,7 @@ def build_row_exprs(*, count: int, flops: Any, act_in: Any, act_out: Any,
     t_memory = (weight_read + metadata + act) / PEAK_BW
     t_comm: sp.Expr = sp.Integer(0)
     if comm_priced:
-        arms = [comm_bytes * rate + fixed for rate, fixed
+        arms = [comm_bytes * rate + _exact(comm_active) * fixed for rate, fixed
                 in map(candidate_symbols, comm_algorithms)]
         t_comm = arms[0] if len(arms) == 1 else as_written(sp.Min, *arms)
     # A row launches a kernel when it moves anything and is not a
@@ -591,12 +591,17 @@ def law_columns(exprs: Mapping[str, sp.Expr], book: "LawBook"
 #: and the measured side's
 #: launches `n_<k>` and launch time `T_<k>` of a step's term `k`. Closed:
 #: laws cross processes and the disk, and a re-read trusts no other name.
+
+# The workload family is derived from `POINT_NAMES` (the `Workload.symbols`
+# names, in order) rather than spelled out again: a new workload input
+# (rho_dcp, dcp_failed_owners) must land here with no second list to drift.
+_WORKLOAD_NAME = "|".join(map(re.escape, sorted(POINT_NAMES, key=len, reverse=True)))
 _LAW_NAME = re.compile(
-    r"(?P<workload>B|s_input|s_output|s_prefix|s_verify|rho)"
-    r"|(?P<bw>PEAK_BW)|(?P<peak>PEAK_FLOPS(_\w+)?)"
-    r"|(?P<comm>COMM_S_PER_BYTE(_\w+)?)|(?P<latency>COMM_LATENCY_S(_\w+)?)"
-    r"|(?P<launch_floor>LAUNCH_S)|(?P<launches>n_\d+)"
-    r"|(?P<launch_time>T_\d+)")
+    rf"(?P<workload>{_WORKLOAD_NAME})"
+    rf"|(?P<bw>PEAK_BW)|(?P<peak>PEAK_FLOPS(_\w+)?)"
+    rf"|(?P<comm>COMM_S_PER_BYTE(_\w+)?)|(?P<latency>COMM_LATENCY_S(_\w+)?)"
+    rf"|(?P<launch_floor>LAUNCH_S)|(?P<launches>n_\d+)"
+    rf"|(?P<launch_time>T_\d+)")
 
 
 def law_symbol(name: str) -> sp.Symbol:
@@ -1063,7 +1068,8 @@ def point_columns(at: RowAt, row: Mapping[str, Any], card: RowCard, *,
         phases = RowRoofline.comm(
             sig, tensor_bytes=at.comm_bytes, fabric=card.fabric,
             t_sym=t_sym, t_sub=t_sub)[1]
-        choice = sig.envelope(card.fabric).choice(at.comm_bytes)
+        if at.comm_bytes > 0:
+            choice = sig.envelope(card.fabric).choice(at.comm_bytes)
     bw, label = 0.0, ""
     if phases:
         bottleneck = max(phases, key=lambda ph: ph["t_phase_s"])

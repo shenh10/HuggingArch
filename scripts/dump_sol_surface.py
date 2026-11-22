@@ -19,6 +19,14 @@ from typing import Any
 
 
 DEPLOYMENTS = {
+    "b300_dcp8": {
+        "snapshots": ["moonshotai__Kimi-K3.1-Pro.json"],
+        "num_gpus": 8,
+        "inputs": {"gpu_sku": "B300", "framework": "sglang",
+                   "decode_batch_size": 1, "prefill_batch_size": 1},
+        "parallel": {"tp_attention": 8, "tp_dense_ffn": 8,
+                     "tp_moe_expert": 4, "ep_moe": 2, "dcp": 8},
+    },
     "eight": {
         "num_gpus": 8,
         "parallel": {
@@ -52,6 +60,11 @@ FIXED_INPUTS = {
     "avg_output_tokens": 1024,
     "selection_mode": "theoretical_only",
 }
+
+
+def deployments_for(snapshot: str):
+    return {name: case for name, case in DEPLOYMENTS.items()
+            if "snapshots" not in case or snapshot in case["snapshots"]}
 
 
 def _args() -> argparse.Namespace:
@@ -255,7 +268,8 @@ def _phase(
 
 
 def measure_case(config: dict[str, Any], deployment: dict[str, Any],
-                 resolved: Any = None) -> dict[str, Any]:
+                 resolved: Any) -> dict[str, Any]:
+    """Measure the supplied resolved snapshot under its declared runtime."""
     from backend.inference.capacity import estimate_pending
     from backend.inference.parallel_config import ParallelConfig
     from backend.inference.sol_closure import check_closure
@@ -277,7 +291,7 @@ def measure_case(config: dict[str, Any], deployment: dict[str, Any],
         resolved=resolved,
         num_gpus=deployment["num_gpus"],
         parallel=ParallelConfig(**deployment["parallel"]),
-        **FIXED_INPUTS,
+        **{**FIXED_INPUTS, **deployment.get("inputs", {})},
     ).finish()
     check_closure(result)
 
@@ -333,10 +347,12 @@ def main() -> int:
         config = json.loads((snapshot_dir / name).read_text())["config"]
         model_id = Path(name).stem.replace("__", "/", 1)
         resolved = SpecLoader().match(config, model_id=model_id)
+        if resolved is None:
+            raise ValueError(f"No spec matches snapshot {name!r}")
         cases[name] = {
             deployment_name: measure_case(
                 config, DEPLOYMENTS[deployment_name], resolved)
-            for deployment_name in deployments
+            for deployment_name in deployments if deployment_name in deployments_for(name)
         }
 
     from backend.arch.eval.precision import PrecisionProfile

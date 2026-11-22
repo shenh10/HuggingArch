@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from math import prod
 import operator
-from typing import Any, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Mapping, Optional, Tuple
 
 import sympy as sp
 
@@ -25,6 +25,9 @@ from . import weight_endpoints
 from .layout import TensorLayout
 
 
+if TYPE_CHECKING:
+    from .runtime_weights import RuntimeWeightAllocation
+
 ArtifactKey = Tuple[int, int, int, str, Optional[int]]
 
 #: Storage surfaces of one stored tensor: where an artifact lives — the tensor
@@ -33,6 +36,7 @@ ArtifactKey = Tuple[int, int, int, str, Optional[int]]
 STORED = "stored"
 SAVED_METADATA = "saved_metadata"
 RESIDENT_METADATA = "resident_metadata"
+RUNTIME_ALLOCATION = "runtime_allocation"
 
 
 @dataclass(frozen=True)
@@ -80,6 +84,8 @@ class PhysicalArtifact:
     #: times `global_instances` — not `resident_bytes_per_instance`, which
     #: is already TP-cut.
     resident_bytes_unsharded: int
+    # Kept optional for checkpoint artifacts.
+    runtime_allocation: Optional[RuntimeWeightAllocation] = None
 
     @property
     def key(self) -> ArtifactKey:
@@ -129,7 +135,11 @@ def physical_artifacts(analysis: Any) -> Tuple[PhysicalArtifact, ...]:
         ((row.node_uid, row.tensor_index) for row in weights),
         "weight endpoint",
     )
-    return _PhysicalJoin(analysis, weights).run()
+    artifacts = _PhysicalJoin(analysis, weights).run()
+    if analysis.rule.sparse_dcp.storage_plans:
+        from .runtime_weights import join_runtime_allocations, sparse_dcp_allocations
+        artifacts = join_runtime_allocations(artifacts, sparse_dcp_allocations(analysis, artifacts))
+    return artifacts
 
 
 
@@ -251,7 +261,7 @@ def resident_weights(artifacts: Tuple[PhysicalArtifact, ...]) -> Weights:
         if row.surface == RESIDENT_METADATA:
             metadata += amount
             node_weights = node_weights.add(metadata=amount)
-        elif row.surface == STORED:
+        elif row.surface in (STORED, RUNTIME_ALLOCATION):
             dtype = (row.resident_logical_dtype
                      or row.resident_storage_dtype or "").upper()
             if row.is_parameter:
@@ -300,7 +310,7 @@ def whole_resident(
         if included is not None and row.stack not in included:
             continue
         if row.surface not in (
-            STORED, RESIDENT_METADATA,
+            STORED, RESIDENT_METADATA, RUNTIME_ALLOCATION,
         ):
             continue
         total += row.resident_bytes_unsharded * row.global_instances

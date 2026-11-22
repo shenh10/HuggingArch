@@ -26,7 +26,7 @@ from .gpu_specs import NoPeakForDtype, peak_flops_for_dtype
 from .parallel_config import ParallelConfig
 from .phases import compute_per_op_timing
 from .serving import ServingLayers
-from .step_eval import evaluate_step
+from .step_eval import StepCells, evaluate_step
 
 
 @dataclass
@@ -218,6 +218,9 @@ def analyze(
                 "pipeline.analyze walks the step itself only at a stated "
                 "workload: pass avg_input_tokens and avg_output_tokens, or "
                 "the step_eval to read")
+        from backend.arch.eval.program import Program
+        contract = (framework_binding.sparse_runtime_for(Program.of(resolved_spec), parallel)
+                    if framework_binding is not None else None)
         step_eval = evaluate_step(
             resolved_spec,
             parallel,
@@ -228,7 +231,7 @@ def analyze(
             s_prefix_cached=s_prefix_cached,
             s_verify=s_verify,
             ep_load_factor=ep_load_factor,
-            precision=precision,
+            precision=precision, cells=StepCells(runtime_contract=contract),
         )
     resolved_spec = step_eval.spec
     timed = (
