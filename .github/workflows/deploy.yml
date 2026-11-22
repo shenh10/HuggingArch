@@ -1,50 +1,34 @@
-# Deploy to Fly.io on every successful main-branch push.
+# The release gate of every main commit. The self-hosted host deploys a main
+# commit only after this workflow's `release-gate` check run concluded
+# `success` on it: its deployer (deploy/self-hosted/deployer/autodeploy.py)
+# pulls main and reads that check run itself — nothing here reaches the host,
+# and no repository secret names it. (Fly is retired: fly.toml stays only as
+# a rollback.)
 #
-# TEMPORARILY DISABLED: auto-deploy on push to main is off until the
-# product is ready. Restore `push: branches: [main]` under `on:` (and
-# drop `workflow_dispatch` if you do not want a manual run) to turn it
-# back on.
-#
-# The deploy is gated by the `smoke` job (its `needs`): the full suite must
-# have passed on this commit in the `tests` workflow (the push runs it; the
-# gate waits for it, and refuses a red, cancelled or missing run), and a
-# few-minute smoke subset must pass here. The full suite is not run twice.
-#
-# Prerequisites — set ONCE in repo Settings → Secrets and variables:
-#   • FLY_API_TOKEN   — `flyctl auth token` from your local machine
+# The gate: the full suite must have passed on this commit in the `tests`
+# workflow (the push runs it; the gate waits for it, and refuses a red,
+# cancelled or missing run), and a few-minute smoke subset must pass here.
+# The full suite is not run twice. A commit marked `[emergency-deploy]`
+# skips the wait for the full suite.
 
-name: deploy
+name: release gate
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
-      skip_warm:
-        description: >-
-          Skip the build-time gallery warm (HA_SKIP_WARM=1). Only when this
-          commit's engine has been warmed into the shared Supabase cache
-          (`python -m backend.warm_caches` with SUPABASE_* set); the image then
-          ships no gallery cache and reads that one.
-        type: boolean
-        default: false
       skip_tests:
         description: >-
-          Deploy without waiting for the full-suite gate. Emergency releases
-          only: the smoke subset below still runs, and the push-side full
-          suite remains required for a green main commit.
+          Pass the gate without waiting for the full suite (dispatched on
+          main, the host then deploys main's head). Emergency releases only:
+          the smoke subset below still runs, and the push-side full suite
+          remains required for a green main commit.
         type: boolean
         default: false
 
-# Don't ship two releases in parallel from rapid back-to-back pushes.
-concurrency:
-  # An emergency restore must not queue behind a normal run that is waiting
-  # for the full suite; it still uses the smoke subset and post-deploy checks.
-  group: ${{ contains(github.event.head_commit.message, '[emergency-deploy]') && format('deploy-emergency-{0}', github.sha) || 'deploy-prod' }}
-  cancel-in-progress: false
-
 jobs:
-  smoke:
+  release-gate:
     runs-on: ubuntu-latest
     # Bounded by the wait for this commit's `tests` run (90 minutes) plus
     # the smoke subset.
@@ -52,10 +36,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-    # The engine hash this commit serves; the deploy job's post-deploy smoke
-    # waits for /inference/version to answer it (a rolling deploy).
-    outputs:
-      engine: ${{ steps.engine.outputs.engine }}
     steps:
       # The full suite runs on every push to main and on a dispatch that
       # asks for a deploy (test.yml); this commit ships only if that run
@@ -104,8 +84,6 @@ jobs:
       # `test.yml`): a gate that measured only `backend/` left
       # `kernel_bench/`, `tools/` and `scripts/` unchecked.
       - run: uv run ruff check .
-      - id: engine
-        run: echo "engine=$(uv run python -c 'from backend.fingerprint import engine_version; print(engine_version())')" >> "$GITHUB_OUTPUT"
       # What a release must do on its own: the web app builds, the shared
       # `web/src` modules still behave as their contract tests say, the
       # service layer stays out of the core, the app answers its root,
@@ -129,58 +107,3 @@ jobs:
             tests/backend/api/test_supported_models_api.py \
             tests/backend/api/test_agent_backends.py \
             -n auto --dist loadfile --timeout=600 -q --tb=short
-
-  deploy:
-    needs: smoke
-    runs-on: ubuntu-latest
-    # The remote build installs torch + CUDA wheels, builds the web app and
-    # warms the gallery for every model (`backend.warm_caches`) before the
-    # rolling deploy; 15 minutes stopped being enough as the corpus grew.
-    # Plus the post-deploy smoke: up to 15 minutes for the rollout to answer
-    # the new engine and 10 for the landing frontier.
-    timeout-minutes: 75
-    # Only the main repo deploys. Compare against the literal repository
-    # name: `github.repository == github.event.repository.full_name` holds
-    # on every push event, forks included.
-    # Only this public repository owns the current Fly deploy token. The old
-    # archive repository must never deploy again.
-    if: github.repository == 'shenh10/HuggingArch'
-      && !contains(github.event.head_commit.message, '[storage-recovery]')
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      # Build remotely on Fly's builders so the runner doesn't need
-      # docker. Without --remote-only, GitHub Actions tries local
-      # docker build which is slower + needs setup-buildx.
-      # HA_GIT_SHA: the image has no `.git`; the service names its code
-      # revision from this build arg (Dockerfile, runtime stage).
-      - name: flyctl deploy
-        env:
-          SKIP_BUILD_WARM: ${{ inputs.skip_warm || github.event_name == 'push' }}
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: |
-          skip_warm=0
-          [ "$SKIP_BUILD_WARM" = true ] && skip_warm=1
-          # The entrypoint downloads and verifies the release artifacts before
-          # it binds port 8000.  A cold 1.9 GB bootstrap can exceed flyctl's
-          # default five-minute health wait; the post-deploy content smoke
-          # below remains the actual release gate.
-          flyctl deploy --remote-only --strategy rolling \
-            --wait-timeout 30m \
-            --build-arg HA_GIT_SHA=${{ github.sha }} \
-            --build-arg HA_SKIP_WARM=$skip_warm
-
-      # What the release serves, by content: a shared Kernel Bench row's key
-      # comes back measured in an estimate, the landing frontier draws
-      # measured points and revisits from cache, and /health's lookups answer
-      # rows. Status shapes (200, model counts, `state == "reads"`) stayed
-      # green for weeks while lookups returned zero rows; this does not.
-      # Waits for the rollout to answer this commit's engine first. Stdlib
-      # only, so the runner's python3 runs it. A red smoke fails the run.
-      - name: post-deploy content smoke
-        run: |
-          python3 tools/post_deploy_smoke.py https://www.huggingarch.com \
-            --expect-version "${{ needs.smoke.outputs.engine }}" \
-            --version-wait 900 --gallery-wait 600

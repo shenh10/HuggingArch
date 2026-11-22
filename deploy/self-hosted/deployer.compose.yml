@@ -1,0 +1,32 @@
+# The deployer (deployer/autodeploy.py), its own compose project so rolling
+# the app stack never restarts it. Started once by hand (README.md); after
+# that it restarts with the Docker VM.
+name: huggingarch-deployer
+
+services:
+  deployer:
+    build: ./deployer
+    restart: unless-stopped
+    # The VM's network: the smoke reads the app's loopback port, and the
+    # egress rules are the VM's iptables (NET_ADMIN).
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    environment:
+      HA_REPO_URL: https://github.com/shenh10/HuggingArch.git
+      # main in production; another branch only for a trial of the deployer.
+      HA_BRANCH: ${HA_BRANCH:-main}
+      # The check run a commit must have passed: deploy.yml's job.
+      HA_GATE_CHECK: release-gate
+      HA_ENV_FILE: /secrets/prod.env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - work:/work
+      - secrets:/secrets:ro
+
+volumes:
+  work:
+  # The host's secrets, copied into the VM (README.md): the VM mounts nothing
+  # of the machine it runs on.
+  secrets:
+    external: true
+    name: huggingarch-secrets

@@ -15,10 +15,11 @@ only. Agent flows are deliberately not here.
 
 Key resolution (most-specific wins):
   1. Verified JWT subject — `user:<sub>` (signed-in users)
-  2. `Fly-Client-IP`        — `ip:<addr>`, only when proxy headers are
-                              trusted (`supabase_env.trust_proxy_headers`;
-                              the Fly edge overwrites the header, elsewhere
-                              a client could supply it)
+  2. the edge's client-IP header — `ip:<addr>`, only when proxy headers
+                              are trusted (`supabase_env.client_ip_header`:
+                              `Fly-Client-IP` on Fly, `CF-Connecting-IP`
+                              behind a Cloudflare Tunnel; the edge overwrites
+                              it, elsewhere a client could supply it)
   3. request.client.host   — `ip:<addr>` (direct)
 
 What is counted: the work a client starts, not its requests. A request on
@@ -149,10 +150,10 @@ _lock = threading.Lock()
 
 
 def _resolve_key(request: Request) -> str:
-    """Pick a stable key from the request. JWT sub > Fly-Client-IP > client.host.
-    Fly-Client-IP counts only when proxy headers are trusted (Fly, or an
-    operator opt-in) — on a directly-exposed deployment it is client-
-    supplied and would let a caller rotate bucket keys at will."""
+    """Pick a stable key from the request. JWT sub > edge client IP >
+    client.host. The edge header counts only when proxy headers are trusted
+    (Fly, or an operator opt-in) — on a directly-exposed deployment it is
+    client-supplied and would let a caller rotate bucket keys at will."""
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer ") and supabase_env.jwt_verification_available():
         token = auth[len("Bearer "):].strip()
@@ -163,8 +164,9 @@ def _resolve_key(request: Request) -> str:
                 return f"user:{sub}"
         except Exception:
             pass  # fall through to IP
-    if supabase_env.trust_proxy_headers():
-        edge_ip = request.headers.get("Fly-Client-IP", "").strip()
+    header = supabase_env.client_ip_header()
+    if header:
+        edge_ip = request.headers.get(header, "").strip()
         if edge_ip:
             return f"ip:{edge_ip}"
     if request.client and request.client.host:
