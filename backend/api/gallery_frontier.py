@@ -1592,15 +1592,19 @@ async def warm_frontier(view: FrontierView,
     model_ids = sorted(iter_snapshot_ids())
     head = _frontier_head(view)
     report_partial(head=head)
-    track = await run_off_loop(_view_scope, view)
+    # Every job of the offline queue holds a ranked cell slot (`run_ranked`),
+    # the reads too: a warm running several of these at once ranks them
+    # (`offload.offline_rank`), and a read waiting for a worker is ranked
+    # with the walks, not queued behind every cell of a later batch.
+    track = await run_ranked(_view_scope, view)
 
     read_slots = asyncio.Semaphore(_model_concurrency())
 
     async def read_one(model_id: str) -> dict:
         async with read_slots:
             try:
-                return await run_off_loop(
-                    _frontier_read, model_id, view, track)
+                return await run_ranked(
+                    _frontier_read, model_id, view, track, name=model_id)
             except Exception as exc:
                 return {"drawn": _draw(
                     {"model_id": model_id, "layouts": [], "error": str(exc)},

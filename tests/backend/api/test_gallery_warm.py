@@ -40,16 +40,14 @@ def test_all_models_layouts_share_one_queue_and_finish_per_model(monkeypatch):
     monkeypatch.setattr(f, "_view_scope",
                         lambda _view: (NO_MEASUREMENTS, "none"))
 
-    async def run_off(fn, *args):
+    events: list[tuple[str, str]] = []
+
+    async def run_ranked(fn, *args, name=None):
+        # The reads hold ranked slots too: a warm runs views side by side.
         if fn is f._view_scope:
             return (NO_MEASUREMENTS, "none")
         if fn is f._frontier_read:
             return {"walk": plans[args[0]]}
-        raise AssertionError(fn)
-
-    events: list[tuple[str, str]] = []
-
-    async def run_ranked(fn, *args, name=None):
         if fn is f._layout_job:
             work = args[0]
             events.append(("layout", work.model_id))
@@ -59,7 +57,6 @@ def test_all_models_layouts_share_one_queue_and_finish_per_model(monkeypatch):
             return {"model_id": name, "built": True}
         raise AssertionError(fn)
 
-    monkeypatch.setattr(f, "run_off_loop", run_off)
     monkeypatch.setattr(f, "run_ranked", run_ranked)
     monkeypatch.setattr(f, "report_partial", lambda **_kwargs: None)
     monkeypatch.setattr(f, "report_progress", lambda *_args: None)
