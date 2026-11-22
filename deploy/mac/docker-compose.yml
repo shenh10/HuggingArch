@@ -3,7 +3,8 @@
 # linux/arm64); this file holds only what is this host's: the volume, the
 # host sizing, the edge (a Cloudflare Tunnel) and the machine id.
 # Host-independent runtime configuration lives in the image, shared with
-# fly.toml. Secrets are in ./.env (gitignored; template: env.example).
+# fly.toml. Secrets are in ~/.config/huggingarch/mac.env, outside every
+# checkout (template: env.example); deploy.sh passes it as HA_ENV_FILE.
 # Steps: README.md.
 name: huggingarch
 
@@ -19,7 +20,7 @@ services:
         HA_SKIP_WARM: ${HA_SKIP_WARM:-1}
     image: huggingarch:local
     restart: unless-stopped
-    env_file: .env
+    env_file: ${HA_ENV_FILE:?run through deploy.sh, or set HA_ENV_FILE}
     environment:
       # The edge: cloudflared overwrites CF-Connecting-IP and
       # X-Forwarded-Proto, and the app is reachable only through it (the
@@ -27,12 +28,12 @@ services:
       HA_TRUST_PROXY_HEADERS: "1"
       HA_CLIENT_IP_HEADER: CF-Connecting-IP
       # This machine's id: the Kernel Bench lake's lease and the spec
-      # worker's machine identity. Set HA_MACHINE in .env.
-      BENCH_LAKE_MACHINE: ${HA_MACHINE:?set HA_MACHINE in deploy/mac/.env}
+      # worker's machine identity. Set HA_MACHINE in the env file.
+      BENCH_LAKE_MACHINE: ${HA_MACHINE:?set HA_MACHINE in the env file}
       HA_MACHINE_ID: ${HA_MACHINE}
       # While Fly holds the lake's lease this copy is restored from the
       # backup and serves read-only (no writes, no backups). Set
-      # BENCH_LAKE_LEASE=on in .env only after the lease is transferred
+      # BENCH_LAKE_LEASE=on in the env file only after the lease is transferred
       # (README.md, "Cutover").
       BENCH_LAKE_LEASE: ${BENCH_LAKE_LEASE:-off}
       # Host sizing: the same budget as Fly's 8 GB VM (fly.toml explains
@@ -63,7 +64,7 @@ services:
     restart: unless-stopped
     environment:
       # A remotely-managed tunnel; its public hostname routes to http://app:8000.
-      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in deploy/mac/.env}
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in the env file}
     depends_on:
       - app
 

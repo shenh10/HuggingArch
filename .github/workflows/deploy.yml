@@ -1,4 +1,5 @@
-# Deploy to Fly.io on every successful main-branch push.
+# Deploy to Fly.io and to the self-hosted Mac (deploy/mac/) on every
+# successful main-branch push.
 #
 # TEMPORARILY DISABLED: auto-deploy on push to main is off until the
 # product is ready. Restore `push: branches: [main]` under `on:` (and
@@ -35,11 +36,6 @@ on:
           suite remains required for a green main commit.
         type: boolean
         default: false
-
-# Don't ship two releases in parallel from rapid back-to-back pushes.
-concurrency:
-  group: deploy-prod
-  cancel-in-progress: false
 
 jobs:
   smoke:
@@ -131,6 +127,12 @@ jobs:
   deploy:
     needs: smoke
     runs-on: ubuntu-latest
+    # Don't ship two releases to one host in parallel from rapid
+    # back-to-back pushes. Per host, so a host that is offline (a queued
+    # self-hosted job) never holds another host's release.
+    concurrency:
+      group: deploy-fly
+      cancel-in-progress: false
     # The remote build installs torch + CUDA wheels, builds the web app and
     # warms the gallery for every model (`backend.warm_caches`) before the
     # rolling deploy; 15 minutes stopped being enough as the corpus grew.
@@ -176,3 +178,23 @@ jobs:
           python3 tools/post_deploy_smoke.py https://www.huggingarch.com \
             --expect-version "${{ needs.smoke.outputs.engine }}" \
             --version-wait 900 --gallery-wait 600
+
+  # The self-hosted Mac (deploy/mac/README.md): the same gate as Fly, then
+  # the same script an operator runs by hand, on the runner that machine
+  # registers. Secrets stay on the machine (~/.config/huggingarch/mac.env);
+  # the job is handed none.
+  deploy-mac:
+    needs: smoke
+    runs-on: [self-hosted, macOS, ARM64, huggingarch-mac]
+    # The image build (cached layers) plus the post-deploy smoke's waits.
+    timeout-minutes: 75
+    concurrency:
+      group: deploy-mac
+      cancel-in-progress: false
+    if: github.repository == 'shenh10/HuggingArch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: build, roll and smoke
+        env:
+          NO_PULL: "1"
+        run: deploy/mac/deploy.sh
