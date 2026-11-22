@@ -30,7 +30,9 @@ queued remote writes are drained before the process exits.
 The gallery has no precision axis: every model is shown as shipped.
 Its offline frontier warm hands one card class every missing model × layout
 walk in one ranked queue (parameter count × layout GPUs, largest first); a
-model's entry is assembled only after all of its layouts have landed.
+model's entry is assembled only after all of its layouts have landed. The
+walk classes run side by side, one chain each (`warm_by_class`), ranked in
+Gallery order so a later class fills only the slots an earlier one leaves.
 """
 from __future__ import annotations
 
@@ -67,6 +69,7 @@ from backend.api.sweep_runtime import (
 from backend.api import offload
 from backend.measure import pool
 from backend.inference import gpu_specs
+from backend.inference.card import Card
 from backend.inference.parallel_sweep import (
     ALL_MODES,
     DEFAULT_SWEEP_GPUS,
@@ -215,25 +218,31 @@ def scaling_jobs(
     return jobs
 
 
+def scaling_walk_cards(gpus: list[str] | None) -> list[str]:
+    """The walk card of every class the Scaling series spans, in series
+    order: the card each class's canonical walk is asked on."""
+    series = list(gpus or DEFAULT_SWEEP_GPUS)
+    return list(dict.fromkeys(class_cards(gpu, series)[0] for gpu in series))
+
+
 async def ensureSharedWalks(models: list[str] | None,
-                            gpus: list[str] | None) -> int:
+                            gpus: list[str] | None,
+                            walk_cards: list[str] | None = None) -> int:
     """Produce the canonical walk classes a Scaling warm will consume.
 
     The Gallery warm fills its public card classes. A Scaling-only card (the
     measured RTX-4090) still needs one producer-side bundle before its cells
     can be projections; this walks only classes whose complete record bundle
     is absent. The anchor spans every Scaling context, so this is once per
-    model and card class, not once per request matrix cell.
+    model and card class, not once per request matrix cell. `walk_cards`
+    narrows it to those classes (`scaling_walk_cards`); None is every one.
     """
-    series = list(gpus or DEFAULT_SWEEP_GPUS)
-    representatives: dict[str, str] = {}
-    for gpu in series:
-        cards = class_cards(gpu, series)
-        representatives[cards[0]] = cards[0]
+    representatives = (scaling_walk_cards(gpus) if walk_cards is None
+                       else list(walk_cards))
     wanted = list(dict.fromkeys(_scaling_models(models)))
-    work = [(model, walkCard, askedGpu)
+    work = [(model, walkCard, walkCard)
             for model in wanted
-            for walkCard, askedGpu in representatives.items()]
+            for walkCard in representatives]
     total = len(work)
     window = asyncio.Semaphore(max(1, pool.worker_count()))
 
@@ -263,6 +272,7 @@ async def warm_sweeps(
     modes: list[str] | None = None,
     degrees: list[int] | None = None,
     job_concurrency: int | None = None,
+    walks: int | None = None,
 ) -> int:
     """Fill the sweep cache (`_SWEEP`: memory→disk→Supabase) for every Scaling
     panel POST (parallel + Context × Batch + KV) through the SAME
@@ -272,8 +282,10 @@ async def warm_sweeps(
     the lookup and fold.
     Per-job failures are isolated;
     one bad model never aborts the run. Returns the count of jobs that stored
-    successfully."""
-    walks = await ensureSharedWalks(models, gpus)
+    successfully. `walks` is the count of canonical walks a caller already
+    ensured (`warm_by_class`); None ensures them here first."""
+    if walks is None:
+        walks = await ensureSharedWalks(models, gpus)
     if poolOnly:
         print("SOL answer cache disabled: canonical walks kept only", flush=True)
         return int(walks > 0)
@@ -364,7 +376,8 @@ class WarmProcess:
         # the pool, as in the server. The pool is budgeted beside the API's
         # in one container (fly.toml).
         if self.workers >= 1:
-            offload.serve_requests_off_process(deadline_s=None)
+            # It answers no request (`offload.run_off_process`).
+            offload.run_off_process()
         if self.pidfile is not None:
             self.pidfile.parent.mkdir(parents=True, exist_ok=True)
             self.pidfile.write_text(f"{os.getpid()}\n")
@@ -381,6 +394,55 @@ class WarmProcess:
         if (self.pidfile is not None and self.pidfile.exists()
                 and self.pidfile.read_text().strip() == str(os.getpid())):
             self.pidfile.unlink(missing_ok=True)
+
+
+async def warm_by_class(gallery_gpus: list[str], sweep_gpus: list[str] | None,
+                        models: list[str] | None,
+                        model_params: dict[str, int | None], *,
+                        scaling: bool) -> tuple[bool, int]:
+    """Every Gallery view and, with `scaling`, every Scaling walk, as one
+    chain per walk class run side by side in one pool.
+
+    A class's chain is its views in Gallery order — the first walks the
+    class, the others price that walk — then the class's Scaling walks,
+    which reuse every layout the Gallery walked. Chains do not share a walk,
+    so they need not wait for each other — a walk bundle is keyed by its
+    class (`ServingWalkKey.of_card`), the key chains are grouped by, and
+    within a chain the order of its steps is what lets the later ones read
+    the first one's walk. They are ranked in Gallery order
+    (`offload.offline_rank`, Scaling-only classes last), so a later class
+    takes only the cell slots an earlier one leaves idle — its tail, and the
+    reads and folds that hold fewer jobs than the pool has workers — and
+    the landing view is still the first one filled. (A view's reads are
+    single jobs, outside the slots and unranked; they are short.) Returns whether any
+    Gallery view drew a model, and the Scaling walks ensured."""
+    chains: dict[Any, dict[str, list[str]]] = {}
+    for gpu in gallery_gpus:
+        chains.setdefault(Card.of(gpu).klass.key(),
+                          {"views": [], "walks": []})["views"].append(gpu)
+    if scaling:
+        for card in scaling_walk_cards(sweep_gpus):
+            chains.setdefault(Card.of(card).klass.key(),
+                              {"views": [], "walks": []})["walks"].append(card)
+
+    async def chain(rank: int, views: list[str], walks: list[str]
+                    ) -> tuple[bool, int]:
+        offload.offline_rank(rank)
+        drew = False
+        for gpu in views:
+            print(f"warming the decode frontier on {gpu}", flush=True)
+            if _report_payload(await warm_frontier(FrontierView(gpu),
+                                                   model_params)):
+                drew = True
+        ensured = (await ensureSharedWalks(models, sweep_gpus, walks)
+                   if walks else 0)
+        return drew, ensured
+
+    answers = await asyncio.gather(*[
+        asyncio.create_task(chain(rank, part["views"], part["walks"]))
+        for rank, part in enumerate(chains.values())])
+    return (any(drew for drew, _ in answers),
+            sum(ensured for _, ensured in answers))
 
 
 def _warm_frontier(gpu: str,
@@ -496,6 +558,11 @@ def main(argv: list[str] | None = None) -> int:
             not args.sweeps or args.landing or args.gallery or args.gpus)
         if warmGallery:
             model_params = _warm_model_facts()
+        sweep_gpus = _gpu_list(
+            gpus=args.gpus, all_gpus=args.all_gpus,
+            default=list(DEFAULT_SWEEP_GPUS),
+        )
+        walks = None  # the Scaling walks, once a class chain ensured them
         if args.landing and warmGallery:
             print("warming the homepage default view", flush=True)
             if not _warm_frontier(GALLERY_LANDING_GPU, model_params):
@@ -505,20 +572,19 @@ def main(argv: list[str] | None = None) -> int:
         elif warmGallery:
             gpus = _gpu_list(gpus=args.gpus, all_gpus=False,
                              default=_gallery_gpus())
-            any_ok = False
-            for gpu in gpus:
-                if _warm_frontier(gpu, model_params):
-                    any_ok = True
+            # The Gallery and the Scaling walks, one chain per walk class
+            # (`warm_by_class`); the sweeps project off them after.
+            any_ok, ensured = asyncio.run(warm_by_class(
+                gpus, sweep_gpus, args.models, model_params,
+                scaling=warmScaling))
             if gpus and not any_ok:
                 print("warm produced no successful entries", file=sys.stderr)
                 rc = 1
-        if warmScaling:
-            sweep_gpus = _gpu_list(
-                gpus=args.gpus, all_gpus=args.all_gpus,
-                default=list(DEFAULT_SWEEP_GPUS),
-            )
-            if not asyncio.run(warm_sweeps(models=args.models, gpus=sweep_gpus)):
-                rc = 1
+            if warmScaling:
+                walks = ensured
+        if warmScaling and not asyncio.run(warm_sweeps(
+                models=args.models, gpus=sweep_gpus, walks=walks)):
+            rc = 1
     return rc
 
 

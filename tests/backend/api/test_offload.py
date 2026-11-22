@@ -865,3 +865,66 @@ def test_work_that_publishes_answers_a_waiting_client_without_waiting_for_the_de
     assert behind < 1.0, behind
     assert [i["model_id"] for i in again.partial["items"]] == ["m1"]
     assert quiet >= 2.9 and nothing.retry_after_s is None
+
+
+def test_an_offline_rank_orders_waiters_outside_a_request():
+    """Outside a request the rank a task set (`offline_rank`) orders the
+    slot's waiters, in the task and every task it starts: a batch ranked
+    later takes a slot only when no earlier one waits — even when its
+    waiters queued first."""
+    import asyncio
+
+    async def scenario():
+        slots = offload.PrioritySlots(1)
+        order: list = []
+        release = asyncio.Event()
+
+        async def blocker():
+            async with slots.hold(lambda: 0):
+                await release.wait()
+
+        async def batch(rank, name):
+            offload.offline_rank(rank)
+
+            async def job(i):
+                async with slots.hold(offload.urgency()):
+                    order.append(f"{name}{i}")
+            await asyncio.gather(*(asyncio.create_task(job(i))
+                                   for i in range(2)))
+
+        held = asyncio.ensure_future(blocker())
+        await asyncio.sleep(0)
+        late = asyncio.create_task(batch(1, "late"))
+        await asyncio.sleep(0)
+        early = asyncio.create_task(batch(0, "early"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(held, late, early)
+        return order
+
+    assert asyncio.run(scenario()) == ["early0", "early1", "late0", "late1"]
+
+
+def test_a_process_that_answers_no_request_keeps_no_worker(monkeypatch):
+    """The cells' slots are the pool's workers less those the process keeps
+    for single jobs: one for the server, none for an offline warm."""
+    import asyncio
+
+    monkeypatch.setattr(offload.pool, "worker_count", lambda: 12)
+    monkeypatch.setattr(offload.pool, "configure_workers", lambda **_kw: None)
+
+    def slots() -> int:
+        async def read():
+            return offload._cell_slots()._free
+        return asyncio.run(read())
+
+    try:
+        offload.serve_requests_off_process(deadline_s=None)
+        assert slots() == 11
+        offload.run_off_process()
+        assert slots() == 12
+        assert offload._deadline_s is None
+    finally:
+        offload.stop_serving()
+    assert offload._answers_requests

@@ -50,6 +50,19 @@ def _sweep_calls(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _walk_calls(monkeypatch):
+    """Stub the Scaling class walks; records the walk cards of each call."""
+    calls = []
+
+    async def fake_walks(models, gpus, walk_cards=None):
+        calls.append(list(walk_cards or []))
+        return len(walk_cards or [])
+
+    monkeypatch.setattr(warm, "ensureSharedWalks", fake_walks)
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def _frontier_calls(monkeypatch):
     """Stub the decode frontier; returns the GPUs a run built it for."""
     gpus = []
@@ -107,7 +120,7 @@ def test_all_gpus_sweeps_use_the_spec_table(monkeypatch, _frontier_calls):
 
     seen = []
 
-    async def fake_sweeps(*, models, gpus):
+    async def fake_sweeps(*, models, gpus, walks=None):
         seen.append(gpus)
         return 1
 
@@ -269,9 +282,53 @@ def test_the_warm_runs_its_jobs_in_its_pool(monkeypatch):
     server."""
     from backend.api import offload
     seen = {}
-    monkeypatch.setattr(offload, "serve_requests_off_process",
-                        lambda deadline_s=None: seen.setdefault("served", deadline_s) or True)
+    monkeypatch.setattr(offload, "run_off_process",
+                        lambda: seen.setdefault("offline", True))
     monkeypatch.setattr(offload, "stop_serving", lambda: seen.setdefault("stopped", True))
     with warm.WarmProcess(nice=0, workers=2, pidfile=None):
         pass
-    assert "served" in seen and seen["stopped"]
+    # It answers no request: offline, not a server's footing.
+    assert seen["offline"] and seen["stopped"]
+
+
+def test_each_walk_class_is_one_chain_its_scaling_walks_after_its_views(
+        monkeypatch, _frontier_calls, _walk_calls, _sweep_calls):
+    """The default warm runs one chain per walk class: the class's Gallery
+    views in Gallery order (the first walks, the rest price it), then the
+    class's Scaling walks; the sweeps project once every chain is done,
+    told the walks are ensured."""
+    events = []
+
+    async def fake_frontier(view, model_params):
+        events.append(("view", view.gpu_sku))
+        return _OK
+
+    async def fake_walks(models, gpus, walk_cards=None):
+        events.append(("walks", tuple(walk_cards)))
+        return len(walk_cards)
+
+    async def fake_sweeps(**kwargs):
+        events.append(("sweeps", kwargs.get("walks")))
+        return 1
+
+    monkeypatch.setattr(warm, "warm_frontier", fake_frontier)
+    monkeypatch.setattr(warm, "ensureSharedWalks", fake_walks)
+    monkeypatch.setattr(warm, "warm_sweeps", fake_sweeps)
+    assert warm.main([]) == 0
+    from backend.inference.card import Card
+    klass = {gpu: Card.of(gpu).klass.key() for gpu in GALLERY_GPUS}
+    views = [gpu for kind, gpu in events if kind == "view"]
+    assert views[0] == GALLERY_LANDING_GPU
+    gallery = warm._gallery_gpus()
+    for key in set(klass.values()):
+        mine = [g for g in views if klass[g] == key]
+        assert mine == [g for g in gallery if klass[g] == key]
+    walked = [cards for kind, cards in events if kind == "walks"]
+    assert sorted(c for cards in walked for c in cards) == sorted(
+        warm.scaling_walk_cards(None))
+    for cards in walked:
+        key = Card.of(cards[0]).klass.key()
+        last_view = max((i for i, (kind, gpu) in enumerate(events)
+                         if kind == "view" and klass[gpu] == key), default=-1)
+        assert events.index(("walks", cards)) > last_view
+    assert events[-1] == ("sweeps", len(warm.scaling_walk_cards(None)))

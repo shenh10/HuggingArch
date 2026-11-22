@@ -108,6 +108,14 @@ UNWATCHED_S = float(os.environ.get("HA_UNWATCHED_WORK_S", "120"))
 
 _off_process = False
 _deadline_s: Optional[float] = None
+#: Whether this process answers requests (`serve_requests_off_process`) or
+#: only runs offline work (`run_off_process`): a server keeps a worker from
+#: its sweep cells for single jobs (`_cell_slots`).
+_answers_requests = True
+#: Outside a request, the order an offline caller states for the work this
+#: task runs (`offline_rank`): its waiters are ranked by it (`urgency`).
+_offline_rank: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "offline_rank", default=0.0)
 #: Told, in the request's own task, that the request is about to start new
 #: work (`within_deadline`); raising refuses the work, which is then never
 #: begun. Set by the service layer (`set_start_hook`); None meters nothing.
@@ -178,18 +186,32 @@ def serve_requests_off_process(*, deadline_s: Optional[float] = DEADLINE_S) -> N
     `backend.api` so their hooks and cache tiers are the server's, and parse
     the spec library and hash the engine (every cache key reads it, ~5 s
     each) before their first job."""
-    global _off_process, _deadline_s
+    _go_off_process(deadline_s, answers_requests=True)
+
+
+def run_off_process() -> None:
+    """The offline warm's footing: heavy work runs in the compute pool as in
+    the server, with no deadline and no request to answer — so no worker is
+    kept from the sweep cells for single jobs (`_cell_slots`)."""
+    _go_off_process(None, answers_requests=False)
+
+
+def _go_off_process(deadline_s: Optional[float], *,
+                    answers_requests: bool) -> None:
+    global _off_process, _deadline_s, _answers_requests
     pool.configure_workers(
         imports=("backend.api",),
         prepare=(code_trace_seal, get_default_loader, engine_code_version,
                  shared_data_version, engine_version))
     _off_process = True
     _deadline_s = deadline_s
+    _answers_requests = answers_requests
 
 
 def stop_serving() -> None:
     """The server's lifespan is over: back to in-process work, no deadline."""
-    global _off_process, _deadline_s
+    global _off_process, _deadline_s, _answers_requests
+    _answers_requests = True
     pool.configure_workers()
     _off_process = False
     _deadline_s = None
@@ -309,10 +331,12 @@ def urgency(name: Optional[str] = None) -> Callable[[], Any]:
     """How urgent a slot is for the work this task runs for, read when a
     slot frees: work asked for more recently first (the view a client is
     on), then `name`'s place in the order the client asked for (`hint`).
-    Outside a request (the warm job) every waiter ties and order is FIFO."""
+    Outside a request (the warm job) the rank the offline caller set for
+    this task (`offline_rank`) orders waiters, ties FIFO."""
     work = _current_work.get()
     if work is None:
-        return lambda: (0.0, 0)
+        rank = _offline_rank.get()
+        return lambda: (rank, 0)
 
     def read() -> Tuple[float, int]:
         rank = len(work.hint)
@@ -330,19 +354,28 @@ _cell_slot_tables: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Priorit
 
 
 def _cell_slots() -> PrioritySlots:
-    """Every worker but one, for sweep cells. A sweep is hundreds of cells;
-    handed to the pool together they fill its one FIFO queue, and a request
-    that is a single job — a one-second lookup, an estimate — waits behind
-    every one of them (after a restart `/supported-models` sat behind the
-    Scaling sweeps). Capped, the cells leave a worker to the single jobs;
-    a one-worker pool still bounds the wait to one cell. A freed slot goes
-    to the most urgent cell (`PrioritySlots`, `urgency`)."""
+    """Every worker but one in a process that answers requests
+    (`_answers_requests`) — every worker offline —, for sweep cells. A sweep is hundreds of cells; handed to the pool together they
+    fill its one FIFO queue, and a request that is a single job — a
+    one-second lookup, an estimate — waits behind every one of them (after a
+    restart `/supported-models` sat behind the Scaling sweeps). Capped, the
+    cells leave a server's worker to the single jobs; a one-worker pool
+    still bounds the wait to one cell. A freed slot goes to the most urgent
+    cell (`PrioritySlots`, `urgency`)."""
     loop = asyncio.get_running_loop()
     slots = _cell_slot_tables.get(loop)
     if slots is None:
         slots = _cell_slot_tables[loop] = PrioritySlots(
-            max(1, pool.worker_count() - 1))
+            max(1, pool.worker_count() - int(_answers_requests)))
     return slots
+
+
+def offline_rank(rank: float) -> None:
+    """Rank the work this task (and every task it starts) runs, outside a
+    request: a freed slot goes to the lowest rank waiting (`urgency`). An
+    offline caller running several batches at once states which comes
+    first; the later ones take only the slots the earlier leave idle."""
+    _offline_rank.set(float(rank))
 
 
 async def run_ranked(fn: Callable[..., _T], /, *args: Any,
