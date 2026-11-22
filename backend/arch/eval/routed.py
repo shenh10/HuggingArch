@@ -48,12 +48,26 @@ from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import sympy as sp
 
+from backend.code_trace.memo import memoize
+
 from .dim import as_number, exact, value_of
 
 
 def _whole(value: sp.Basic) -> Any:
     """A reading as an `int` where it is a number, else the law it is."""
     return int(value) if value.is_Integer else value
+
+
+@memoize(maxsize=1 << 12)
+def _padded(routed_rows: sp.Basic, local_experts: int) -> Tuple[Any, Any]:
+    """`(touched, rows_per_expert)` of a launch running `routed_rows` over
+    `local_experts`: `min(ceil(R), E)` and `ceil(R / max(touched, 1))`. A
+    function of the two alone, so one reading answers every routed leaf of a
+    step at a point — they share the dispatch's rows."""
+    touched = _whole(sp.Min(sp.ceiling(routed_rows),
+                            sp.Integer(local_experts)))
+    return touched, _whole(sp.ceiling(
+        routed_rows / sp.Max(exact(touched), sp.Integer(1))))
 
 
 @dataclass(frozen=True)
@@ -113,16 +127,13 @@ class RoutedLaunch:
     @property
     def touched_experts(self) -> Any:
         """The experts that receive rows: `min(ceil(R), E)`."""
-        return _whole(sp.Min(sp.ceiling(exact(self.routed_rows)),
-                             sp.Integer(self.local_experts)))
+        return _padded(exact(self.routed_rows), self.local_experts)[0]
 
     @property
     def rows_per_expert(self) -> Any:
         """Each touched expert's rows, padded to a whole row:
         `ceil(R / touched)` (0 where nothing is routed)."""
-        touched = exact(self.touched_experts)
-        return _whole(sp.ceiling(exact(self.routed_rows)
-                                 / sp.Max(touched, sp.Integer(1))))
+        return _padded(exact(self.routed_rows), self.local_experts)[1]
 
     @property
     def launch_rows(self) -> Any:
