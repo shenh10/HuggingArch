@@ -15,17 +15,18 @@ from backend.measure.lookup import Key
 
 
 def _measure(formula: str, launches: tuple[float, ...],
-             signatures: tuple[str, ...] = ("op",)) -> PointMeasure:
+             signatures: tuple[str, ...] = ("op",),
+             gpu: str = "B200") -> PointMeasure:
     count = len(launches)
     keys = tuple(
         Key(signatures[i % len(signatures)], '{"x":1}', "{}",
-            "B200", "decode") for i in range(count))
+            gpu, "decode") for i in range(count))
     return PointMeasure(
         keys, launches,
         tuple(None for _ in launches), tuple("op" for _ in launches),
         tuple("" for _ in launches),
         MeasuredFormula(formula, tuple(False for _ in launches)),
-        {"framework": "vllm", "gpu": "B200"},
+        {"framework": "vllm", "gpu": gpu},
         tuple({"anchor": None, "dispatch": None} for _ in launches),
         aggregation_ids=tuple("op" for _ in launches))
 
@@ -80,13 +81,13 @@ def test_one_key_selected_once_answers_every_point_that_names_it():
 
 def test_record_k_views_share_keys_but_keep_their_formula_variants():
     """Recursive draft launches repeat K times; the launch is selected once."""
-    measures = [_measure("T_0*n_0", (2.0,)),
-                _measure("3*T_0*n_0", (2.0,))]
+    measures = [_measure("T_0*n_0", (2.0,), gpu=""),
+                _measure("3*T_0*n_0", (2.0,), gpu="")]
     table = _measurePointsToJson([
-        ("B200", 1024, 1, 0, measures[0]),
-        ("B200", 1024, 1, 1, measures[1]),
+        (1024, 1, 0, measures[0]),
+        (1024, 1, 1, measures[1]),
     ])
-    assert table["schema"] == "measure-points-v7"
+    assert table["schema"] == "measure-points-v8"
     assert [(p["draftTokens"], p["variant"]) for p in table["points"]] == [
         (0, 0), (1, 1)]
     assert len(table["keyColumns"][0]) == 1
@@ -95,3 +96,17 @@ def test_record_k_views_share_keys_but_keep_their_formula_variants():
         table, card=Card.of("B200"), wanted=[(1024, 1, 0), (1024, 1, 1)])
     assert matrix.formulas == ("T_0*n_0", "3*T_0*n_0")
     assert len(matrix.keys) == 1
+
+
+def test_a_record_table_refuses_a_key_that_names_a_card():
+    """A serving-law table is a walk class's: its keys are derived with no
+    card (`sol_law._measurePointTables`), and a reader stamps its own. A
+    measure that names one did not come from that derivation."""
+    with pytest.raises(ValueError, match="names a card"):
+        _measurePointsToJson([(1024, 1, 0, _measure("T_0*n_0", (2.0,)))])
+    table = _measurePointsToJson(
+        [(1024, 1, 0, _measure("T_0*n_0", (2.0,), gpu=""))])
+    for card in ("B200", "GB200"):
+        matrix = MeasureMatrix.of_record(table, card=Card.of(card),
+                                         wanted=[(1024, 1, 0)])
+        assert {key.gpu for key in matrix.keys} == {card}

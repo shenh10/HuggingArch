@@ -221,7 +221,7 @@ def test_a_stored_k1_measure_is_the_direct_speculative_walk():
         capacityCards=("H100-SXM",), capacityContexts=(1024,),
         measureContexts=(1024,), measureBatchGrid=[{"decode_batch_size": 1}])
     table = record["phases"]["decode"]["measurePoints"]
-    assert table["schema"] == "measure-points-v7"
+    assert table["schema"] == "measure-points-v8"
     ks = {int(point["draftTokens"]) for point in table["points"]}
     assert ks == {0, *FRONTIER_DRAFT_TOKENS}
     stored = servingMeasurePoint(
@@ -248,8 +248,9 @@ def test_a_stored_measure_point_survives_json_and_the_matrix_fold():
         measureContexts=(1024,), measureBatchGrid=[{"decode_batch_size": 1}])
     throughJson = json.loads(json.dumps(record))
     table = throughJson["phases"]["decode"]["measurePoints"]
-    assert table["cardless"]
+    # A walk class's table names no card; a reader stamps its own.
     assert all("gpu" not in point for point in table["points"])
+    assert gpu not in json.dumps(table)
     ks = [0, 1] if record.get("speculative") else [0]
     wanted = [(1024, 1, k) for k in ks]
     assert set(wanted) <= {
@@ -297,8 +298,8 @@ def test_stored_measure_points_are_point_keys_after_json():
         assert record.get("schema") == gallery.walkRecordSchema, (model, record)
         throughJson = json.loads(json.dumps(record))
         table = throughJson["phases"]["decode"]["measurePoints"]
-        assert table["cardless"]
         assert all("gpu" not in point for point in table["points"])
+        assert not any(card in json.dumps(table) for card in cards)
         publicPoints = {(int(point["context"]), int(point["batch"]),
                          int(point.get("draftTokens", 0)))
                         for point in table["points"]}

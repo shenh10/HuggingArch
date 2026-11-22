@@ -23,7 +23,6 @@ from backend.measure.auto_sweep import (
     _ExactPrinter, compile_law_float, compile_law_vector, exact_div,
     MeasuredFormula, PointMeasure,
 )
-from backend.measure.lookup import Key
 
 from .capacity import (
     CapacityKnobs,
@@ -41,7 +40,8 @@ from .gpu_specs import peak_flops_for_dtype, peak_hbm_bw
 from .phases import Speculation, phase_binding, phase_throughput, step_tokens
 from .parallel_config import ParallelConfig
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
-from backend.measure.measure_matrix import MeasureMatrix
+from backend.measure.measure_matrix import (MeasureMatrix, stored_context,
+                                           stored_key)
 from .row_roofline import (FloorForm, FloorTerm, StepSum, candidate_symbols,
                            floor_of, law_symbol)
 from .sol_data import walkRecordSchema as servingLawSchema
@@ -59,7 +59,7 @@ from .batch_sweep import point_measures
 #: A step law's per-term outputs are `term_<k>`, k the step term's index
 #: (`StepSum.terms`, the measured formula's), each its share of `t_sol_s`.
 _TERM = "term_"
-_MEASURE_POINTS_SCHEMA = "measure-points-v7"
+_MEASURE_POINTS_SCHEMA = "measure-points-v8"
 
 # One draft law serves every speculative K: the request says which draft stack
 # exists, while this symbol says how many forwards the point runs.
@@ -618,14 +618,16 @@ def _collectives(rows: Iterable[Mapping[str, Any]]) -> tuple[str, ...]:
 
 
 def _measurePointsToJson(
-        items: Sequence[tuple[str, int, int, int, PointMeasure]]
+        items: Sequence[tuple[int, int, int, PointMeasure]]
 ) -> dict[str, Any]:
     """One decode grid's concrete lookups as ordinary JSON tables.
 
     Every distinct string and physical key is named once. Launches and term
     metadata are properties of the step's rows, held by a term variant rather
     than repeated at every point. A point names only the looked-up terms and
-    the key entry each reads.
+    the key entry each reads. The grid is a walk class's: its measures name
+    no card (`_measurePointTables`), and a reader stamps its own
+    (`measure_matrix.stored_key`).
     """
     strings: list[str] = []
     at_string: dict[str, int] = {}
@@ -672,7 +674,7 @@ def _measurePointsToJson(
         }
         return indexed(variants, at_variant, value)
 
-    def key(value: Any, read: Any, *, cardless: bool) -> int:
+    def key(value: Any, read: Any) -> int:
         if value is None or read is None:
             raise ValueError("a looked-up term states its key and selection read")
         decoded = json.loads(value.shape_json)
@@ -691,8 +693,10 @@ def _measurePointsToJson(
         if shape is None:
             shape = at_shape[canonicalShape] = len(shapes)
             shapes.append(shapeRow)
+        if value.gpu:
+            raise ValueError("a walk class's measure key names a card")
         fields = [text(value.signature), shape, text(value.dtype_env_json),
-                  text("" if cardless else value.gpu), text(value.phase)]
+                  text(value.phase)]
         anchor = indexed(anchors, at_anchor, read.get("anchor"))
         dispatch = indexed(dispatches, at_dispatch, read.get("dispatch"))
         canonical = (*fields, anchor, dispatch)
@@ -702,41 +706,25 @@ def _measurePointsToJson(
             keys.append([*fields, anchor, dispatch])
         return got
 
-    def withoutCard(measure: PointMeasure) -> PointMeasure:
-        return measure.on_card("")
-
-    grouped: dict[tuple[int, int, int], list[tuple[str, PointMeasure]]] = {}
-    for gpu, context, batch, draft_tokens, measure in items:
-        grouped.setdefault((int(context), int(batch), int(draft_tokens)), []).append(
-            (gpu, measure))
     points = []
-    for (context, batch, draft_tokens), atPoint in grouped.items():
-        firstGpu, first = atPoint[0]
-        normalized = withoutCard(first)
-        cardless = all(
-            withoutCard(measure) == normalized
-            for _gpu, measure in atPoint[1:])
-        representatives = [(firstGpu, first)] if cardless else atPoint
-        for gpu, measure in representatives:
-            keyed = []
-            for i, (physical, read) in enumerate(
-                    zip(measure.keys, measure.inputs, strict=True)):
-                if physical is None or measure.formula.zero_cost[i]:
-                    continue
-                keyed.append((i, key(physical, read, cardless=cardless)))
-            point = {
-                "context": context, "batch": batch,
-                "draftTokens": draft_tokens,
-                "variant": variant(measure),
-                "contextIndex": indexed(
-                    contexts, at_context, withoutCard(measure).context
-                    if cardless else measure.context),
-                "keyedTerms": [term for term, _key in keyed],
-                "keyedKeys": [entry for _term, entry in keyed],
-            }
-            if not cardless:
-                point["gpu"] = gpu
-            points.append(point)
+    for context, batch, draft_tokens, measure in items:
+        keyed = []
+        for i, (physical, read) in enumerate(
+                zip(measure.keys, measure.inputs, strict=True)):
+            if physical is None or measure.formula.zero_cost[i]:
+                continue
+            keyed.append((i, key(physical, read)))
+        selection = dict(measure.context or {})
+        if selection.pop("gpu", ""):
+            raise ValueError("a walk class's selection context names a card")
+        points.append({
+            "context": int(context), "batch": int(batch),
+            "draftTokens": int(draft_tokens),
+            "variant": variant(measure),
+            "contextIndex": indexed(contexts, at_context, selection),
+            "keyedTerms": [term for term, _key in keyed],
+            "keyedKeys": [entry for _term, entry in keyed],
+        })
     return {"schema": _MEASURE_POINTS_SCHEMA, "strings": strings,
             "contexts": contexts, "variants": variants,
             "keyColumns": [list(column) for column in zip(*keys, strict=True)]
@@ -744,67 +732,33 @@ def _measurePointsToJson(
             "shapeAxes": shapeAxes, "shapeTemplates": shapeTemplates,
             "shapes": shapes,
             "anchors": anchors,
-            "dispatches": dispatches, "points": points,
-            "cardless": all("gpu" not in point for point in points)}
+            "dispatches": dispatches, "points": points}
 
 
 def _measurePointAt(table: Mapping[str, Any], *, gpu_sku: str,
                     context: int, batch: int, draft_tokens: int = 0,
-                    point: Any = None,
-                    as_object: bool = False,
-                    shared: Optional[Dict[Any, Any]] = None
-                    ) -> dict[str, Any]:
-    """One stored table row as the `PointMeasure` a fold reads.
-
-    `point` is the already-located row; a one-point caller may omit it.
-    """
-    if point is None:
-        for candidate in table["points"]:
-            if (candidate.get("gpu", gpu_sku) == gpu_sku
-                    and int(candidate["context"]) == int(context)
-                    and int(candidate["batch"]) == int(batch)
-                    and int(candidate.get("draftTokens", 0)) == int(draft_tokens)):
-                point = candidate
-                break
+                    as_object: bool = False) -> dict[str, Any]:
+    """One stored table row as the `PointMeasure` a fold reads on
+    `gpu_sku`."""
+    point = next((candidate for candidate in table["points"]
+                  if int(candidate["context"]) == int(context)
+                  and int(candidate["batch"]) == int(batch)
+                  and int(candidate.get("draftTokens", 0)) == int(draft_tokens)),
+                 None)
     if point is None:
         raise KeyError(f"the serving law has no measured point for {gpu_sku} "
                        f"at {context} tokens and batch {batch}")
 
     strings = table["strings"]
-    cardless = bool(table.get("cardless"))
     stored = table["variants"][point["variant"]]
     count = len(stored["zero_cost"])
     physical: list[Any] = [None] * count
     inputs: list[Any] = [None] * count
     for term, entry in zip(point["keyedTerms"], point["keyedKeys"],
                            strict=True):
-        storedKey = [column[entry] for column in table["keyColumns"]]
-        cacheKey = (gpu_sku, tuple(storedKey))
-        if shared is not None and cacheKey in shared:
-            physical[term], inputs[term] = shared[cacheKey]
-        else:
-            shapeRow = table["shapes"][storedKey[1]]
-            template = table["shapeTemplates"][shapeRow[0]]
-            shape = {table["shapeAxes"][axis]: value
-                     for axis, value in zip(template, shapeRow[1:],
-                                            strict=True)}
-            shapeJson = json.dumps(shape, sort_keys=True,
-                                   separators=(",", ":"))
-            fields = [strings[storedKey[0]], shapeJson,
-                      strings[storedKey[2]], strings[storedKey[3]],
-                      strings[storedKey[4]]]
-            if cardless:
-                fields[3] = gpu_sku
-            rowInput = {
-                "anchor": table["anchors"][storedKey[5]],
-                "dispatch": table["dispatches"][storedKey[6]],
-            }
-            physical[term], inputs[term] = Key(*fields), rowInput
-            if shared is not None:
-                shared[cacheKey] = (physical[term], inputs[term])
-    selectionContext = dict(table["contexts"][point["contextIndex"]])
-    if cardless:
-        selectionContext["gpu"] = gpu_sku
+        physical[term], inputs[term] = stored_key(table, entry, gpu=gpu_sku)
+    selectionContext = stored_context(table, point["contextIndex"],
+                                      gpu=gpu_sku)
     measureObject = PointMeasure(
         tuple(physical), tuple(float(v) for v in stored["launches"]),
         tuple(strings[i] for i in stored["unkeyed"]),
@@ -876,7 +830,7 @@ def _measurePointTables(pending: Any, preparation: Any,
     base = {name: rows for name, rows in base.items()
             if name in ("per_op_timing_decode", "per_op_timing_draft")}
     all_facts = {"plain": plain_capacity, "draft": draft_capacity or plain_capacity}
-    byPhase: Dict[str, list[tuple[str, int, int, int, PointMeasure]]] = {}
+    byPhase: Dict[str, list[tuple[int, int, int, PointMeasure]]] = {}
     speculative = preparation.draft is not None
     draft_phase = dict(base_phases.get("decode") or {})
     plain_phase = {key: value for key, value in draft_phase.items()
@@ -923,33 +877,25 @@ def _measurePointTables(pending: Any, preparation: Any,
                     base, onCard, batches, pending,
                     Point({"s_input": int(context)}), breakdown=False,
                     costs=False)
-                served = [gpu_sku for gpu_sku, fact in cardFacts
-                          if point_served(
-                              max_batch_per_gpu=fact["max_decode_batch"],
-                              beyond_max_context=fact["beyond_max_context"],
-                              requests=decodeBatch or 1)]
-                if not served:
-                    continue
                 # The rows are the class's (`onCard`), so the keys are too:
-                # derived once, on the walk card, and stamped with each served
-                # card's name (`PointMeasure.on_card`) — the card is a key
-                # field, not an input of the derivation.
+                # derived once per point with no card at all (`gpu_sku`
+                # empty) — what a key reads of a card cannot be written
+                # here, and the writer refuses a key that names one. A
+                # reader stamps its own card (`measure_matrix.stored_key`).
                 keyed: Dict[str, list[Any]] = {}
                 for name, walk in pending.walk_of_rows.items():
                     if name not in base:
                         continue
                     keyed[name] = point_keys(
                         walk.analysis, rows.get(name) or [], walk.workload,
-                        replace(walk.deployment, gpu_sku=cards[0]),
+                        replace(walk.deployment, gpu_sku=""),
                         model_id=walk.model_id, spec_hash=walk.spec_hash)
                 measures = point_measures(
                     pending, rows, keyed, {"decode": phase},
-                    gpu_sku=cards[0], as_objects=True)
+                    gpu_sku="", as_objects=True)
                 for phase_name, measure in measures.items():
-                    for gpu_sku in served:
-                        byPhase.setdefault(phase_name, []).append(
-                            (gpu_sku, int(context), decodeBatch, k,
-                             measure["measure"].on_card(gpu_sku)))
+                    byPhase.setdefault(phase_name, []).append(
+                        (int(context), decodeBatch, k, measure["measure"]))
     return {phase: _measurePointsToJson(items)
             for phase, items in byPhase.items()}
 

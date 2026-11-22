@@ -49,6 +49,33 @@ def _cached_questions(matrix: "MeasureMatrix") -> tuple[Any, ...]:
     return matrix._questionKeys
 
 
+def stored_key(table: Mapping[str, Any], entry: int, *,
+               gpu: str) -> tuple[Key, dict[str, Any]]:
+    """Entry `entry` of a serving-law measure table (`sol_law`'s
+    `measure-points` schema) as the key a card looks up, and what the
+    selection reads of it beside the key. The table is a walk class's and
+    names no card: the card is stamped here, at the read, and nowhere
+    else."""
+    fields = [column[entry] for column in table["keyColumns"]]
+    shape_row = table["shapes"][fields[1]]
+    template = table["shapeTemplates"][shape_row[0]]
+    shape = {table["shapeAxes"][axis]: value
+             for axis, value in zip(template, shape_row[1:], strict=True)}
+    strings = table["strings"]
+    key = Key(strings[fields[0]],
+              json.dumps(shape, sort_keys=True, separators=(",", ":")),
+              strings[fields[2]], gpu, strings[fields[3]])
+    return key, {"anchor": table["anchors"][fields[4]],
+                 "dispatch": table["dispatches"][fields[5]]}
+
+
+def stored_context(table: Mapping[str, Any], index: int, *,
+                   gpu: str) -> dict[str, Any]:
+    """Selection context `index` of a serving-law measure table, on `gpu`
+    (`stored_key`)."""
+    return {**table["contexts"][index], "gpu": gpu}
+
+
 @dataclass(frozen=True)
 class _RowGroup:
     labels: tuple[str, ...]
@@ -142,32 +169,19 @@ class MeasureMatrix:
     def of_record(cls, table: Mapping[str, Any], *, card: Any,
                   wanted: Sequence[tuple[int, int, int]]) -> "MeasureMatrix":
         """One canonical record's compact measure table as a matrix."""
-        cardless = bool(table.get("cardless"))
         strings = table["strings"]
         keyColumns = table["keyColumns"]
         physical: list[Key] = []
         anchors: list[Any] = []
         dispatches: list[Any] = []
         for entry in range(len(keyColumns[0]) if keyColumns else 0):
-            fields = [column[entry] for column in keyColumns]
-            shape_row = table["shapes"][fields[1]]
-            template = table["shapeTemplates"][shape_row[0]]
-            shape = {
-                table["shapeAxes"][axis]: value
-                for axis, value in zip(template, shape_row[1:], strict=True)
-            }
-            shape_json = json.dumps(shape, sort_keys=True,
-                                    separators=(",", ":"))
-            gpu = card.sku if cardless else strings[fields[3]]
-            physical.append(Key(strings[fields[0]], shape_json,
-                                strings[fields[2]], gpu, strings[fields[4]]))
-            anchors.append(table["anchors"][fields[5]])
-            dispatches.append(table["dispatches"][fields[6]])
+            key, read = stored_key(table, entry, gpu=card.sku)
+            physical.append(key)
+            anchors.append(read["anchor"])
+            dispatches.append(read["dispatch"])
 
-        contexts = [dict(value) for value in table["contexts"]]
-        if cardless:
-            for context in contexts:
-                context["gpu"] = card.sku
+        contexts = [stored_context(table, index, gpu=card.sku)
+                    for index in range(len(table["contexts"]))]
         variants = table["variants"]
         width = max((len(variant["zero_cost"]) for variant in variants),
                     default=0)
@@ -184,8 +198,7 @@ class MeasureMatrix:
         selected: list[Mapping[str, Any]] = []
         for context, batch, draft_tokens in wanted:
             for point in table["points"]:
-                if (point.get("gpu", card.sku) == card.sku
-                        and int(point["context"]) == int(context)
+                if (int(point["context"]) == int(context)
                         and int(point["batch"]) == int(batch)
                         and int(point.get("draftTokens", 0)) == int(draft_tokens)):
                     rows_for_points[

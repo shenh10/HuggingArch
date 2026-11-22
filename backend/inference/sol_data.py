@@ -32,7 +32,9 @@ from backend.measure.scope import ResultIdentity, of_walk
 #: swap a measured term out of it (`auto_sweep.blend`).
 # v8: a kept bundle carries every card of its class the Scaling series
 # prices (`FrontierView.walk_cards`), not only the Gallery's.
-walkRecordSchema = "serving-law-v8"
+# v9: its measure table (`measure-points-v8`) names no card — one entry per
+# point for the whole class, the card stamped by the reader.
+walkRecordSchema = "serving-law-v9"
 servingContexts = tuple(ROUTINE_SEQ_LENS)
 defaultPrefillChunkSize = 8192
 
