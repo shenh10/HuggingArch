@@ -703,11 +703,7 @@ def _measurePointsToJson(
         return got
 
     def withoutCard(measure: PointMeasure) -> PointMeasure:
-        return replace(
-            measure,
-            keys=tuple(None if value is None else value._replace(gpu="")
-                       for value in measure.keys),
-            context={**(measure.context or {}), "gpu": ""})
+        return measure.on_card("")
 
     grouped: dict[tuple[int, int, int], list[tuple[str, PointMeasure]]] = {}
     for gpu, context, batch, draft_tokens, measure in items:
@@ -927,27 +923,33 @@ def _measurePointTables(pending: Any, preparation: Any,
                     base, onCard, batches, pending,
                     Point({"s_input": int(context)}), breakdown=False,
                     costs=False)
-                for gpu_sku, fact in cardFacts:
-                    if not point_served(
-                            max_batch_per_gpu=fact["max_decode_batch"],
-                            beyond_max_context=fact["beyond_max_context"],
-                            requests=decodeBatch or 1):
+                served = [gpu_sku for gpu_sku, fact in cardFacts
+                          if point_served(
+                              max_batch_per_gpu=fact["max_decode_batch"],
+                              beyond_max_context=fact["beyond_max_context"],
+                              requests=decodeBatch or 1)]
+                if not served:
+                    continue
+                # The rows are the class's (`onCard`), so the keys are too:
+                # derived once, on the walk card, and stamped with each served
+                # card's name (`PointMeasure.on_card`) — the card is a key
+                # field, not an input of the derivation.
+                keyed: Dict[str, list[Any]] = {}
+                for name, walk in pending.walk_of_rows.items():
+                    if name not in base:
                         continue
-                    keyed: Dict[str, list[Any]] = {}
-                    for name, walk in pending.walk_of_rows.items():
-                        if name not in base:
-                            continue
-                        keyed[name] = point_keys(
-                            walk.analysis, rows.get(name) or [], walk.workload,
-                            replace(walk.deployment, gpu_sku=gpu_sku),
-                            model_id=walk.model_id, spec_hash=walk.spec_hash)
-                    measures = point_measures(
-                        pending, rows, keyed, {"decode": phase},
-                        gpu_sku=gpu_sku, as_objects=True)
-                    for phase_name, measure in measures.items():
+                    keyed[name] = point_keys(
+                        walk.analysis, rows.get(name) or [], walk.workload,
+                        replace(walk.deployment, gpu_sku=cards[0]),
+                        model_id=walk.model_id, spec_hash=walk.spec_hash)
+                measures = point_measures(
+                    pending, rows, keyed, {"decode": phase},
+                    gpu_sku=cards[0], as_objects=True)
+                for phase_name, measure in measures.items():
+                    for gpu_sku in served:
                         byPhase.setdefault(phase_name, []).append(
                             (gpu_sku, int(context), decodeBatch, k,
-                             measure["measure"]))
+                             measure["measure"].on_card(gpu_sku)))
     return {phase: _measurePointsToJson(items)
             for phase, items in byPhase.items()}
 

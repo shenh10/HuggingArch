@@ -623,6 +623,17 @@ class PointMeasure:
                 raise ValueError(
                     f"unknown unplaced reason {reason!r}; one of {UNPLACED_REASONS}")
 
+    def on_card(self, gpu: str) -> "PointMeasure":
+        """This measure on another card of its walk class: the card is the
+        keys' `gpu` field and the selection context's, nothing else."""
+        return replace(
+            self,
+            keys=tuple(None if key is None else key._replace(gpu=gpu)
+                       for key in self.keys),
+            context={**(self.context or {}), "gpu": gpu},
+            contexts=tuple({**(context or {}), "gpu": gpu}
+                           for context in self.contexts))
+
     def key_set(self) -> List[Key]:
         """The keys this point looks up."""
         return [k for k, z in zip(self.keys, self.formula.zero_cost, strict=True)
