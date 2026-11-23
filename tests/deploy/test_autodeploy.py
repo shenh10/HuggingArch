@@ -179,19 +179,20 @@ def test_a_pending_gate_is_asked_about_at_most_once_per_poll_interval(world, dep
     assert world.api_calls == 2
 
 
-def test_the_named_proxy_is_the_one_private_destination_let_through(world, deployer, tmp_path):
+def test_the_containers_proxy_is_the_one_private_destination_let_through(world, deployer, tmp_path):
     secrets = tmp_path / "prod.env"
-    secrets.write_text(secrets.read_text() + "HA_EGRESS_PROXY='192.168.5.2:7897'\n")
+    secrets.write_text(secrets.read_text() + "HTTP_PROXY=http://192.168.5.2:7897\n"
+                       "HTTPS_PROXY='http://192.168.5.2:7897'\n")
     deployer.ensure_egress()
     chain = world.chains["HA-EGRESS"]
     allow = "-A HA-EGRESS -d 192.168.5.2/32 -p tcp -m tcp --dport 7897 -j RETURN"
-    assert allow in chain
+    assert chain.count(allow) == 1                              # one proxy, named twice
     assert chain.index(allow) < chain.index("-A HA-EGRESS -d 192.168.0.0/16 -j DROP")
     world.iptables.clear()
     deployer.ensure_egress()                                    # listed form matches: no rebuild
     assert not [a for a in world.iptables if a[0] in ("-F", "-N", "-A", "-I")]
-    secrets.write_text("HA_EGRESS_PROXY=proxy.lan:7897\n")      # iptables -d would resolve it once
-    with pytest.raises(ValueError, match="HA_EGRESS_PROXY"):
+    secrets.write_text("HTTPS_PROXY=http://proxy.lan:7897\n")   # iptables -d would resolve it once
+    with pytest.raises(ValueError, match="ipv4"):
         deployer.ensure_egress()
 
 
@@ -211,4 +212,26 @@ def test_the_proxy_reaches_the_build_and_every_running_container():
     assert set(proxy["services"]) == set(base["services"])
     for service in proxy["services"].values():
         assert set(service["environment"]) == names
+
+
+def test_deploy_sh_completes_no_proxy_with_loopback_and_the_compose_services(tmp_path):
+    """The real deploy.sh, up to its first build, against a docker stub that
+    answers `config --services` and records the rest."""
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "docker").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in *"config --services"*) printf "app\\ntunnel\\n"; exit 0;; esac\n'
+        'echo "$NO_PROXY|$HTTPS_PROXY|$*" >> "$RECORD"; exit 1\n')
+    (stub / "docker").chmod(0o755)
+    secrets = tmp_path / "prod.env"
+    secrets.write_text("HTTP_PROXY=http://192.168.5.2:7897\nNO_PROXY=beszel\n")
+    record = tmp_path / "record"
+    subprocess.run(["bash", str(HOST / "deploy.sh")], cwd=ROOT, env={
+        "PATH": f"{stub}:/usr/bin:/bin", "HA_ENV_FILE": str(secrets), "NO_PULL": "1",
+        "RECORD": str(record)}, capture_output=True, check=False)   # the stub fails the build
+    no_proxy, https_proxy, args = record.read_text().splitlines()[0].split("|")
+    assert no_proxy.split(",") == ["localhost", "127.0.0.1", "::1", "app", "tunnel", "beszel"]
+    assert https_proxy == "http://192.168.5.2:7897"
+    assert "proxy.compose.yml" in args
 

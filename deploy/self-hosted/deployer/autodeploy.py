@@ -28,10 +28,9 @@ A pending gate is asked about at most every HA_GATE_POLL_S seconds (default
 
 Environment: HA_REPO_URL, HA_BRANCH, HA_GATE_CHECK, HA_ENV_FILE (the host's
 secrets; this reads HA_DEPLOY_GITHUB_TOKEN, an optional read-only token for
-the API quota, HA_PUBLIC_URL, the public smoke's base URL, and
-HA_EGRESS_PROXY, the one `<ip>:<port>` on a private range containers may
-reach — a proxy on the VM's gateway), HA_WORK (/work), HA_INTERVAL_S,
-HA_GATE_POLL_S.
+the API quota, HA_PUBLIC_URL, the public smoke's base URL, and the standard
+HTTP_PROXY / HTTPS_PROXY when the containers reach the internet through a
+proxy), HA_WORK (/work), HA_INTERVAL_S, HA_GATE_POLL_S.
 """
 from __future__ import annotations
 
@@ -43,11 +42,14 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from ipaddress import IPv4Address
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Callable
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
-PROXY = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$")
+#: The proxy variables the containers are given (deploy.sh), in both spellings.
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
 
 
 def log(message: str) -> None:
@@ -81,8 +83,8 @@ class Egress:
     """The VM's DOCKER-USER chain jumps to HA-EGRESS, which drops container
     traffic to private, link-local and CGNAT ranges (the LAN, the VM's host
     gateway) and lets container-to-container and internet traffic through.
-    A host that names a proxy (`<ip>:<port>`) gets that one TCP destination
-    let through ahead of the drops."""
+    A proxy the containers are told to use (HTTP_PROXY / HTTPS_PROXY) is
+    let through ahead of the drops — that address and port, nothing else."""
 
     CHAIN = "HA-EGRESS"
     PRIVATE = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -98,15 +100,23 @@ class Egress:
                 return binary
         return None
 
-    def rules(self, proxy: str | None = None) -> list[list[str]]:
-        allowed = []
-        if proxy:
-            match = PROXY.match(proxy)
-            if not match:
-                raise ValueError(f"HA_EGRESS_PROXY must be <ipv4>:<port>, got {proxy!r}")
-            host, port = match.groups()
-            allowed = [["-A", self.CHAIN, "-d", f"{host}/32", "-p", "tcp", "-m", "tcp",
-                        "--dport", port, "-j", "RETURN"]]
+    @staticmethod
+    def destination(proxy: str) -> tuple[str, int]:
+        """A proxy URL's (IPv4, port). A name is refused: iptables would
+        resolve it once, at insert time."""
+        parts = urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+        try:
+            host = str(IPv4Address(parts.hostname or ""))
+            port = parts.port or {"http": 80, "https": 443}[parts.scheme]
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"a proxy for the egress rules must be http(s)://<ipv4>:<port>, "
+                             f"got {proxy!r}") from e
+        return host, port
+
+    def rules(self, proxies: tuple[str, ...] = ()) -> list[list[str]]:
+        allowed = [["-A", self.CHAIN, "-d", f"{host}/32", "-p", "tcp", "-m", "tcp",
+                    "--dport", str(port), "-j", "RETURN"]
+                   for host, port in sorted({self.destination(p) for p in proxies})]
         return ([["-A", self.CHAIN, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
                   "-j", "RETURN"],
                  ["-A", self.CHAIN, "-o", "br+", "-j", "RETURN"],
@@ -115,7 +125,7 @@ class Egress:
                 + [["-A", self.CHAIN, "-d", net, "-j", "DROP"] for net in self.PRIVATE]
                 + [["-A", self.CHAIN, "-j", "RETURN"]])
 
-    def ensure(self, proxy: str | None = None) -> bool:
+    def ensure(self, proxies: tuple[str, ...] = ()) -> bool:
         """Rebuilt only when the chain differs from `rules()`, so checking it
         never opens a window without the drops."""
         ipt = self._binary()
@@ -123,7 +133,7 @@ class Egress:
             log("EGRESS NOT APPLIED: no DOCKER-USER chain in iptables or iptables-legacy")
             return False
         listed = self.run([ipt, "-S", self.CHAIN], capture_output=True, text=True)
-        rules = self.rules(proxy)
+        rules = self.rules(proxies)
         want = [f"-N {self.CHAIN}"] + [" ".join(rule) for rule in rules]
         if listed.returncode or listed.stdout.split("\n")[:-1] != want:
             if listed.returncode:
@@ -182,7 +192,8 @@ class Deployer:
         return out[0]
 
     def ensure_egress(self) -> bool:
-        return self.egress.ensure(read_env_file(self.env_file).get("HA_EGRESS_PROXY") or None)
+        secrets = read_env_file(self.env_file)
+        return self.egress.ensure(tuple(secrets[k] for k in PROXY_VARIABLES if secrets.get(k)))
 
     def gate(self, sha: str) -> str:
         """'passed', 'failed' or 'pending' (not run yet, or running)."""

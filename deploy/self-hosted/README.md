@@ -19,7 +19,7 @@ What is where:
 | Secrets | the `huggingarch-secrets` volume in the VM (template `env.example`) |
 | Build + restart + content smoke | `deploy.sh` |
 | Pull, gate check, deploy; container egress rules | `deployer/` (`deployer.compose.yml`) |
-| Proxy for a host that needs one (only with `HA_EGRESS_PROXY`) | `proxy.compose.yml` |
+| Proxy for a host that needs one (only with `HTTP(S)_PROXY` set) | `proxy.compose.yml` |
 | Release gate | `.github/workflows/deploy.yml`, check run `release-gate` |
 
 ## How a commit ships
@@ -97,12 +97,13 @@ again before every deploy; `EGRESS NOT APPLIED` in its log means they are
 missing. IPv4 only.
 
 **Behind a proxy.** Where the containers reach the internet only through a
-proxy on the VM's gateway, name it in the secrets: `HA_EGRESS_PROXY=<ip>:<port>`
-(plus `HA_EGRESS_NO_PROXY` for extra names on the compose network). That one
-TCP destination is let through ahead of the drops; `deploy.sh` loads
-`proxy.compose.yml`, which hands `HTTP(S)_PROXY` / `NO_PROXY` to the image
-build and to the app and tunnel. Base-image pulls are the Docker daemon's own
-and follow its proxy settings, not these.
+proxy, set the standard `HTTP_PROXY` / `HTTPS_PROXY` (`http://<ipv4>:<port>`)
+in the secrets, and `NO_PROXY` for extra names on the compose network.
+`deploy.sh` then loads `proxy.compose.yml`, which hands them to the image
+build and to the app and tunnel, with loopback and the compose services'
+names added to `NO_PROXY`; the deployer lets the proxy's address and port
+through ahead of the drops. Base-image pulls are the Docker daemon's own and
+follow its proxy settings, not these.
 
 ## Running beside Fly
 

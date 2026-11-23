@@ -1,17 +1,16 @@
-# Loaded over docker-compose.yml only when the host's secrets set
-# HA_EGRESS_PROXY (deploy.sh decides, and derives the variables below from it):
-# a host whose containers reach the internet through a proxy on the VM's
-# gateway. The image build's RUN steps and the running app and tunnel get the
+# Loaded over docker-compose.yml only when the host's secrets set HTTP_PROXY /
+# HTTPS_PROXY (deploy.sh decides, and completes NO_PROXY): a host whose
+# containers reach the internet through a proxy. The image build's RUN steps and the running app and tunnel get the
 # same proxy; NO_PROXY keeps loopback and the compose network's own names
 # direct. The egress rules let exactly that address through
 # (deployer/autodeploy.py, Egress).
 x-proxy: &proxy
-  HTTP_PROXY: ${HTTP_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
-  HTTPS_PROXY: ${HTTPS_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
-  NO_PROXY: ${NO_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
-  http_proxy: ${HTTP_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
-  https_proxy: ${HTTPS_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
-  no_proxy: ${NO_PROXY:?set by deploy.sh from HA_EGRESS_PROXY}
+  HTTP_PROXY: ${HTTP_PROXY:?set by deploy.sh from the secrets}
+  HTTPS_PROXY: ${HTTPS_PROXY:?set by deploy.sh from the secrets}
+  NO_PROXY: ${NO_PROXY:?set by deploy.sh from the secrets}
+  http_proxy: ${HTTP_PROXY:?set by deploy.sh from the secrets}
+  https_proxy: ${HTTPS_PROXY:?set by deploy.sh from the secrets}
+  no_proxy: ${NO_PROXY:?set by deploy.sh from the secrets}
 
 services:
   app:

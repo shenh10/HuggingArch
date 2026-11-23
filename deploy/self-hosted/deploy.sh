@@ -17,15 +17,18 @@ export HA_GIT_SHA="$(git rev-parse HEAD)"
 # A value of the secrets file (KEY=value, optionally quoted), empty when unset.
 secret() { sed -n "s/^$1=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}\$/\1/p" "$HA_ENV_FILE" | tail -n 1; }
 compose=(docker compose -f "$here/docker-compose.yml")
-# A host whose containers reach the internet through a proxy on the VM's
-# gateway names it once (HA_EGRESS_PROXY=<ip>:<port>); the build and the
-# running containers get it from proxy.compose.yml, the egress rules let it
-# through (the deployer). Unset: neither file nor variables are involved.
-proxy="$(secret HA_EGRESS_PROXY)"
-if [ -n "$proxy" ]; then
-  export HTTP_PROXY="http://$proxy" HTTPS_PROXY="http://$proxy"
-  extra="$(secret HA_EGRESS_NO_PROXY)"
-  export NO_PROXY="localhost,127.0.0.1,::1,app,tunnel${extra:+,$extra}"
+# A host whose containers reach the internet through a proxy sets the standard
+# HTTP_PROXY / HTTPS_PROXY (and NO_PROXY for extra direct names) in its
+# secrets. The build and the running containers get them from
+# proxy.compose.yml; NO_PROXY gains loopback and the compose services' own
+# names; the deployer lets the proxy's address through the egress rules.
+# Unset: neither file nor variables are involved.
+HTTP_PROXY="$(secret HTTP_PROXY)"; HTTPS_PROXY="$(secret HTTPS_PROXY)"
+if [ -n "$HTTP_PROXY$HTTPS_PROXY" ]; then
+  export HTTP_PROXY="${HTTP_PROXY:-$HTTPS_PROXY}" HTTPS_PROXY="${HTTPS_PROXY:-$HTTP_PROXY}"
+  services="$("${compose[@]}" --env-file "$HA_ENV_FILE" config --services | paste -sd, -)"
+  extra="$(secret NO_PROXY)"
+  export NO_PROXY="localhost,127.0.0.1,::1,$services${extra:+,$extra}"
   compose+=(-f "$here/proxy.compose.yml")
 fi
 compose+=(--env-file "$HA_ENV_FILE")
