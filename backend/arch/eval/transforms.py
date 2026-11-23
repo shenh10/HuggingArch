@@ -2027,10 +2027,10 @@ class CallSite:
 def _layers_label(stack: str, meta: Any) -> str:
     """The layers a block invocation runs at, in its stack: `backbone ·
     layers 3–60`; a few at most when they do not run contiguously."""
-    if meta.layer_indices is not None:
-        layers = sorted(meta.layer_indices)
-    else:
-        layers = list(range(int(meta.count)))
+    if meta.loop_gate:
+        return f"{Stack.display_name(stack)} · loop gate"
+    layers = sorted(meta.layer_numbers)
+    passed = f" · pass {meta.pass_}" if meta.pass_ > 1 else ""
     if len(layers) == 1:
         span = f"layer {layers[0]}"
     elif layers == list(range(layers[0], layers[-1] + 1)):
@@ -2040,7 +2040,7 @@ def _layers_label(stack: str, meta: Any) -> str:
     else:
         span = (f"{len(layers)} layers {layers[0]}, {layers[1]}, …, "
                 f"{layers[-1]}")
-    return f"{Stack.display_name(stack)} · {span}"
+    return f"{Stack.display_name(stack)} · {span}{passed}"
 
 
 def isolate_resolved(resolved: Any, template: str,

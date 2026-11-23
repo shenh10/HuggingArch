@@ -261,12 +261,15 @@ def display_formulas(resolved: Any, *, batch_size: int = 1,
         call = template.attention_call()
         groups.append({
             "count": template.count,
+            # Stored layers it holds: a looped stack's later pass and its
+            # gate hold none (`BlockMeta.stored_count`).
+            "stored_count": template.stored_count,
             "attn_type": (
                 (call.attn_variant or call.kv_label) if call is not None else None),
             "ffn_type": template.ffn_type(),
         })
     output["hetero_config"] = {
-        "total_layers": sum(item.get("count", 1) for item in groups),
+        "total_layers": sum(item["stored_count"] for item in groups),
         "layer_groups": groups,
     }
     return output

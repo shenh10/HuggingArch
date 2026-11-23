@@ -165,8 +165,17 @@ class LayerGroup:
     @property
     def editable(self) -> bool:
         """Backbone and MTP layers are edited alike; a vision / audio tower
-        is one wrapper component — shown, not edited."""
-        return bool(self.template) and self.meta.aux_kind in (None, "mtp")
+        is one wrapper component — shown, not edited. A looped stack's
+        groups are shown, not edited: an edit names layers, and the editor
+        has no pass to say which execution of a looped layer it means."""
+        return (bool(self.template) and self.meta.aux_kind in (None, "mtp")
+                and not self.looped)
+
+    @property
+    def looped(self) -> bool:
+        """Whether this group runs in a looped stack (`BlockMeta.pass_`,
+        `stored_indices`)."""
+        return self.meta.stored_indices is not None
 
     @property
     def address(self) -> Tuple[Tuple[int, ...], Optional[int]]:
@@ -212,9 +221,7 @@ class LayerGroup:
         """The layer indices this group covers, in its own stack: the
         resolver's selection for an assignment, the whole stack for a
         `template:` declaration."""
-        if self.meta.layer_indices is not None:
-            return tuple(self.meta.layer_indices)
-        return tuple(range(int(self.meta.count)))
+        return self.meta.layer_numbers
 
     def layers_label(self) -> str:
         """The resolved layers in words: a run is `a–b`, a stride is
@@ -1358,8 +1365,9 @@ def model_skeleton(model_id: str) -> Dict[str, Any]:
     composition = Composition(resolved, model_id=model_id, header=header)
     return {
         "model_id": model_id,
-        "n_layers": sum(int(g.meta.count) for g in composition.groups()
-                        if g.meta.aux_kind is None and g.editable),
+        "n_layers": sum(g.meta.stored_count for g in composition.groups()
+                        if g.meta.aux_kind is None
+                        and (g.editable or g.looped)),
         "groups": [_group_dto(composition, g) for g in composition.groups()],
     }
 

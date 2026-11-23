@@ -104,10 +104,16 @@ def render_structure(resolved) -> str:
         out.append("\nBlock templates (per-layer):")
         seen: set = set()
         for meta in metas:
-            if meta.template_name in seen:
+            # A looped stack's later pass and its gate are rows of their own.
+            key = (meta.template_name, meta.pass_, meta.loop_gate)
+            if key in seen:
                 continue
-            seen.add(meta.template_name)
-            out.append(f"  {meta.template_name}  ×{meta.count} layers")
+            seen.add(key)
+            out.append(f"  {meta.template_name}"
+                       + ("  (loop gate)" if meta.loop_gate
+                          else f"  (pass {meta.pass_})" if meta.pass_ > 1
+                          else "")
+                       + f"  ×{meta.count} layers")
 
     out.append("\nComponents (op + dataflow + role + KV):")
     for name, bg in iter_reachable_components(resolved):

@@ -442,6 +442,30 @@ class StagePlacement:
                           if stage is None or placed == stage else 0)
         return out
 
+    def stored_counts(self, stage: Optional[int]) -> Dict[int, int]:
+        """Per block ordinal that holds a looped stack's stored layers (a
+        pass-1 invocation, the owner its later passes read), how many of
+        those stored layers have an execution of any pass on `stage`. A
+        stage loads the modules of the layers it runs, so a stored layer
+        whose two passes sit on two stages is resident on both."""
+        program = self.program
+        out: Dict[int, int] = {}
+        for index, block in self._block_stages.items():
+            meta = block.template.meta
+            if (meta.pass_ != 1 or meta.loop_gate
+                    or not self.partitioned(block)):
+                continue
+            schedule = program.execution_schedule(block.layer_path)
+            if not schedule.is_looped:
+                continue
+            stored = {schedule.executions[o].stored
+                      for o in block.template.layer_indices}
+            out[index] = sum(
+                1 for layer in stored
+                if any(stage is None or self.iteration_stage(block, o) == stage
+                       for o in schedule.ordinals_of(layer)))
+        return out
+
     def contribution_counts(self, stage: Optional[int],
                             scope: FrozenSet[str]) -> Dict[int, int]:
         """How many of each accounting root of `scope`'s stacks run on
@@ -554,6 +578,16 @@ class StageView:
         for uid in resident:
             if uid in roots and not counts.get(uid):
                 counts[uid] = everywhere[uid]
+        # A looped stack's later pass stores nothing and reads its owner's
+        # layers: the owner is resident for exactly the stored layers any
+        # pass on this stage runs. That count is the answer for a looped
+        # owner — it replaces the whole-owner promotion above, which a
+        # later pass's tied reads would otherwise have triggered.
+        stored = placement.stored_counts(self.stage)
+        for contribution in program.contributions:
+            index = contribution.block_index
+            if (index in stored and contribution.stack in weight_scope):
+                counts[contribution.node.uid] = stored[index]
         return self._layer(counts)
 
     def crossings(self, timing_scope: FrozenSet[str]

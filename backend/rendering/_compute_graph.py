@@ -1030,6 +1030,8 @@ def serialize_post_tree(post_tree, resolved_spec, *,
         label = (f"{meta.stack_name or meta.template_name} × {meta.count}"
                  + (f"  [{derived['axis']}={derived['visible']}]"
                     if derived is not None else "")
+                 + ("  [loop gate]" if meta.loop_gate
+                    else f"  [pass {meta.pass_}]" if meta.pass_ > 1 else "")
                  + (f"  [{meta.aux_kind}]" if meta.aux_kind else ""))
         is_aux = bool(meta.aux_kind)
         # Aux attachment comes from the group's declared `inputs:` (an MTP

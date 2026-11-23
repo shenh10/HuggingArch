@@ -93,6 +93,30 @@ class CarryEntry:
         return Reference(table=tuple(table), model_input=self.model_input)
 
 
+@dataclass(frozen=True)
+class PassEntry(CarryEntry):
+    """What formal 1 of a looped stack's gate reads (`_eval_link`): at the
+    gate's iteration after pass k, the carried value ENTERING pass k — the
+    exit of iteration `entries[j]`, the one before the pass's first layer
+    (`ExecutionSchedule.pass_entry`), or the stack's start when that is -1.
+    Resolved against the walked chain, as `CarryEntry` is."""
+
+    entries: Tuple[int, ...] = ()
+
+    def resolve(self, exits: Sequence[Tuple[Tuple[int, ...], int]]
+                ) -> Reference:
+        producer = {i: uid for iterations, uid in exits for i in iterations}
+        table = []
+        for iteration, at in zip(self.iterations, self.entries, strict=True):
+            if at < 0:
+                found = self.start.via("carry").at(iteration)
+            else:
+                found = (Source(Occurrence(producer[at], at), "out",
+                                "carry"),)
+            table.append((iteration, found))
+        return Reference(table=tuple(table), model_input=self.model_input)
+
+
 def _share(active: Any, stored: Any) -> Any:
     """`active / stored`, exact in both value domains.
 
@@ -382,6 +406,9 @@ class Evaluator:
         # The iteration space a pipeline partition cuts is whole at any pp:
         # each repeated layer's templates cover its iterations exactly once.
         _ = program.iteration_space
+        # A looped stack's later pass reads its owner's tensors; refused here,
+        # before anything is priced, when they are not the same tensor.
+        program.refuse_loop_ties()
         # A join is a node the walk evaluates, not a binding it improvises:
         # the program it walks has them in its graph (`Program.lowered`).
         if program.joined_streams and not program.is_lowered:
@@ -690,9 +717,21 @@ class Evaluator:
         repeats = (template.count > 1
                    or template.outer_repeat > 1
                    or max(indices) - min(indices) + 1 != len(indices))
+        bound = [entry, *inbounds[1:]]
+        if template.meta.loop_gate:
+            # A loop's gate reads, besides the value leaving the pass, the
+            # value entering it. The chain is held to one state at every
+            # link of a repeated stage, so the two share the entry's shape
+            # and state; where each comes from is its own reference.
+            schedule = self.program.execution_schedule(stage.layer_path)
+            bound.insert(1, replace(entry, origin=PassEntry(
+                key=carry.key, iterations=indices, start=start,
+                model_input=(start.model_input if first else None),
+                entries=tuple(schedule.pass_entry(schedule.executions[g].pass_)
+                              for g in indices))))
         out = self._eval_stage(
             stage, entry, scope, walk,
-            inbounds=[entry, *inbounds[1:]],
+            inbounds=bound,
             fixed_point=repeats, close=True,
             prefix=prefix,
             joined=joined)
@@ -1897,13 +1936,15 @@ class Evaluator:
                                       node_dims=dims,
                                       stack=self.program.stack_of(node),
                                       components=node.enclosing_components,
-                                      # The layers this node runs at. A
-                                      # weight's dtype may be declared per
-                                      # layer (`select.layers`), and the
-                                      # template is walked once for all of
-                                      # them, so the answer is per layer
-                                      # segment rather than per node.
-                                      layers=self.program.occurrence_layers(
+                                      # The stored layers this node's
+                                      # weights sit at. A weight's dtype
+                                      # may be declared per layer
+                                      # (`select.layers`, a stored layer
+                                      # number), and the template is walked
+                                      # once for all of them, so the answer
+                                      # is per layer segment rather than per
+                                      # node.
+                                      layers=self.program.stored_layers(
                                           node.uid))
                 for t in tensors)
             if reps:

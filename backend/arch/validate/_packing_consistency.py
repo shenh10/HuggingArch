@@ -153,7 +153,7 @@ def run_quant_override_check(analysis) -> List[Finding]:
     rows = [(row, program.by_uid(row.uid)) for row in analysis.tensors()
             if not row.is_metadata]
     stored = [(row.name, program.stack_of(node), node.enclosing_components,
-               program.occurrence_layers(row.uid))
+               program.stored_layers(row.uid))
               for row, node in rows]
     findings: List[Finding] = []
     undescribed: Dict[int, List[str]] = {}

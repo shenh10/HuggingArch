@@ -1077,7 +1077,7 @@ def per_rank_weight_breakdown(
     groups: list[TreeNode] = []
     attention_kind: Optional[str] = None
     num_layers = sum(
-        template.count
+        template.stored_count
         for block_index, template in enumerate(program.blocks)
         if (template.meta.indexed
             and program.stack_of_block(block_index) in backbone_stacks)

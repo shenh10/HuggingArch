@@ -87,6 +87,7 @@ from backend.arch.dim_resolution import (
 from backend.arch.eval.dim import eval_dim_expr
 from backend.arch.eval.refusal import SpecRefusal
 from backend.arch.law_text import read_law
+from backend.arch.loop_schedule import ExecutionSchedule
 from backend.arch.ops_base import reject_divisible_parameter_names
 from backend.arch.ops import OP_REGISTRY
 from backend.arch.spec_parsing import (
@@ -502,6 +503,20 @@ class ResolvedSpec:
             idxs &= set(range(total))
         return idxs
 
+    def execution_schedule(self, container) -> ExecutionSchedule:
+        """The executions of a repeated stack in order, with the stored layer
+        and pass of each (`loop_schedule`). THE one place a `loop:` is read:
+        without one each stored layer runs once and ordinal = stored layer.
+        """
+        stored = self.get_dim(container.repeat)
+        loop = container.loop
+        if loop is None:
+            return ExecutionSchedule.unlooped(stored)
+        where = f"model layer {container.name!r}"
+        return ExecutionSchedule.looped(
+            stored, self.get_dim(loop.layers[0]), self.get_dim(loop.layers[1]),
+            self.get_dim(loop.passes), loop.gate is not None, where)
+
     def resolve_assignment_groups(self, container, total=None) -> List[Dict[str, Any]]:
         """Canonical per-layer template resolution — THE single place layer→
         template selection lives.
@@ -530,9 +545,47 @@ class ResolvedSpec:
         if total is None:
             rep = container.repeat
             total = self.get_dim(rep) if rep else None
+        # In a looped stack a selector names STORED layers and the groups
+        # hold the ordinals of their executions (`execution_schedule`): every
+        # execution, or with `pass:` that pass's. Precedence runs over
+        # executions, so a pass-2 entry first claims pass 2 and the entries
+        # after it describe the rest.
+        schedule = (self.execution_schedule(container)
+                    if container.loop is not None else None)
 
         def _ovr(a):
             return {k: str(v) for k, v in a.dims.items()} if a.dims else None
+
+        def _executions(assign, stored: set) -> set:
+            if schedule is None:
+                if assign.pass_ is not None:
+                    raise ValueError(
+                        f"model layer {container.name!r}: `pass: "
+                        f"{assign.pass_}` selects a pass of a loop, and this "
+                        f"stack declares no `loop:`")
+                return stored
+            if assign.pass_ is None:
+                return {o for s in stored for o in schedule.ordinals_of(s)}
+            if assign.pass_ > schedule.passes():
+                raise ValueError(
+                    f"model layer {container.name!r}: `pass: {assign.pass_}` "
+                    f"names a pass the loop does not run (passes: "
+                    f"{schedule.passes()})")
+            # `pass:` selects inside the loop: `from: …, is: full, pass: 2`
+            # is the loop's full layers in pass 2, and the loop's range is
+            # not written a second time. A selection that names layers and
+            # none of them loops runs no pass but the first.
+            looped = {s for s in (stored if assign.selects_layers
+                                  else range(schedule.stored_layers))
+                      if schedule.in_loop(s)}
+            if not looped:
+                raise ValueError(
+                    f"model layer {container.name!r}: an assignment with "
+                    f"`pass: {assign.pass_}` selects stored layer(s) "
+                    f"{sorted(stored)[:8]}, none inside the loop "
+                    f"[{schedule.loop[0]}, {schedule.loop[1]}]; only loop "
+                    f"layers run more than one pass")
+            return {schedule.ordinal(s, assign.pass_) for s in looped}
 
         covered: set = set()
         rest_assign = None
@@ -542,7 +595,7 @@ class ResolvedSpec:
             if assign.rest:
                 rest_assign, rest_index = assign, index
                 continue
-            indices = self.layers_selected(assign, total)
+            indices = _executions(assign, self.layers_selected(assign, total))
             indices -= covered            # declaration-order precedence
             covered |= indices
             groups.append({
@@ -553,9 +606,11 @@ class ResolvedSpec:
                 "assignment_index": index,
             })
         if rest_assign is not None and total is not None:
+            every = (set(range(total)) if schedule is None
+                     else set(schedule.layer_ordinals()))
             groups.append({
                 "template": rest_assign.template,
-                "indices": sorted(set(range(total)) - covered),
+                "indices": sorted(every - covered),
                 "dim_overrides": _ovr(rest_assign),
                 "assign": rest_assign,
                 "assignment_index": rest_index,

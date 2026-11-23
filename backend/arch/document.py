@@ -80,6 +80,10 @@ class PerLayerAssign(BaseModel):
     #: layer numbers, optionally `base`): a layer kind that is the product of
     #: two config lists, Qwen3.8's `layer_types` × `ple_layer_ids`.
     within: Optional[StreamLayerSet] = None
+    #: In a looped stack: only the executions of the selected stored layers
+    #: in this pass (`BlockAssignment.pass_`). Alone, it selects every stored
+    #: layer of the loop in that pass.
+    pass_: Optional[int] = Field(default=None, alias="pass")
 
     # --- per-selection overrides, layered over the `map` entry -----------
     dims: Optional[Dict[str, str]] = None
@@ -122,6 +126,7 @@ class PerLayerAssign(BaseModel):
             "stride": self.stride is not None,
             "from": self.from_ is not None or self.is_ is not None,
             "within": self.within is not None,
+            "pass": self.pass_ is not None,
         }
         selected = [name for name, present in positive.items() if present]
         if self.rest is not None:
@@ -134,8 +139,9 @@ class PerLayerAssign(BaseModel):
             raise ValueError(
                 "per_layer assign requires at least one selector: `range`, "
                 "`layers`, `stride` (+ optional `offset`), `rest: true`, "
-                "`from` + `is`, or `from` alone for a config list of layer "
-                "numbers (several are intersected)")
+                "`from` + `is`, `from` alone for a config list of layer "
+                "numbers, or `pass` in a looped stack (several are "
+                "intersected)")
         if self.range is not None and len(self.range) != 2:
             raise ValueError("per_layer `range` must contain exactly [start, end]")
         if self.layers is not None and not self.layers:
@@ -291,6 +297,8 @@ class PerLayerBlock(BaseModel):
                 entry["config_list_base"] = a.base
             if a.within is not None:
                 entry["within"] = a.within
+            if a.pass_ is not None:
+                entry["pass"] = a.pass_
             out.append(entry)
         return out
 

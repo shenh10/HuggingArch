@@ -36,7 +36,10 @@ _READS_FROM_FIX = (
     "{<reading layer>: <source layer>, …}}` for each reading layer's source "
     "written out; a layer that reads the values of several layers at once "
     "reads an appended stream (`from:` + `after` / `before`, read with "
-    "`read: concat` or `read: all`)")
+    "`read: concat` or `read: all`). In a looped stack (`loop:`) a layer "
+    "number names a stored layer, read at its latest execution before the "
+    "reader; `{pass: n}` (alone, or with `nearest:` / `layer:`) reads its "
+    "pass-n execution")
 
 
 def _names_i(text: str) -> bool:
@@ -195,8 +198,59 @@ class LayerMap(BaseModel):
             else f"{k}: {v}" for k, v in self.map.items()) + "}"
 
 
+class PassRead(BaseModel):
+    """`{pass: n}`, optionally with `nearest:` or `layer:`: in a looped
+    stack (`LoopSpec`), the pass-n execution of a stored layer. `{pass: n}`
+    alone names the reader's own stored layer; with `nearest` or `layer`
+    (a layer number or `"i - k"`) the stored layer that form names. Without
+    `pass:` a stored layer's latest execution before the reader is read."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True,
+                              serialize_by_alias=True)
+
+    pass_: int = Field(alias="pass")
+    nearest: Optional[StreamLayerSet] = Field(
+        default=None, exclude_if=lambda v: v is None)
+    layer: Optional[str] = Field(default=None, exclude_if=lambda v: v is None)
+
+    @field_validator("layer", mode="before")
+    @classmethod
+    def _layer_number(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value)
+        relative = (_RELATIVE_LAYER.fullmatch(value)
+                    if isinstance(value, str) else None)
+        if not isinstance(value, str) or not value.strip() or (
+                _names_i(value) and (relative is None
+                                     or _names_i(relative["k"]))):
+            raise ValueError(
+                f"`reads_from` {{pass, layer}}: layer {value!r} is not one "
+                f"layer number or `\"i - k\"`; {_READS_FROM_FIX}")
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _one_layer(self) -> "PassRead":
+        if self.pass_ < 1:
+            raise ValueError(
+                f"`reads_from` {{pass: {self.pass_}}}: passes count from 1")
+        if self.nearest is not None and self.layer is not None:
+            raise ValueError(
+                "`reads_from` {pass, …} names one stored layer: `nearest:` "
+                "or `layer:`, not both")
+        return self
+
+    def __str__(self) -> str:
+        where = (f", nearest {self.nearest}" if self.nearest is not None
+                 else f", layer {self.layer}" if self.layer is not None
+                 else "")
+        return f"pass {self.pass_}{where}"
+
+
 #: One reader declaration's sources, stream name → layer.
-ReadsFrom = Dict[str, Union[str, StreamLayerRef, NearestLayer, LayerMap]]
+ReadsFrom = Dict[str, Union[str, StreamLayerRef, NearestLayer, LayerMap,
+                            PassRead]]
 
 
 def check_reads_from(value: Any) -> Optional[ReadsFrom]:
@@ -219,11 +273,13 @@ def check_reads_from(value: Any) -> Optional[ReadsFrom]:
                 f"`reads_from` keys are stream names, got {name!r}")
         if isinstance(layer, int) and not isinstance(layer, bool):
             layer = str(layer)
-        if isinstance(layer, (StreamLayerRef, NearestLayer, LayerMap)):
+        if isinstance(layer, (StreamLayerRef, NearestLayer, LayerMap,
+                              PassRead)):
             out[name] = layer
             continue
         if isinstance(layer, dict):
-            out[name] = (NearestLayer(**layer) if "nearest" in layer
+            out[name] = (PassRead(**layer) if "pass" in layer
+                         else NearestLayer(**layer) if "nearest" in layer
                          else LayerMap(**layer) if "map" in layer
                          else StreamLayerRef(**layer))
             continue
@@ -350,6 +406,12 @@ class BlockAssignment(LayerSelection):
     # offset / config_list + equals / within), so an assignment's authored
     # YAML is unchanged.
     rest: Optional[bool] = None             # all layers not covered by other assignments
+    # In a looped stack (`LoopSpec`): only the executions of the selected
+    # stored layers in this pass. Without it, every execution of them.
+    # Left out of the dump while unset.
+    pass_: Optional[int] = Field(default=None, alias="pass",
+                                 serialization_alias="pass",
+                                 exclude_if=lambda v: v is None)
 
     # Reference a block template (component name or inline block).
     template: Optional[str] = None
@@ -373,10 +435,19 @@ class BlockAssignment(LayerSelection):
     reads_from: Optional[ReadsFrom] = Field(
         default=None, exclude_if=lambda v: v is None)
 
+    model_config = ConfigDict(populate_by_name=True)
+
     @field_validator("reads_from", mode="before")
     @classmethod
     def _reads_from(cls, value: Any) -> Optional[ReadsFrom]:
         return check_reads_from(value)
+
+    @field_validator("pass_")
+    @classmethod
+    def _pass_counts_from_one(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value < 1:
+            raise ValueError(f"`pass: {value}`: passes count from 1")
+        return value
 
     @field_validator("dims")
     @classmethod
@@ -1180,6 +1251,59 @@ class StreamSpec(BaseModel):
 
 
 
+class LoopGate(BaseModel):
+    """What a looped stack runs after each pass: a block template whose
+    formal 0 takes the carried value leaving the pass and formal 1 the
+    carried value entering it, and whose output is carried on. One stored
+    copy per pass, indexed by pass under `checkpoint.prefix`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    template: str
+    checkpoint: CheckpointAddress
+
+    @model_validator(mode="after")
+    def _indexed_by_pass(self) -> "LoopGate":
+        self.checkpoint.only("prefix", where="loop gate")
+        if self.checkpoint.prefix is None:
+            raise ValueError(
+                "a loop gate stores one copy per pass; its `checkpoint` "
+                "declares the `prefix` the pass index follows")
+        return self
+
+
+class LoopSpec(BaseModel):
+    """A looped stack: stored layers `layers[0]..layers[1]` (inclusive) run
+    `passes` times with the same weights, each pass after the previous one,
+    with an optional gate after every pass. `repeat:` still counts STORED
+    layers; the stack's iterations are its executions in order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    layers: List[str]
+    passes: str
+    gate: Optional[LoopGate] = Field(default=None,
+                                     exclude_if=lambda v: v is None)
+
+    @field_validator("layers", mode="before")
+    @classmethod
+    def _range(cls, value: Any) -> Any:
+        if not isinstance(value, list) or len(value) != 2:
+            raise ValueError(
+                f"`loop.layers: {value!r}` is the inclusive stored range "
+                f"[first, last]")
+        return [str(v).strip() for v in value]
+
+    @field_validator("passes", mode="before")
+    @classmethod
+    def _passes(cls, value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, (int, str)) \
+                or not str(value).strip():
+            raise ValueError(
+                f"`loop.passes: {value!r}` is an integer or a dim expression")
+        return str(value).strip()
+
+
 class ModelLayer(BaseModel):
     """A single entry in the model structure (embedding, block group, lm_head, etc.)."""
     model_config = ConfigDict(extra="forbid")
@@ -1266,6 +1390,9 @@ class ModelLayer(BaseModel):
     # See GraphNode.params for the dict-valued nested-call semantics.
     params: Dict[str, Any] = {}
     assignments: Optional[List[BlockAssignment]] = None  # heterogeneous block assignments
+    #: A looped stack (`LoopSpec`). Left out of the dump while unset.
+    loop: Optional[LoopSpec] = Field(default=None,
+                                     exclude_if=lambda v: v is None)
     tied_weight: Optional[TiedWeightSpec] = None
     #: On a `group:` or `template:` layer the loader wrote from a call site
     #: (`spec_parsing.LayerCall`): the earlier layer whose module this one
@@ -1433,7 +1560,7 @@ class ModelLayer(BaseModel):
             "weight_axes", "expert_weight", "stored_axes", "stored_split",
             "stored_without_graph_reader", "host_offload", "params",
             "tied_weight", "layers", "aux_kind", "checkpoint", "quant_metadata", "streams",
-            "reads_from",
+            "reads_from", "loop",
         }
         allowed = {
             "op": {
@@ -1442,8 +1569,9 @@ class ModelLayer(BaseModel):
                 "stored_without_graph_reader", "host_offload", "tied_weight",
                 "quant_metadata", "checkpoint",
             },
-            "template": {"params", "streams", "checkpoint", "reads_from"},
-            "per_layer": {"streams", "checkpoint"},
+            "template": {"params", "streams", "checkpoint", "reads_from",
+                         "loop"},
+            "per_layer": {"streams", "checkpoint", "loop"},
             "group": {"layers", "aux_kind", "checkpoint", "streams"},
         }
         invalid = sorted((self.model_fields_set & contextual) - allowed[form])
@@ -1495,6 +1623,7 @@ class ModelLayer(BaseModel):
                 f"`carries: true` streams {carried}; a stack hands one value "
                 f"from iteration to iteration")
         self._check_appended_streams(form)
+        self._check_loop()
 
         if self.group is not None:
             if self.group is not True:
@@ -1509,6 +1638,13 @@ class ModelLayer(BaseModel):
             # held at the spec, which knows the model inputs): an encoder reads
             # its media input and names no backbone tensor; a head (MTP,
             # speculative) names the backbone tensor it reads in `inputs:`.
+            looped = [layer.name for layer in self.layers or []
+                      if layer.loop is not None]
+            if looped:
+                raise ValueError(
+                    f"Model group {self.name!r}: {looped} declare `loop:` "
+                    f"inside a group; a loop is supported on a top-level "
+                    f"stack only")
             child_names = [layer.name for layer in self.layers or []]
             duplicate_children = sorted({
                 name for name in child_names if child_names.count(name) > 1
@@ -1580,6 +1716,31 @@ class ModelLayer(BaseModel):
         if isinstance(self.prompt_slots, dict):
             return self.prompt_slots.get(ref)
         return self.prompt_slots
+
+    def _check_loop(self) -> None:
+        """A loop belongs to a repeated `template:` / `per_layer:` stack of
+        its own (the form check admits no other). It is not a call of
+        another layer, and its iterations are executions, so no appended
+        stream counts them yet: their iteration selectors would need the
+        stored → execution rule, and no model needs it."""
+        if self.loop is None:
+            return
+        if self.repeat is None:
+            raise ValueError(
+                f"model layer {self.name!r}: `loop:` runs stored layers of a "
+                f"repeated stack again; it needs `repeat:`")
+        if self.call is not None:
+            raise ValueError(
+                f"model layer {self.name!r}: a call of {self.call!r} runs "
+                f"another layer's weights; it cannot also declare `loop:`")
+        appended = [*self.appended_streams, *self.read_streams,
+                    *self.concat_streams, *self.prefix_streams]
+        if appended:
+            raise ValueError(
+                f"model layer {self.name!r}: appended streams {appended} on "
+                f"a looped stack are not supported; their iteration "
+                f"selectors would have to pick among a stored layer's "
+                f"executions")
 
     def _check_appended_streams(self, form: str) -> None:
         """An appended stream, or a `read: each` / `read: concat` of one,

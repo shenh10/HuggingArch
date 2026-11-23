@@ -501,17 +501,32 @@ per_layer:
 | an integer or dim expression (`"20"`, `"n_dense_layers - 1"`) | that layer of the reading layer's stack |
 | `{ nearest: { from: config.<list>, is: <value> } }` | the nearest earlier layer whose entry in a per-layer config list is `<value>` — the selector `per_layer.assign` uses |
 | `{ nearest: { from: config.<list> } }` | the nearest earlier layer of a config list of layer numbers (one number is a set of one) |
-| `{ stack: <path>, layer: <number> }` | that layer of another stack; `<path>` is its layer names from the top of `model:` joined by `/` (`layers`, `mtp/mtp`) |
+| `{ stack: <path>, layer: <number> }` | that layer of another stack; `<path>` is its layer names from the top of `model:` joined by `/` (`layers`, `mtp/mtp`). When that stack loops, `<number>` is its stored layer and the read is that layer's last execution; this form takes no `pass:` |
 | `{ map: { "<reading layer>": <source>, … } }` | each reading layer's source written out, one entry per layer the declaration selects; a source is a layer number or `{ stack, layer }` |
 | `{ map: config.<list> }` | a config list of source layer numbers, one per selected layer in ascending order |
+| `{ pass: n }`, alone or with `nearest:` / `layer:` | in a looped stack (`loop:`): pass n of the reading layer's own stored layer, or of the layer `nearest` / `layer` names |
 
 The map is the general form: every other value is shorthand for the map it
 gives over the selected layers, and all of them resolve the same way.
 
-Layers are numbered as `per_layer.assign` selects them: the iteration of
-the stack, not the checkpoint index. The named layer writes the stream:
+Layers are numbered as `per_layer.assign` selects them: the layer of the
+stack as `repeat:` counts it. In a looped stack (below) that is the stored
+layer — the checkpoint index — and a value that names a layer reads its
+latest execution before the reader; `{ pass: n }` reads pass n instead. The named layer writes the stream:
 a component on it `stream_out`s the stream from a node. In a `nearest` set
 every layer writes it, and every reading layer has one before it.
+
+A looped stack runs a range of its layers more than once per forward pass
+with the same weights (a Loop / recurrent-depth transformer):
+`loop: { layers: [<first>, <last>], passes: <n>, gate: { template: <block>,
+checkpoint: { prefix: <path> } } }` on the stack, `repeat:` still counting
+stored layers. A `per_layer.assign` entry with `pass: <k>` selects only the
+loop layers' pass-k executions (a later pass binds its own components; its
+weights are the stored layer's, and it may read no weight the stored layer
+lacks); entries without `pass:` select every execution of their layers, so
+write the later-pass entries first. The optional gate runs after every pass:
+its block's first input is the value leaving the pass, its second the value
+entering it, and it stores one copy per pass.
 
 Write the source the forward source and the config state: a loop that hands
 every layer what the layer before returned is `"i - 1"`; layers that reuse

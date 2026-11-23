@@ -1129,7 +1129,8 @@ def build_model_config(summary, resolved_spec):
         # groups (`Headline.dense_layers`); with none, the dense width
         # (`intermediate_size`) does not apply.
         ffn["dense_layers"] = list(program.headline.dense_layers)
-        mtp = sum(template.count for template in program.stack_blocks("mtp"))
+        mtp = sum(template.stored_count
+                  for template in program.stack_blocks("mtp"))
         if mtp:
             ffn["mtp_layers"] = mtp
     result["ffn"] = ffn

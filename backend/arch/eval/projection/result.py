@@ -215,10 +215,18 @@ class ModelReport:
     analysis: Any = None
 
     def layer_positions(self) -> List[List[int]]:
-        """Per block invocation, the layer indices it covers in its own
-        stack (`BlockTemplate.layer_indices`): the resolver's selection
-        where the spec made one, else every iteration of its stack."""
-        return [list(template.layer_indices)
+        """Per block invocation, the layers it covers in its own stack, as
+        the checkpoint numbers them (`BlockMeta.layer_numbers`): the
+        resolver's selection where the spec made one, else every layer of
+        its stack; in a looped stack, the stored layers (`layer_passes`
+        says which pass)."""
+        return [list(template.meta.layer_numbers)
+                for template in self.analysis.program.blocks]
+
+    def layer_passes(self) -> List[int]:
+        """Per block invocation, the pass of a looped stack it runs in (1
+        outside a loop), and 0 for a loop's gate, which is no layer."""
+        return [0 if template.meta.loop_gate else template.meta.pass_
                 for template in self.analysis.program.blocks]
 
     def _lm_head_node(self) -> Optional[NodeReport]:

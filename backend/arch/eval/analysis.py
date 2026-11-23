@@ -137,7 +137,8 @@ class OwnCopies(NamedTuple):
 class AttentionFamily:
     """One attention family of the backbone (`Analysis.attention_families`):
     the cache family its attention call declares (`kv_label`, with the
-    compute flavor `variant` — DSA, CSA), how many layers run it, and the
+    compute flavor `variant` — DSA, CSA), how many layers run it (stored
+    layers: a looped layer running it in two passes counts once), and the
     model-level dims its body reads (`Program.reads`) with the values the
     walk bound them to at the call (`node_dims`).
 
@@ -1049,6 +1050,10 @@ class Analysis:
         program = self.program
         declared = list(program.resolved.dim_values)
         families: Dict[Tuple[Any, ...], AttentionFamily] = {}
+        # The layers that run each family, as the checkpoint numbers them in
+        # their own stack: a looped stack's later pass runs its stored layers
+        # again, and a layer is counted once per family it runs.
+        members: Dict[Tuple[Any, ...], set] = {}
         for template in program.stack_blocks():
             call = template.attention_call()
             if call is None:
@@ -1084,10 +1089,12 @@ class Analysis:
             rebound &= {name for name, _ in dims}
             key = (call.kv_label, call.attn_variant, tuple(dims),
                    frozenset(rebound))
-            found = families.get(key)
+            members.setdefault(key, set()).update(
+                (template.meta.stack_name, layer)
+                for layer in template.meta.layer_numbers)
             families[key] = AttentionFamily(
                 label=call.kv_label, variant=call.attn_variant,
-                layers=template.count + (found.layers if found else 0),
+                layers=len(members[key]),
                 dims=tuple(dims), rebound=frozenset(rebound))
         return tuple(families.values())
 

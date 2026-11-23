@@ -64,16 +64,38 @@ def layout_assignments_in_order(
     L = max(occupied) + 1
 
     # Enumeration already applied declaration-order precedence and filled
-    # the remainder from `rest:`, so the invocations partition [0, L).
+    # the remainder from `rest:`, so the invocations partition [0, L). The
+    # cards follow the iterations in the order they run; a looped stack's
+    # are its executions, and a card names them by stored layer and pass
+    # (`stored`).
     idx_to_tmpl: List[Optional[str]] = [None] * L
     idx_to_kind: List[Optional[str]] = [None] * L
+    stored: Dict[int, str] = {}
     meta_of: Dict[str, Any] = {}
     for meta in metas:
         meta_of.setdefault(meta.template_name, meta)
+        numbers = (dict(zip(meta.layer_indices, meta.layer_numbers,
+                            strict=True))
+                   if meta.layer_indices is not None else {})
         for idx in meta.layer_indices or ():
             if idx >= 0:
                 idx_to_tmpl[idx] = meta.template_name
                 idx_to_kind[idx] = meta.family_name or meta.template_name
+                if meta.stored_indices is not None:
+                    stored[idx] = (f"loop gate {numbers[idx] + 1}"
+                                   if meta.loop_gate
+                                   else f"{numbers[idx]}"
+                                   + (f" · pass {meta.pass_}"
+                                      if meta.pass_ > 1 else ""))
+
+    def _named(indices: Sequence[int]) -> str:
+        """`indices` in words: as layer numbers outside a loop, else each
+        by its stored layer and pass."""
+        if not any(i in stored for i in indices):
+            return _layers_label(indices)
+        shown = [stored.get(i, str(i)) for i in indices]
+        return (shown[0] if len(shown) == 1
+                else f"{shown[0]} … {shown[-1]}")
 
     def _card(indices: List[int], where: str, count: int) -> dict:
         """One card for the layers `indices`, all of one kind, standing
@@ -103,7 +125,7 @@ def layout_assignments_in_order(
             variants.append({
                 "name": v_label,
                 "type": "moe_block" if v_moe else "dense_block",
-                "detail": f"{_layers_label(at)} · ×{len(at)}",
+                "detail": f"{_named(at)} · ×{len(at)}",
                 "expandable": True,
                 "template": tmpl,
                 "layers": at,
@@ -128,7 +150,7 @@ def layout_assignments_in_order(
             j = i
             while j + 1 < hi and idx_to_kind[j + 1] == kind:
                 j += 1
-            where = f"layer {i}" if i == j else f"layers {i}–{j}"
+            where = _named(list(range(i, j + 1)))
             cards.append(_card(list(range(i, j + 1)), where, j - i + 1))
             i = j + 1
 
@@ -152,14 +174,15 @@ def layout_assignments_in_order(
             abs_idx = start + offset
             # One position of one cycle is one layer.
             inner = _card([abs_idx + k * period for k in range(cycles)],
-                          f"+{offset} (e.g. layer {abs_idx})", 1)
+                          f"+{offset} (e.g. {_named([abs_idx])})", 1)
             is_moe = is_moe or inner["type"] == "moe_block"
             inner_cards.append({**inner, "cycle_offset": offset})
 
         cards.append({
             "name": f"× {cycles} cycles",
             "type": "cycle_container",
-            "detail": f"layers {start}–{end} · period {period}",
+            "detail": f"{_named(list(range(start, end + 1)))} · "
+                      f"period {period}",
             "expandable": False,
             "cycle_count": cycles,
             "cycle_period": period,

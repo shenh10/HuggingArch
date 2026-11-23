@@ -313,6 +313,8 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
 | Code identifier | Literature term / source | Meaning here |
 |---|---|---|
 | `ProcessGroupFamily` | cf. MPI groups (no communication context attached); XLA replica_groups | a family of process groups over the ranks of one world |
+| `loop:`, `pass` | looped / recurrent-depth transformer (Universal Transformer's weight-shared depth) | a range of stored layers run more than once per forward pass with the same weights; a pass is one run over the range |
+| `ExecutionSchedule`, execution ordinal | — | a stack's iterations in the order they run, each with the stored layer and pass it runs; the pipeline cuts executions |
 | `refines` | partition refinement (order theory) | one partition of the ranks is finer than another |
 | `orthogonal`, `joint_components` | — | two families jointly index ranks one-to-one (product-bijective per joint component) |
 | `Block`, `pad_to` | HPF BLOCK distribution; owner computes | contiguous block distribution of one axis over a world |

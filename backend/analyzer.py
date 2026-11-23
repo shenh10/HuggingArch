@@ -280,18 +280,23 @@ def _analyze_from_spec(model_id: str, config: dict, resolved, hf_meta: dict,
         call = template.attention_call()
         layer_groups_meta.append({
             "count": template.count,
+            # Stored layers it holds (a looped stack's later pass and its
+            # gate hold none) and the pass it runs in.
+            "stored_count": template.stored_count,
+            "pass": template.meta.pass_,
             "template": template.name,
             "attn_type": call.kv_label if call is not None else None,
             "attn_display": (
                 (call.attn_variant or call.kv_label) if call is not None else None),
             "ffn_type": template.ffn_type(),
-            "layer_indices": template.layer_indices,
+            # The layers as the checkpoint numbers them (stored layers).
+            "layer_indices": template.meta.layer_numbers,
         })
     ffn_type = next((cfg.get("ffn_type") for cfg in layer_groups_meta
                      if cfg.get("ffn_type")), None)
     if any(cfg.get("ffn_type") == "moe" for cfg in layer_groups_meta):
         ffn_type = "moe"
-    num_moe_layers = sum(cfg["count"] for cfg in layer_groups_meta
+    num_moe_layers = sum(cfg["stored_count"] for cfg in layer_groups_meta
                          if cfg.get("ffn_type") == "moe")
     # The backbone layers that run a dense FFN, alone or beside their
     # experts (LongCat runs one in every MoE layer): the one published fact
@@ -301,7 +306,8 @@ def _analyze_from_spec(model_id: str, config: dict, resolved, hf_meta: dict,
     # Layers whose block makes an attention / sequence-mixer call (its cache
     # identity, `BlockTemplate.attention_call`): Nemotron's MoE layers make
     # none.
-    num_attention_layers = sum(cfg["count"] for cfg in layer_groups_meta
+    num_attention_layers = sum(cfg["stored_count"]
+                               for cfg in layer_groups_meta
                                if cfg.get("attn_type"))
 
     total_flops = model_result.total_flops
@@ -647,6 +653,10 @@ def _build_attention_info(headline, layer_groups_meta: list, L: int,
 
     layer_types: list = [None] * L
     for cfg in layer_groups_meta:
+        # Per stored layer: a looped stack's later pass and its gate hold no
+        # layer (`stored_count` 0) and would overwrite the layer's own.
+        if not cfg["stored_count"]:
+            continue
         attn = cfg.get("attn_display")
         for idx in cfg.get("layer_indices") or ():
             if 0 <= idx < L:
@@ -892,6 +902,7 @@ def _build_layer_groups(model_result: ModelReport, _resolved, batch_size, seq_le
     aux_kinds = list(model_result.block_aux_kinds) if model_result.block_aux_kinds else []
     derived_groups = list(model_result.block_derived_groups)
     positions = model_result.layer_positions()
+    passes = model_result.layer_passes()
     binding = analysis.binding
     B = (_extent_int(binding.get("B"), batch_size) if binding is not None
          else batch_size)
@@ -905,10 +916,13 @@ def _build_layer_groups(model_result: ModelReport, _resolved, batch_size, seq_le
         layer_positions = positions[i]
         first_shape = br.nodes[0].shape_in if br.nodes and br.nodes[0].shape_in else block_shape
         last_shape = br.nodes[-1].shape_out if br.nodes and br.nodes[-1].shape_out else block_shape
+        pass_ = passes[i]
         for pos in layer_positions:
             bucket_id = i
             groups.append({
-                "name": f"Transformer Block {pos}",
+                "name": (f"Loop gate {pos + 1}" if pass_ == 0
+                         else f"Transformer Block {pos}"
+                         + (f" · pass {pass_}" if pass_ > 1 else "")),
                 "layer_type": "transformer_block",
                 "count": 1,
                 "total_params": br.total_params,

@@ -63,18 +63,22 @@ from ..spec_tree import (
     STACK_ENTRY, BlockMeta, InputRef, SpecIRNode, SpecIRTree, SpineEntry,
     TreeStream,
     checkpoint_prefix, ir_dim_symbols, ir_to_leaf, iter_leaves, iter_tree,
+    layer_at,
     require_module,
     scope_prefix,
 )
 from .binding import Binding
 from .copies import copy_factors_of
-from .dim import eval_dim_expr, value_of
+from .dim import eval_dim_expr, names_of, value_of
 from .layer import Layer
 from .node import Evaluable
 from .occurrence import Occurrence, Reference, Source
 from .op_ref import OpRef
 from .refusal import SpecRefusal
 from .storage import StorageKind
+from ..loop_schedule import Execution, ExecutionSchedule
+from pydantic import BaseModel
+
 from backend.code_trace.memo import memo_property
 
 
@@ -116,6 +120,14 @@ class BlockTemplate:
         """
         raw = self.meta.count
         return 1 if raw is None else int(raw)
+
+    @property
+    def stored_count(self) -> int:
+        """How many of the stack's stored LAYERS this invocation holds: its
+        count, except in a looped stack, where a later pass runs layers its
+        pass-1 owner holds and the gate is no layer of the stack. A page that
+        counts a model's layers sums this; `count` counts executions."""
+        return self.meta.stored_count
 
     @property
     def dim_overrides(self) -> Mapping[str, Any]:
@@ -777,6 +789,25 @@ def _outermost_readers(roots: Sequence[SpecIRNode],
         yield from _outermost_readers(node.children, name)
 
 
+def _resolved(value: Any, frame: Mapping[str, Any]) -> Any:
+    """`value` (a stored-axis declaration, as dumped) with every string that
+    is a dim expression of `frame` replaced by its value; other strings (a
+    world, a fit) stay as written."""
+    if isinstance(value, BaseModel):
+        value = value.model_dump()
+    if isinstance(value, dict):
+        return tuple(sorted((k, _resolved(v, frame)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_resolved(v, frame) for v in value)
+    if isinstance(value, str):
+        try:
+            resolved = eval_dim_expr(value, frame)
+        except (SyntaxError, TypeError, ValueError):
+            return value
+        return value if names_of(resolved) else str(resolved)
+    return value
+
+
 def _first_iteration(stage: Stage) -> int:
     """Where a chain stage first occurs. Only a block stage carries a stream;
     an op stage in a carrying group (an MTP head's logits) is not a link."""
@@ -883,6 +914,7 @@ class Headline:
 
     hidden: int
     vocab: int
+    #: Stored layers: a looped stack's loop range counts once.
     layers: int
     dense_layers: Tuple[int, ...]
     heads: Optional[int]
@@ -892,6 +924,9 @@ class Headline:
     kv_lora_rank: Optional[int]
     q_lora_rank: Optional[int]
     qk_rope_dim: Optional[int]
+    #: A looped backbone's `(first, last, passes)` stored range, None
+    #: without a loop (`ExecutionSchedule.loop`).
+    loop: Optional[Tuple[int, int, int]] = None
 
 
 @dataclass(frozen=True)
@@ -1214,6 +1249,7 @@ class Program:
         """
         aliases: Dict[int, Dict[int, TiedRead]] = {}
         pieces: Dict[int, Fraction] = {}
+        self.refuse_loop_ties()
         for node in self.nodes():
             if node.tied_to is None:
                 continue
@@ -1229,8 +1265,11 @@ class Program:
             aliases[node.uid] = {node.tied_to_uid: TiedRead(
                 share, node.split_at_load)}
             if node.split_at_load:
-                pieces[node.tied_to_uid] = (
-                    pieces.get(node.tied_to_uid, Fraction(0)) + share)
+                # Keyed by the holder the piece's own graph split: a looped
+                # stack's later pass splits its own holder, tied on to the
+                # owner pass's, and each graph's pieces partition their own.
+                pieces[node.split_of] = (
+                    pieces.get(node.split_of, Fraction(0)) + share)
         for holder, total in pieces.items():
             if total != 1:
                 stored = self.by_uid(holder)
@@ -1242,6 +1281,53 @@ class Program:
                     f"declared weights must partition the stored tensor; a "
                     f"reader that runs the whole tensor is a `tied_weight:`.")
         return aliases
+
+    @memo_property
+    def loop_ties_checked(self) -> bool:
+        """`refuse_loop_ties`, asked once: the walk asks it before it
+        evaluates anything (`Evaluator.__init__`) and every reader of a tie
+        through `read_aliases`, so no path prices a looped stack whose later
+        pass reads another tensor than its owner stores."""
+        for node in self.nodes():
+            if node.tied_to is not None:
+                self._refuse_another_tensor(node)
+        return True
+
+    def refuse_loop_ties(self) -> None:
+        _ = self.loop_ties_checked
+
+    def _refuse_another_tensor(self, node: SpecIRNode) -> None:
+        """A looped stack's later pass reads its owner's tensor whole
+        (`_tie_loop_passes` paired them by address and declaration). It is
+        the same tensor only if it resolves to the same shape and the same
+        axis contracts in both frames: one address, one shape and one
+        spelling `parts: n_heads` under two bindings of `n_heads` are two
+        cuts of the tensor. Every dim expression the stored axes and split
+        spell is compared at the value its node's frame binds; a dim the
+        node binds and no stored field spells takes no part."""
+        index = self.block_of(node.uid)
+        if (node.split_at_load or index is None
+                or self.blocks[index].meta.loop_owner is None):
+            return
+        owner = self.by_uid(node.tied_to_uid)
+        custom = self.spec.custom_ops or {}
+
+        def identity(n: SpecIRNode) -> Tuple[Any, ...]:
+            frame = {**n.frame, **n.dims}
+            return (tuple(ir_to_leaf(n, "", custom).shape),
+                    _resolved(n.weight_axes, frame),
+                    _resolved(n.stored_split, frame))
+
+        if identity(node) != identity(owner):
+            raise SpecRefusal(
+                f"{node.display_path}: pass {self.blocks[index].meta.pass_} "
+                f"of a looped stack reads the stored layer's weight at "
+                f"{node.weight_name!r}, which it binds to another shape or "
+                f"axis cut than its pass-1 invocation does "
+                f"({identity(node)} vs {identity(owner)})",
+                declaration="per_layer.assign[].dims",
+                fix="a later pass runs the stored layer's weights as stored; "
+                    "bind the dims they are cut by as pass 1 does")
 
     @memo_property
     def embeddings_tied(self) -> bool:
@@ -2159,14 +2245,18 @@ class Program:
                         f"field the model names it by) in the spec's "
                         f"`dims:`")
         backbone = self.stack_blocks()
-        dense_layers = tuple(sorted(
+        dense_layers = tuple(sorted({
             index for template in backbone if template.runs_dense_ffn()
-            for index in template.layer_indices))
+            for index in template.meta.layer_numbers}))
         return Headline(
             hidden=declared("d_model"),
             vocab=declared("n_vocab"),
-            layers=sum(template.count for template in backbone),
+            layers=sum(template.stored_count for template in backbone),
             dense_layers=dense_layers,
+            loop=next((schedule.loop for schedule in (
+                self.execution_schedule(template.meta.layer_path)
+                for template in backbone if template.meta.loop_gate
+                or template.meta.pass_ > 1) if schedule.is_looped), None),
             heads=declared("n_heads"),
             kv_heads=declared("n_kv_heads"),
             intermediate=declared("d_ffn") if dense_layers else None,
@@ -2433,8 +2523,12 @@ class Program:
         if index is None:
             return f"{node.display_path!r} (stack {stack!r})"
         meta = self.blocks[index].meta
-        layers = (f" layers {sorted(meta.layer_indices)}"
+        layers = (f" layers {sorted(meta.layer_numbers)}"
                   if meta.layer_indices else "")
+        if meta.loop_gate:
+            layers = " loop gate"
+        elif meta.pass_ > 1:
+            layers += f" pass {meta.pass_}"
         return (f"{node.display_path!r} in {meta.stack_name}{layers} "
                 f"(template {meta.template_name}, stack {stack!r})")
 
@@ -2463,7 +2557,7 @@ class Program:
         if source.via == "carry":
             return True
         if source.via == "named":
-            depth = self.stack_depth(stack)
+            depth = self.stack_iterations(stack)
             return (self.block_of(reader) is None and depth is not None
                     and source.occurrence.iteration == depth - 1)
         return False
@@ -2646,6 +2740,23 @@ class Program:
     # one value per input, and beside it the occurrences that produced the
     # value at each iteration (`Analysis.input_references`).
 
+    def execution_schedule(self, layer_path: Tuple[int, ...]
+                           ) -> "ExecutionSchedule":
+        """The executions of the repeated model layer at `layer_path`, with
+        the stored layer and pass of each (`loop_schedule`): the one answer
+        to "which stored layer does iteration i run". Iterations everywhere
+        else in the program are executions; only a reader that has to name
+        a STORED tensor (its checkpoint index, its per-layer format) asks
+        this."""
+        layer = layer_at(self.spec, tuple(layer_path))
+        return self.resolved.execution_schedule(layer)
+
+    def execution(self, layer_path: Tuple[int, ...], iteration: int
+                  ) -> "Execution":
+        """The stored layer, pass and part iteration `iteration` of the
+        stack at `layer_path` runs (`execution_schedule`)."""
+        return self.execution_schedule(layer_path).executions[iteration]
+
     @memo_property
     def iteration_space(self) -> Mapping[Tuple[int, ...], Tuple[int, int]]:
         """The iteration space a pipeline partition cuts: the repeated model
@@ -2665,11 +2776,13 @@ class Program:
                 continue
             for stage in stack.walk_order():
                 if not isinstance(stage, BlockStage) \
-                        or stage.entry.repeat is None:
+                        or stage.entry.iterations is None:
                     continue
                 key = stage.layer_path
                 if key not in out:
-                    depth = stage.entry.repeat
+                    # Executions, not stored layers: a looped stack runs
+                    # its loop range once per pass (`SpineEntry.iterations`).
+                    depth = stage.entry.iterations
                     out[key] = (offset, depth)
                     names[key] = stage.name
                     offset += depth
@@ -2815,10 +2928,43 @@ class Program:
             return tuple(declared)
         return self.stage_iterations(self._walk_sequence[position])
 
+    def stored_layers(self, uid: int) -> Tuple[Optional[int], ...]:
+        """The STORED layers node `uid`'s weights sit at: one per iteration
+        it occurs at (`occurrence_layers`), each projected through its
+        stack's execution schedule — the checkpoint index the iteration's
+        weights live under, the number a per-layer quant override names. In
+        a stack without a loop they are the iterations themselves; a loop's
+        gate is indexed by pass. `(None,)` for a model-level op."""
+        iterations = self.occurrence_layers(uid)
+        position, _parent, _root = self._frame(uid)
+        stage = self._walk_sequence[position]
+        if not isinstance(stage, BlockStage):
+            return iterations
+        meta = stage.template.meta
+        if meta.stored_indices is None:
+            return iterations
+        stored = dict(zip(meta.layer_indices, meta.stored_indices,
+                          strict=True))
+        return tuple(stored[i] for i in iterations)
+
     def stack_depth(self, stack: Optional[str]) -> Optional[int]:
         """How many layers `stack` has, as its templates cover them — the
-        `total` a `LayerSelection` of that stack resolves against. None for
-        a stack of no block stages (nothing to index)."""
+        `total` a `LayerSelection` of that stack resolves against, which
+        names STORED layers (`BlockMeta.layer_numbers`; a looped stack's
+        gate is no layer of it). None for a stack of no block stages
+        (nothing to index)."""
+        covered = {layer
+                   for declared in self.stacks if declared.name == (stack or "")
+                   for stage in declared.stages
+                   if isinstance(stage, BlockStage)
+                   and not stage.template.meta.loop_gate
+                   for layer in stage.template.meta.layer_numbers}
+        return max(covered) + 1 if covered else None
+
+    def stack_iterations(self, stack: Optional[str]) -> Optional[int]:
+        """How many iterations `stack` runs — its executions, which a looped
+        stack has more of than layers (`stack_depth`). None for a stack of
+        no block stages."""
         covered = {layer
                    for declared in self.stacks if declared.name == (stack or "")
                    for stage in declared.stages
@@ -3031,13 +3177,16 @@ class Program:
         owner = template.meta.iteration_owner
         out: Dict[str, Tuple[str, List[Tuple[int, int]]]] = {}
         for layer in template.layer_indices:
+            shown = self.iteration_label(template, layer)
             for name in self.block_stream_reads(block):
                 key = (owner, layer, name)
                 if key in self.ir.stream_reads:
                     _form, rows = out.setdefault(
                         name, (self.ir.stream_read_forms[key], []))
                     origin = self.stream_origin(*key)
-                    rows.append((layer, origin.iteration
+                    rows.append((shown, self.iteration_label(
+                        self.blocks[self.block_of(origin.uid)],
+                        origin.iteration)
                                  if origin.iteration is not None
                                  else self.by_uid(origin.uid).name))
         return {name: (form, tuple(rows))
@@ -3046,6 +3195,21 @@ class Program:
     @memo_property
     def _block_stream_reads(self) -> Dict[int, Mapping[str, Tuple[int, ...]]]:
         return {}
+
+    @staticmethod
+    def iteration_label(template: BlockTemplate,
+                        iteration: int) -> Union[int, str]:
+        """Iteration `iteration` of `template` as a page names it: the layer
+        number itself outside a loop; in a looped stack its stored layer,
+        with the pass after the first (`"30 · pass 2"`)."""
+        meta = template.meta
+        if meta.stored_indices is None:
+            return iteration
+        stored = dict(zip(meta.layer_indices, meta.stored_indices,
+                          strict=True))[iteration]
+        if meta.loop_gate:
+            return f"gate {stored + 1}"
+        return stored if meta.pass_ == 1 else f"{stored} · pass {meta.pass_}"
 
     def stream_distances(self) -> Dict[str, int]:
         """Per inner stream, the most layers between a reader and the layer

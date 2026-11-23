@@ -828,6 +828,25 @@ symbols:
     kind: whole
     group: partial_rope_split_head_dims
     meaning: 'Non-RoPE portion. Constraint: `d_rope + d_nope == d_head`.'
+  loop_first:
+    kind: whole
+    group: backbone
+    meaning: >-
+      A looped stack (`loop:`): the first stored layer of the range that runs
+      more than once with the same weights (GLM-5.4: 26). A layer number that
+      selects, not an extent, so nothing divides it.
+  loop_last:
+    kind: whole
+    group: backbone
+    meaning: >-
+      A looped stack (`loop:`): the last stored layer of the looped range,
+      inclusive (GLM-5.4: 53).
+  n_loop_passes:
+    kind: whole
+    group: backbone
+    meaning: >-
+      A looped stack (`loop:`): how many times the looped range runs per
+      forward pass (GLM-5.4: 2). Executions multiply; stored weights do not.
   n_mtp_layers:
     kind: whole
     group: mtp_speculative

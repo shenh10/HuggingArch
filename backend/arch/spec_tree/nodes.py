@@ -88,6 +88,10 @@ class SpineEntry:
     group: Optional[str] = None
     children: Tuple["SpineEntry", ...] = ()
     repeat: Optional[int] = None
+    #: How many iterations the entry's stack runs: its executions
+    #: (`ResolvedSpec.execution_schedule`). `repeat` counts stored layers;
+    #: the two differ only in a looped stack. None when `repeat` is.
+    iterations: Optional[int] = None
 
 
 @dataclass
@@ -253,6 +257,46 @@ class BlockMeta:
     # hand-written one-node adapter binds — None when it is neither.
     wrapper_op: Optional[str] = None
     wrapper_params: Dict[str, str] = field(default_factory=dict)
+    # In a looped stack (`LoopSpec`): the pass this invocation's executions
+    # run in (1 outside a loop), and whether it is the loop's gate. A
+    # pass-k (k > 1) invocation stores nothing: every weight it reads is the
+    # stored layer's, held by its owner (`loop_owner`, the pass-1
+    # invocation's `declaration`), and the build ties each of its holders
+    # to the owner's (`_tie_loop_passes`).
+    #: (A gate runs once after every pass; its `pass_` is 1 and means
+    #: nothing — every reader of `pass_` asks `loop_gate` first.)
+    pass_: int = 1
+    loop_gate: bool = False
+    #: In a looped stack, the STORED layer each of `layer_indices` runs (for
+    #: the gate, the pass index its copy is stored under), aligned with it:
+    #: what a weight path names and what a page calls the layer. Copied at
+    #: enumerate from the stack's `ExecutionSchedule`; None outside a loop,
+    #: where an iteration is its stored layer.
+    stored_indices: Optional[Tuple[int, ...]] = None
+    loop_owner: Optional[Tuple[Tuple[int, ...], Optional[int], str]] = None
+    #: The owner invocation's `label`: one pass-k declaration may cover
+    #: stored layers of several owners (a `pass: 2` entry over every loop
+    #: layer), and each owner's share is its own invocation and its own row.
+    loop_owner_label: str = ""
+
+    @property
+    def stored_count(self) -> int:
+        """How many of its stack's stored LAYERS this invocation holds: its
+        count, except in a looped stack, where a later pass runs layers its
+        pass-1 owner holds and the gate is no layer of the stack. A page
+        that counts a model's layers sums this; `count` counts executions."""
+        return 0 if self.pass_ > 1 or self.loop_gate else int(self.count)
+
+    @property
+    def layer_numbers(self) -> Tuple[int, ...]:
+        """The layers this invocation runs, as the checkpoint and the config
+        number them: its stored layers in a looped stack, else its
+        iterations. A page that names a layer reads this, with `pass_`."""
+        if self.stored_indices is not None:
+            return tuple(self.stored_indices)
+        if self.layer_indices is not None:
+            return tuple(self.layer_indices)
+        return tuple(range(int(self.count)))
 
     @property
     def indexed(self) -> bool:
@@ -283,6 +327,8 @@ class BlockMeta:
         if self.distinct_dims:
             bound = ",".join(f"{dim}={value}" for dim, value in self.distinct_dims)
             name = f"{name}[{bound}]"
+        if self.pass_ > 1 and not self.loop_gate:
+            name = f"{name}[pass={self.pass_} of {self.loop_owner_label}]"
         return name
 
     @property
@@ -747,6 +793,26 @@ class SpecIRNode:
     #: the table it is tied to as stored. What the split piece is held at is
     #: the deployment's answer (`ResolvedPrecision.load_split_format`).
     split_at_load: bool = False
+    #: For a split-at-load piece: the uid of the holder `_tie_shared_modules`
+    #: split, in the piece's own graph. `tied_to_uid` is where the stored
+    #: tensor finally lives, and a looped stack's later pass collapses it to
+    #: the owner pass's holder (`_tie_loop_passes`); the pieces of one graph
+    #: still partition their own holder, and that partition is keyed here
+    #: (`Program.read_aliases`). None on every node that is not a piece.
+    split_of: Optional[int] = None
+
+    def stored_declaration(self) -> Tuple[Any, ...]:
+        """What this node declares about the tensor(s) it stores that holds
+        at any binding: its op, file names, axis order, encodings and
+        residency. Two holders at one checkpoint address with equal
+        declarations store one kind of tensor; whether they store the SAME
+        tensor also needs the resolved shape and the resolved axis
+        contracts, which `Program.read_aliases` compares for a looped
+        stack's later pass (`_tie_loop_passes` pairs by address and this)."""
+        return (self.op, tuple(sorted(self.tensor_suffix.items())),
+                self.stored_axes, self.stored_without_graph_reader,
+                self.host_offload, self.expert_weight, self.has_bias,
+                self.from_custom_op, self.repeat)
 
     @property
     def processor_step(self) -> Optional[str]:

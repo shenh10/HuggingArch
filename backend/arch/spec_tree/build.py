@@ -23,7 +23,7 @@ from backend.arch.spec_id_compose import compose_weight_name
 
 from backend.arch.eval.refusal import SpecRefusal
 from backend.arch.dim_resolution import config_path_value
-from backend.arch.schema.model import (LayerMap, NearestLayer,
+from backend.arch.schema.model import (LayerMap, NearestLayer, PassRead,
                                        StreamLayerRef, relative_distance)
 
 from .nodes import (
@@ -181,8 +181,10 @@ def model_spine(resolved) -> Tuple[SpineEntry, ...]:
                     group=layer.name,
                     children=children,
                     repeat=repeat_of(layer),
+                    iterations=repeat_of(layer),
                 ))
                 continue
+            repeat = repeat_of(layer)
             out.append(SpineEntry(
                 layer_path=here,
                 name=layer.name,
@@ -191,7 +193,9 @@ def model_spine(resolved) -> Tuple[SpineEntry, ...]:
                 stack_name=stack,
                 aux_kind=aux_kind,
                 group=group,
-                repeat=repeat_of(layer),
+                repeat=repeat,
+                iterations=(len(resolved.execution_schedule(layer))
+                            if layer.loop is not None else repeat),
             ))
         return tuple(out)
 
@@ -329,6 +333,8 @@ class _BlockEnumerator:
         for lyr in self.resolved.spec.model:
             if lyr.group:
                 continue
+            if lyr.loop is not None:
+                return self.resolved.execution_schedule(lyr).stored_layers
             if lyr.assignments:
                 return sum(
                     len(g["indices"])
@@ -339,7 +345,17 @@ class _BlockEnumerator:
 
     def assignment_metas(self, container, count_multiplier: int,
                          **extras) -> None:
-        """One BlockMeta per assignment group of a per-layer container."""
+        """One BlockMeta per assignment group of a per-layer container (a
+        looped one's split by pass and owner, `split_by_pass`)."""
+        start = len(self.out)
+        self._assignment_metas(container, count_multiplier, **extras)
+        if container.loop is not None:
+            self.out[start:] = self.split_by_pass(container,
+                                                  self.out[start:])
+            self.gate_meta(container, extras.get("layer_path", ()))
+
+    def _assignment_metas(self, container, count_multiplier: int,
+                          **extras) -> None:
         for g in self.resolved.resolve_assignment_groups(container):
             count = count_multiplier * len(g["indices"])
             if absent_repeat(count):
@@ -373,6 +389,9 @@ class _BlockEnumerator:
         if absent_repeat(count):
             return
         site = self.resolved.site
+        schedule = (self.resolved.execution_schedule(layer)
+                    if layer.loop is not None else None)
+        start = len(self.out)
         self.out.append(BlockMeta(
             tied_to=layer.call,
             tied_to_path=(
@@ -385,12 +404,93 @@ class _BlockEnumerator:
             stack_name=layer.name,
             aux_kind=None,
             checkpoint=self.stack_address(layer),
-            layer_indices=None,
+            layer_indices=(None if schedule is None
+                           else schedule.layer_ordinals()),
             dim_overrides={},
             layer_path=layer_path,
             address=site.address if site is not None else None,
             reads=self.reads_at(layer_path),
             **self.block_io(layer.template),
+        ))
+        if schedule is not None:
+            self.out[start:] = self.split_by_pass(layer, self.out[start:])
+            self.gate_meta(layer, layer_path)
+
+    def split_by_pass(self, layer, metas: List[BlockMeta]
+                      ) -> List[BlockMeta]:
+        """A looped stack's invocations, each split into its pass-1
+        executions — the OWNER of the stored layers they run, which holds
+        their weights — and, per later pass, its executions grouped by the
+        owner of their stored layer. Each later-pass invocation stores
+        nothing: `_tie_loop_passes` ties its holders to its owner's. One
+        pass-k declaration may cover the layers of several owners (a
+        `pass: 2` entry over the whole loop), so the split is by owner and
+        not by declaration alone."""
+        schedule = self.resolved.execution_schedule(layer)
+        executions = schedule.executions
+        owner: Dict[int, BlockMeta] = {}
+        out: List[BlockMeta] = []
+        later: List[Tuple[BlockMeta, List[int]]] = []
+        for meta in metas:
+            first = [o for o in meta.layer_indices
+                     if executions[o].pass_ == 1]
+            rest = [o for o in meta.layer_indices
+                    if executions[o].pass_ > 1]
+            if first:
+                kept = replace(meta, count=len(first),
+                               layer_indices=tuple(first),
+                               stored_indices=tuple(executions[o].stored
+                                                    for o in first))
+                out.append(kept)
+                for o in first:
+                    owner[executions[o].stored] = kept
+            if rest:
+                later.append((meta, rest))
+        for meta, rest in later:
+            split: Dict[Tuple[int, Tuple], List[int]] = {}
+            for o in rest:
+                stored = executions[o].stored
+                held = owner.get(stored)
+                if held is None:
+                    raise ValueError(
+                        f"model layer {layer.name!r}: stored layer {stored} "
+                        f"runs pass {executions[o].pass_} but no declaration "
+                        f"selects its pass-1 execution, so nothing holds the "
+                        f"weights the later pass reads")
+                split.setdefault((executions[o].pass_, held.declaration),
+                                 []).append(o)
+            for (pass_, held), ordinals in sorted(split.items()):
+                out.append(replace(meta, count=len(ordinals),
+                                   layer_indices=tuple(ordinals),
+                                   stored_indices=tuple(
+                                       executions[o].stored
+                                       for o in ordinals),
+                                   pass_=pass_, loop_owner=held))
+        return out
+
+    def gate_meta(self, layer, layer_path) -> None:
+        """The loop's gate: one invocation over its ordinals (one after each
+        pass), one stored copy per pass under its own address."""
+        gate = layer.loop.gate
+        if gate is None:
+            return
+        ordinals = self.resolved.execution_schedule(layer).gate_ordinals()
+        site = self.resolved.site
+        self.out.append(BlockMeta(
+            template_name=gate.template,
+            count=len(ordinals),
+            stack_name=layer.name,
+            aux_kind=None,
+            checkpoint=with_root(gate.checkpoint, self.root),
+            layer_indices=ordinals,
+            stored_indices=tuple(self.resolved.execution_schedule(layer)
+                                 .executions[o].stored for o in ordinals),
+            dim_overrides={},
+            layer_path=layer_path,
+            address=site.address if site is not None else None,
+            reads=self.reads_at(layer_path),
+            loop_gate=True,
+            **self.block_io(gate.template),
         ))
 
     def stack_address(self, layer) -> CheckpointAddress:
@@ -546,7 +646,7 @@ class _BlockEnumerator:
                     (slot, name, getattr(self.resolve(name), "description",
                                          None) or "")
                     for slot, name in found)
-        return self.distinguish_by_dims([
+        return self.name_loop_owners(self.distinguish_by_dims([
             replace(group, short_name=names[group.template_name],
                     family_name=families[group.template_name],
                     distinct_slots=slots.get(
@@ -555,7 +655,21 @@ class _BlockEnumerator:
                         iteration_owner(spec, group.layer_path)
                         if group.layer_path else ()))
             for meta in self.out
-            for group in self.visibility_groups(meta)])
+            for group in self.visibility_groups(meta)]))
+
+    @staticmethod
+    def name_loop_owners(metas: List[BlockMeta]) -> List[BlockMeta]:
+        """Each later-pass invocation carries its owner's final `label`
+        (`BlockMeta.loop_owner_label`), read once the owners are named."""
+        labels = {meta.declaration: meta.label for meta in metas
+                  if meta.pass_ == 1 and not meta.loop_gate}
+        # The short name every page shows a block by says which pass it
+        # runs, so the two passes of one template read apart.
+        return [meta if meta.loop_owner is None
+                else replace(meta, loop_owner_label=labels[meta.loop_owner],
+                             short_name=(f"{meta.short_name} · pass "
+                                         f"{meta.pass_}"))
+                for meta in metas]
 
     def distinguish_by_dims(self, metas: List[BlockMeta]) -> List[BlockMeta]:
         """`metas` with `distinct_dims` set on every invocation that shares
@@ -1084,11 +1198,122 @@ class _StreamTable:
             return f"{value.stack} layer {value.layer}"
         return str(value)
 
+    def schedule(self, path):
+        """The executions of the repeated model layer at `path`
+        (`ResolvedSpec.execution_schedule`); None for a layer that does not
+        repeat. Without a loop every stored layer runs once, at its own
+        number."""
+        layer = layer_at(self.spec, path)
+        if layer.repeat is None or layer.loop is None:
+            return None
+        return self.resolved.execution_schedule(layer)
+
     def sources(self, meta, owner, name, value) -> Dict[int, StreamAt]:
         """Each layer of the declaration and the layer its `reads_from`
         names. Every form is a map from reading layer to source: `{map: …}`
         writes it out, and a layer number, `"i - k"`, `{stack, layer}` and
-        `{nearest: <set>}` are shorthand for one."""
+        `{nearest: <set>}` are shorthand for one.
+
+        In a looped stack (`loop:`) the layers a declaration selects are
+        executions, and every number a `reads_from` writes is a STORED
+        layer: each form names a stored layer relative to the reader's,
+        exactly as without a loop, and the reader then reads that layer's
+        latest execution before it — or, under `{pass: n}`, its pass-n
+        execution (`executions`)."""
+        schedule = self.schedule(owner)
+        if schedule is None and not isinstance(value, PassRead):
+            return self.stored_sources(meta, owner, name, value)
+        if schedule is None:
+            raise StreamReadRefusal(
+                f"{self.where(meta.layer_path, meta.assignment_index)}: "
+                f"reads_from[{name!r}] = {{{value}}} names a pass, and stack "
+                f"{self.names[owner]!r} declares no `loop:`",
+                fix=("`{pass: n}` reads a pass of a looped stack; write the "
+                     "layer the reader reads without it"),
+                meta=meta)
+        return self.executions(meta, owner, name, value, schedule)
+
+    def executions(self, meta, owner, name, value, schedule
+                   ) -> Dict[int, StreamAt]:
+        """`sources` in a looped stack: per reading execution, the stored
+        layer its form names (from the reader's stored layer), then the
+        execution of it that is read."""
+        pass_ = value.pass_ if isinstance(value, PassRead) else None
+        if isinstance(value, PassRead):
+            value = (NearestLayer(nearest=value.nearest)
+                     if value.nearest is not None else value.layer)
+        out: Dict[int, StreamAt] = {}
+        for reader in self.decl_layers[(tuple(meta.layer_path),
+                                        meta.assignment_index)]:
+            stored = schedule.executions[reader].stored
+            if value is None:
+                source = (owner, stored)
+            elif isinstance(value, NearestLayer):
+                # `nearest` picks each member's execution itself, and
+                # answers the nearest one's ordinal.
+                out[reader] = (owner, self.nearest(
+                    meta, owner, stored, name, value.nearest,
+                    pick=lambda m, r=reader: self.pick(
+                        meta, owner, name, schedule, m, r, pass_)))
+                continue
+            elif isinstance(value, StreamLayerRef):
+                source = self.point(meta, owner, name, value)
+            elif isinstance(value, LayerMap):
+                source = self.mapped(meta, owner, name, value,
+                                     [stored])[stored]
+            else:
+                distance = relative_distance(value)
+                if distance is None:
+                    source = (owner, self.number(meta, name, value))
+                else:
+                    step = self.number(meta, name, distance)
+                    if step < 1:
+                        raise StreamReadRefusal(
+                            f"reads_from[{name!r}] = {value!r} is not a "
+                            f"layer before the reading one",
+                            fix='"i - k" reads the layer k before, k >= 1',
+                            meta=meta)
+                    source = (owner, stored - step)
+            stack, at = source
+            if stack != owner:
+                # Another stack's layer, already its execution (`point`).
+                out[reader] = (stack, at)
+                continue
+            out[reader] = (owner, self.pick(meta, owner, name, schedule, at,
+                                            reader, pass_))
+        return out
+
+    def pick(self, meta, owner, name, schedule, stored: int, reader: int,
+             pass_: Optional[int]) -> int:
+        """The execution of stored layer `stored` a reader at ordinal
+        `reader` reads: its pass-`pass_` one, else its latest before the
+        reader. Refused when there is none; never walked back to another
+        pass."""
+        if not 0 <= stored < schedule.stored_layers:
+            raise StreamReadRefusal(
+                f"iteration {reader} of stack {self.names[owner]!r} reads "
+                f"stream {name!r} from stored layer {stored}, and the stack "
+                f"has stored layers 0..{schedule.stored_layers - 1}",
+                fix=self.writers_fix(owner, name), meta=meta)
+        at = (schedule.ordinal(stored, pass_) if pass_ is not None
+              else schedule.latest_before(stored, reader))
+        if at is None or at >= reader:
+            what = (f"pass {pass_} of stored layer {stored}"
+                    if pass_ is not None
+                    else f"an execution of stored layer {stored}")
+            raise StreamReadRefusal(
+                f"iteration {reader} of stack {self.names[owner]!r} (stored "
+                f"layer {schedule.executions[reader].stored}, pass "
+                f"{schedule.executions[reader].pass_}) reads stream {name!r} "
+                f"from {what}, and there is none before it",
+                fix=("a reader reads a write that runs before it: name an "
+                     "earlier stored layer, or the pass of it that runs "
+                     "first (`{pass: n}`). " + self.writers_fix(owner, name)),
+                meta=meta)
+        return at
+
+    def stored_sources(self, meta, owner, name, value) -> Dict[int, StreamAt]:
+        """`sources` in a stack whose iterations are its stored layers."""
         layers = self.decl_layers[(tuple(meta.layer_path),
                                    meta.assignment_index)]
         if isinstance(value, LayerMap):
@@ -1148,9 +1373,25 @@ class _StreamTable:
 
     def point(self, meta, owner, name, value) -> StreamAt:
         """One source layer: a number of the reader's stack, or
-        `{stack, layer}`."""
+        `{stack, layer}` — another stack's layer, which in a looped stack
+        names a STORED layer and reads its last execution (that stack walks
+        before the reader's)."""
         if not isinstance(value, StreamLayerRef):
             return (owner, self.number(meta, name, value))
+        source, layer = self.other_layer(meta, owner, name, value)
+        schedule = self.schedule(source)
+        if schedule is None or source == owner:
+            return (source, layer)
+        if not 0 <= layer < schedule.stored_layers:
+            raise StreamReadRefusal(
+                f"reads_from[{name!r}] names stored layer {layer} of stack "
+                f"{self.names[source]!r}, which has stored layers "
+                f"0..{schedule.stored_layers - 1}",
+                fix=self.writers_fix(source, name), meta=meta)
+        return (source, schedule.ordinals_of(layer)[-1])
+
+    def other_layer(self, meta, owner, name, value) -> StreamAt:
+        """`{stack, layer}` as written: the stack and the layer number."""
         source = self.spec.layer_position(value.stack.split("/"))
         if source is None:
             stacks = sorted(self.names[path] for path, names
@@ -1198,11 +1439,17 @@ class _StreamTable:
                 fix=self.writers_fix(source, name), meta=meta)
         return (source, at)
 
-    def nearest(self, meta, owner, layer, name, members) -> int:
+    def nearest(self, meta, owner, layer, name, members, pick=None) -> int:
         """The nearest layer of the declared set before `layer`. Every
         member writes the stream — a set that names a layer that does not
         is a wrong set, whichever member a reader lands on — and nothing
-        outside the set is a candidate."""
+        outside the set is a candidate.
+
+        In a looped stack `layer` and the members are stored layers, and a
+        member "writes" in the execution the declaration selects (`pick`:
+        its pass-n one, or its latest before the reader); the ordinal of the
+        nearest member's is returned. A `full` layer whose later pass runs
+        no indexer is no silent member for a reader of its first pass."""
         if name not in self.declared.get(owner, ()):
             raise StreamReadRefusal(
                 f"layer {layer} of stack {self.names[owner]!r} reads stream "
@@ -1211,9 +1458,21 @@ class _StreamTable:
                 fix=(f"declare `{name}` under the `streams:` of the stack "
                      f"whose layers write it"),
                 meta=meta)
+        schedule = self.schedule(owner)
+        depth = (schedule.stored_layers if schedule is not None
+                 else self.depth.get(owner, 0))
         found = sorted(self.resolved._config_list_indices(
-            members, self.depth.get(owner, 0), base=members.base or 0))
-        silent = [m for m in found if (owner, m, name) not in self.writes]
+            members, depth, base=members.base or 0))
+        if pick is not None:
+            # A stored layer is in the set when it writes the stream in some
+            # pass: a `full` layer whose later pass runs no indexer is still
+            # a full layer. Which execution a reader lands on is `pick`'s,
+            # and that one must write (`build`'s final check).
+            silent = [m for m in found if not any(
+                (owner, at, name) in self.writes
+                for at in schedule.ordinals_of(m))]
+        else:
+            silent = [m for m in found if (owner, m, name) not in self.writes]
         if silent:
             raise StreamReadRefusal(
                 f"reads_from[{name!r}] = nearest {members}: layers "
@@ -1232,7 +1491,7 @@ class _StreamTable:
                      f"that does not read {name!r}. "
                      + self.writers_fix(owner, name)),
                 meta=meta)
-        return before[-1]
+        return before[-1] if pick is None else pick(before[-1])
 
     def number(self, meta, name: str, expr: str) -> int:
         value = eval_dim_expr(str(expr), self.resolved.dim_values)
@@ -1419,6 +1678,9 @@ def resolve_tied_weights(tree: SpecIRTree) -> None:
     tied: List[SpecIRNode] = (_tie_template_calls(tree, _walk)
                               + _tie_group_ops(tree, _walk)
                               + _tie_shared_modules(_walk(roots)))
+    # After the shared modules: a later pass's split pieces are tied in
+    # their own graph first, and only its holders pair with the owner's.
+    tied += _tie_loop_passes(tree, _walk)
     for node in _walk(roots):
         if node.tied_to is None or node.tied_to_uid is not None:
             continue
@@ -1502,7 +1764,52 @@ def _tie_shared_modules(nodes) -> List[SpecIRNode]:
             for node in pieces:
                 node.tied_to, node.tied_to_uid = owner.name, owner.uid
                 node.split_at_load = True
+                node.split_of = owner.uid
                 tied.append(node)
+    return tied
+
+
+def _tie_loop_passes(tree: SpecIRTree, walk) -> List[SpecIRNode]:
+    """A looped stack's later pass runs the stored layer's weights
+    (`BlockMeta.loop_owner`): each of its holders — a leaf that would store
+    a tensor and is not already tied in its own graph — reads the owner
+    pass's holder at the same checkpoint address (`weight_name`, relative
+    to the layer) with the same stored declaration, whole. A split piece is
+    not a holder: it is tied to its graph's holder, which is tied here, and
+    the chain collapse takes it on to the owner's (`split_of` keeps the
+    graph's own). A holder with no such owner holder reads a weight the
+    stored layer does not have, and is refused."""
+    by_declaration = {meta.declaration: roots
+                      for meta, roots in tree.blocks if meta.pass_ == 1}
+    tied: List[SpecIRNode] = []
+    for meta, roots in tree.blocks:
+        if meta.loop_owner is None:
+            continue
+        held: Dict[str, SpecIRNode] = {}
+        for node in walk(by_declaration[meta.loop_owner]):
+            if _holds_weight(node) and node.tied_to_uid is None:
+                if node.weight_name in held:
+                    raise ValueError(
+                        f"{node.display_path}: two weights of one layer store "
+                        f"at {node.weight_name!r}")
+                held[node.weight_name] = node
+        for node in walk(roots):
+            if not _holds_weight(node) or node.tied_to_uid is not None:
+                continue
+            owner = held.get(node.weight_name)
+            if owner is None or (owner.stored_declaration()
+                                 != node.stored_declaration()):
+                found = ("no weight there" if owner is None
+                         else "a weight declared otherwise")
+                raise ValueError(
+                    f"{node.display_path}: pass {meta.pass_} of a looped "
+                    f"stack reads the stored layer's weight at "
+                    f"{node.weight_name!r}, and its pass-1 invocation "
+                    f"({meta.loop_owner_label or meta.loop_owner[2]}) holds "
+                    f"{found}. A later pass runs the stored layer's "
+                    f"weights and adds none.")
+            node.tied_to, node.tied_to_uid = owner.name, owner.uid
+            tied.append(node)
     return tied
 
 

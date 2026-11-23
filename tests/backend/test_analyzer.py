@@ -427,8 +427,10 @@ def test_attention_families_are_the_cache_families_not_the_display():
     headline = SimpleNamespace(heads=8, kv_heads=1, head_dim=64, kv_lora_rank=512,
                                q_lora_rank=None, qk_rope_dim=64)
     groups = [
-        {"attn_type": "MLA", "attn_display": "DSA", "layer_indices": [0, 2]},
-        {"attn_type": "MLA", "attn_display": "MLA", "layer_indices": [1, 3]},
+        {"attn_type": "MLA", "attn_display": "DSA", "layer_indices": [0, 2],
+         "stored_count": 2},
+        {"attn_type": "MLA", "attn_display": "MLA", "layer_indices": [1, 3],
+         "stored_count": 2},
     ]
     info = _build_attention_info(headline, groups, 4, is_hybrid=True)
     assert info["attention_type"] == "DSA + MLA"
