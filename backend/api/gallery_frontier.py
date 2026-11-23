@@ -1222,33 +1222,57 @@ async def frontier_track(view: FrontierView) -> Track:
     return await asyncio.to_thread(_view_scope, view)
 
 
+def _kept_drawing(model_id: str, resolved: Any, version: Optional[str],
+                  view: FrontierView, track: Track) -> Optional[dict]:
+    """What a model under `view` and `track` reads without pricing
+    anything: the drawing kept for them, or the drawing of a model no spec
+    resolves; None when only pricing answers it."""
+    if resolved is None:
+        return _draw({"model_id": model_id, "layouts": [],
+                      "error": "no spec resolves for this model"},
+                     view, "none", None)
+    if version is None:
+        return None
+    return _Stored(model_id, version).kept(view, track)
+
+
+def _kept_drawings(model_ids: List[str], view: FrontierView,
+                   track: Track) -> Dict[str, dict]:
+    """Every model of `model_ids` whose drawing `_kept_drawing` reads, by
+    id — one job of cache reads alone, so a view already drawn comes back
+    whole in one quick job, whatever the pool is pricing."""
+    out = {}
+    for model_id in model_ids:
+        _config, resolved, version = _resolve_one(model_id)
+        hit = _kept_drawing(model_id, resolved, version, view, track)
+        if hit is not None:
+            out[model_id] = hit
+    return out
+
+
 def _frontier_read(model_id: str, view: FrontierView,
-                   track: Optional[Track] = None, *,
-                   cache_only: bool = False) -> dict:
+                   track: Optional[Track] = None) -> dict:
     """One model under `view` and `track` (the request's lake answer; read
     here when not given), as far as the caches answer it: `{"drawn":
-    …}` — the view's drawing kept, else drawn off the kept entry (its named
-    measure records read only when the view's measured rates are not kept) —
-    else priced off the model's class walk kept for the view's card
-    (`_restamp`) — or `{"walk": plan}`: the cards and layouts a class walk
-    walks (`FrontierView.walk_cards`, `class_frontier_layouts`, and per
-    card the layouts its frontier prices). A whole entry is never read for
-    a view already drawn, and its measure records never for floors, K or
-    acceptance.
+    …}` — the view's drawing kept (`_kept_drawing`), else drawn off the
+    kept entry (its named measure records read only when the view's
+    measured rates are not kept) — else priced off the model's class walk
+    kept for the view's card (`_restamp`) — or `{"walk": plan}`: the cards
+    and layouts a class walk walks (`FrontierView.walk_cards`,
+    `class_frontier_layouts`, and per card the layouts its frontier
+    prices). A whole entry is never read for a view already drawn, and its
+    measure records never for floors, K or acceptance.
+
+    Past the kept drawing this prices — a measured fold, a restamp — so it
+    is compute: callers run it in a ranked slot (`run_ranked`).
     Runs where the compute runs: what crosses back is the drawing."""
     _config, resolved, version = _resolve_one(model_id)
     stored = _Stored(model_id, version)
-    if resolved is None:
-        return {"drawn": _draw({"model_id": model_id, "layouts": [],
-                                "error": "no spec resolves for this model"},
-                               view, "none", None)}
+    track = track if track is not None else _view_scope(view)
+    hit = _kept_drawing(model_id, resolved, version, view, track)
+    if hit is not None:
+        return {"drawn": hit}
     if version is not None:
-        track = track if track is not None else _view_scope(view)
-        hit = stored.kept(view, track)
-        if hit is not None:
-            return {"drawn": hit}
-        if cache_only:
-            return {}
         core = _FRONTIER.get(stored.entry_key(view), remote_ok=True)
         if core is not None:
             drawn = stored.drawn(view, core, track)
@@ -1412,38 +1436,36 @@ async def _keptSharedWalk(model_id: str, gpu_sku: str) -> bool:
 
 async def frontier_model(model_id: str, view: FrontierView,
                          track: Optional[Track] = None, *,
-                         compute: Optional[PrioritySlots] = None,
-                         cache_only: bool = False) -> dict:
+                         compute: Optional[PrioritySlots] = None) -> dict:
     """`_frontier_model` as one recorded computation
     (`code_trace.provider.recording`): the read, the layout jobs and the fold
     (each a worker job whose trace comes back to it), so every part it
     keeps is stored with the code that made it."""
     with recording():
-        return await _frontier_model(
-            model_id, view, track, compute=compute, cache_only=cache_only)
+        return await _frontier_model(model_id, view, track, compute=compute)
 
 
 async def _frontier_model(model_id: str, view: FrontierView,
                           track: Optional[Track] = None, *,
-                          compute: Optional[PrioritySlots] = None,
-                          cache_only: bool = False) -> dict:
+                          compute: Optional[PrioritySlots] = None) -> dict:
     """One model's frontier under `view` and `track`: read off the caches —
     the view's drawing, its entry, or its class walk priced on its card —
     or each layout of the class walk its own compute job and the fold
     (`_finish_frontier`). Kernel Bench rows fold on after the SOL entry is
     in hand, so the lake's answer reaches the pricing and never the walk.
 
-    The read is one quick job and queues for nothing, so a model already
-    kept lands at once whatever is computing. Only a model that computes
-    holds one of `compute` (the frontier's model slots), and its steps queue
-    at its urgency (`offload.urgency`): the model a client picked, or has on
-    screen, before the rest."""
-    got = await run_off_loop(
-        _frontier_read, model_id, view, track, cache_only=cache_only)
+    The read may price (a measured fold, a restamp), so it queues in a
+    ranked slot (`run_ranked`) like every step: a client's view on screen
+    prices before a view it left, and never waits in the pool's queue
+    behind the left view's reads. Only a model that walks holds one of
+    `compute` (the frontier's model slots). Both rank at the model's
+    urgency (`offload.urgency`): the model a client picked, or has on
+    screen, before the rest. A model already drawn for the view is read
+    before any of this (`build_frontier`, `_kept_drawings`)."""
+    got = await run_ranked(_frontier_read, model_id, view, track,
+                           name=model_id)
     if "drawn" in got:
         return got["drawn"]
-    if cache_only:
-        return {}
     if compute is None:
         return await _compute_frontier(model_id, view, track, got)
     async with compute.hold(urgency(model_id)):
@@ -1473,8 +1495,11 @@ async def build_frontier(view: FrontierView,
     """Every model's decode frontier under `view`, `_model_concurrency`
     models computing at a time, reporting how many have finished and
     publishing each as it lands (`report_partial`), so a page draws it
-    without waiting for the slowest. Every model is read first, at once: a
-    kept one lands without waiting behind one that computes. Which model
+    without waiting for the slowest. Every drawing the view already has is
+    read first, together, in one job of cache reads (`_kept_drawings`):
+    that job prices nothing, so a view drawn before — the GPU a client
+    switches back to — lands whole while another view prices, rather than
+    model by model behind that view's jobs. Which model
     computes next is the client's order (`offload.urgency`: picked, then on
     screen). Every model is drawn under one lake answer, `track` — the one
     the request's identity names (`frontier_request_key`), read here
@@ -1492,21 +1517,19 @@ async def build_frontier(view: FrontierView,
     if track is None:
         track = await frontier_track(view)
     slots = PrioritySlots(_model_concurrency())
-    done = 0
+    kept = await run_off_loop(_kept_drawings, model_ids, view, track)
+    for mid in model_ids:
+        if mid in kept:
+            report_partial(kept[mid])
+    done = len(kept)
+    print(f"frontier {view.gpu_sku}: {done}/{len(model_ids)} kept", flush=True)
     report_progress(done, len(model_ids))
 
     async def one(mid: str) -> dict:
         nonlocal done
-        if track is not None and track[1] == "reads":
-            entry = await frontier_model(
-                mid, view, track, cache_only=True)
-            if entry:
-                done += 1
-                print(f"frontier {view.gpu_sku}: {done}/{len(model_ids)} · {mid}",
-                      flush=True)
-                report_progress(done, len(model_ids))
-                report_partial(entry)
-                return entry
+        if mid in kept:
+            return kept[mid]
+        if track[1] == "reads":
             # SOL is a first-class partial answer: publish and keep it before
             # any measurement lookup or fold is allowed to delay the page.
             sol = await frontier_model(

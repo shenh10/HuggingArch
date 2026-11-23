@@ -1241,11 +1241,16 @@ def test_one_request_reads_the_lake_once(monkeypatch):
 
     seen: list = []
 
-    def read(model_id, view, track=None, *, cache_only=False):
+    def kept(model_ids, view, track):
+        seen.append(track)
+        return {"b/2": {"model_id": "b/2"}}
+
+    def read(model_id, view, track=None):
         seen.append(track)
         return {"drawn": {"model_id": model_id}}
 
     monkeypatch.setattr(f, "_frontier_scope", scope)
+    monkeypatch.setattr(f, "_kept_drawings", kept)
     monkeypatch.setattr(f, "_frontier_read", read)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
     out = asyncio.run(f.build_frontier(f.FrontierView("B200")))
@@ -1305,9 +1310,11 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2", "c/3"])
 
-    def read(model_id, view, track=None, *, cache_only=False):
-        if model_id == "c/3":
-            return {"drawn": {"model_id": model_id}}
+    def kept(model_ids, view, track):
+        return {"c/3": {"model_id": "c/3"}}
+
+    def read(model_id, view, track=None):
+        assert model_id != "c/3", "a kept model is read once, with the rest"
         return {"walk": {"cards": [], "layouts": []}}
 
     computed: list = []
@@ -1317,6 +1324,7 @@ def test_a_cold_frontier_publishes_kept_models_at_once_and_computes_in_the_clien
         await asyncio.sleep(0.3)
         return {"model_id": model_id}
 
+    monkeypatch.setattr(f, "_kept_drawings", kept)
     monkeypatch.setattr(f, "_frontier_read", read)
     monkeypatch.setattr(f, "_compute_frontier", compute)
     view = f.FrontierView("B200")
@@ -1364,9 +1372,7 @@ def _route_scenario(monkeypatch, scopes, states_by_call):
         calls["scope"] += 1
         return got
 
-    def read(model_id, view, track=None, *, cache_only=False):
-        if cache_only:
-            return {}
+    def read(model_id, view, track=None):
         time.sleep(0.3)
         if track[1] == "none":               # the SOL partial a "reads" build publishes first
             return {"drawn": {"model_id": model_id, "measured_track": {"state": "none"}}}
@@ -1378,6 +1384,7 @@ def _route_scenario(monkeypatch, scopes, states_by_call):
     monkeypatch.setattr(f, "_frontier_scope", scope)
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1"])
+    monkeypatch.setattr(f, "_kept_drawings", lambda *_args: {})
     monkeypatch.setattr(f, "_frontier_read", read)
     ask = dict(gpu_sku="B200", gpu_memory_fraction=0.9, comm_latency_us=2.0,
                launch_floor_us=1.0, draft_tokens=0, acceptance_rate=0.7,
@@ -1454,6 +1461,63 @@ def test_a_bare_frontier_request_and_its_explicit_defaults_are_one_identity(monk
     assert len(keys) == 3 and len(set(keys)) == 1
 
 
+def test_the_kept_read_prices_nothing(monkeypatch, tmp_path):
+    """`_kept_drawings` answers a view already drawn and misses one that is
+    not — another floor — without folding or reading the entry: it is the
+    one read a request runs outside the ranked slots, so it must stay cache
+    reads alone."""
+    _entries, reads, folds = _kept(monkeypatch, tmp_path)
+    plan, results = _built_entry(monkeypatch)
+    view = f.FrontierView("B200")
+    first = f._finish_frontier("test/Model", view, plan, results)
+    track = f._view_scope(view)
+    n_folds, n_reads = len(folds), len(reads)
+    assert f._kept_drawings(["test/Model"], view, track) == {
+        "test/Model": first}
+    assert f._kept_drawings(
+        ["test/Model"], view._replace(comm_latency_us=7.0), track) == {}
+    assert (len(folds), len(reads)) == (n_folds, n_reads)
+
+
+def test_a_view_switched_back_to_prices_nothing(monkeypatch):
+    """A view whose every model is drawn — the GPU a client switches back
+    to — is one job of cache reads (`_kept_drawings`) and no per-model read:
+    nothing of it queues behind the view the client left. A model it misses
+    is read in a ranked slot (`run_ranked`), at the client's urgency."""
+    import asyncio
+
+    track = (f.NO_MEASUREMENTS, "none")
+    monkeypatch.setattr(f, "_frontier_scope", lambda: track)
+    monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1", "b/2"])
+    jobs: list = []
+
+    async def off_loop(fn, *args, **_kw):
+        jobs.append(fn.__name__)
+        return fn(*args)
+
+    async def ranked(fn, *args, name=None):
+        jobs.append(("ranked", fn.__name__, name))
+        return fn(*args)
+
+    monkeypatch.setattr(f, "run_off_loop", off_loop)
+    monkeypatch.setattr(f, "run_ranked", ranked)
+    monkeypatch.setattr(f, "_frontier_read", lambda mid, view, track=None: {
+        "drawn": {"model_id": mid}})
+    monkeypatch.setattr(f, "_kept_drawings", lambda ids, view, track: {
+        mid: {"model_id": mid} for mid in ids})
+    view = f.FrontierView("B200")
+    out = asyncio.run(f.build_frontier(view))
+    assert [m["model_id"] for m in out["models"]] == ["a/1", "b/2"]
+    assert jobs == ["<lambda>"]
+
+    jobs.clear()
+    monkeypatch.setattr(f, "_kept_drawings", lambda ids, view, track: {
+        "a/1": {"model_id": "a/1"}})
+    out = asyncio.run(f.build_frontier(view))
+    assert [m["model_id"] for m in out["models"]] == ["a/1", "b/2"]
+    assert jobs == ["<lambda>", ("ranked", "<lambda>", "b/2")]
+
+
 def test_a_measured_cache_hit_returns_without_computing(monkeypatch):
     """The lake being readable never invalidates a drawing already kept for
     its own track (`frontier_model` must not fall back to a second walk)."""
@@ -1481,10 +1545,11 @@ def test_a_measured_request_publishes_sol_before_the_fold(monkeypatch):
     monkeypatch.setattr(f, "_frontier_scope", lambda: track)
     monkeypatch.setattr(f, "iter_snapshot_ids", lambda: ["a/1"])
     monkeypatch.setattr(f, "_model_concurrency", lambda: 1)
+    monkeypatch.setattr(f, "_kept_drawings", lambda *_args: {})
     monkeypatch.setattr(
         f, "_frontier_read",
-        lambda model, view_arg, track_arg=None, *, cache_only=False:
-        {} if cache_only or track_arg[1] == "reads" else {"walk": {}})
+        lambda model, view_arg, track_arg=None:
+        {} if track_arg[1] == "reads" else {"walk": {}})
     monkeypatch.setattr(f, "_layout_law", lambda item: {"schema": "law"})
     monkeypatch.setattr(f, "_finish_frontier", lambda *args, **kwargs: {
         "model_id": args[0], "track": kwargs.get("track")})
