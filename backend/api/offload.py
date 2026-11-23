@@ -79,6 +79,7 @@ from backend.measure.scope import of_request
 from backend.arch.loader import default_loader_generation, get_default_loader
 from backend.code_trace.provider import seal as code_trace_seal
 from backend.fingerprint import engine_code_version, engine_version, shared_data_version
+from backend.hf import metadata as hf_metadata
 from backend.measure import pool
 
 _T = TypeVar("_T")
@@ -555,6 +556,11 @@ def report_progress(done: int, total: int) -> None:
         return
     work.progress = (int(done), int(total))
 
+
+
+# A hub header read is one long step of the work that asked for it (a
+# checkpoint of hundreds of shards): its shards are that work's progress.
+hf_metadata.set_progress_hook(report_progress)
 
 def report_partial(item: Any = None, *,
                    head: Optional[Dict[str, Any]] = None) -> None:

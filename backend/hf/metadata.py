@@ -20,7 +20,8 @@ local-repo header readers, the record a snapshot stores (`metadata_record`), tot
 """
 import json
 import logging
-from typing import Any, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, Optional
 
 from huggingface_hub import errors as hf_errors
 
@@ -292,6 +293,23 @@ def fetch_metadata(model_id: str, overlay_dir: Optional[str] = None
     return _fetch_metadata_hf(model_id, scheme=SCHEME_NONE, num_bits=0)
 
 
+#: How many shard headers are read at once: a checkpoint of hundreds of
+#: shards is two small hub requests per shard, and read one after another
+#: they are minutes (245 shards, ~7 min) before a model is even matched.
+_SHARD_READERS = 16
+
+#: Told `(done, total)` as shard headers are read, so the work waiting on a
+#: header read reports movement. Set by the API layer (`set_progress_hook`);
+#: None tells no one.
+_progress_hook: Optional[Callable[[int, int], None]] = None
+
+
+def set_progress_hook(hook: Optional[Callable[[int, int], None]]) -> None:
+    """Who is told how many shard headers of a hub read are done."""
+    global _progress_hook
+    _progress_hook = hook
+
+
 def read_header_hf(model_id: str, revision: Optional[str] = None, *,
                    read_from: Optional[str] = None) -> SafetensorsHeader:
     """Every shard header of `model_id` at `revision` (default: `main`).
@@ -331,19 +349,36 @@ def read_header_hf(model_id: str, revision: Optional[str] = None, *,
             if files[shard].lfs.sha256 != mirror_files[shard].lfs.sha256:
                 raise ValueError(f"{read_from}'s {shard} is not {model_id}'s")
 
-    read = ReadTensors()
-    for shard in shards:
+    def read_one(shard: str):
         last_err: Optional[Exception] = None
         for attempt in range(3):
             try:
-                file_meta = api.parse_safetensors_file_metadata(
+                return api.parse_safetensors_file_metadata(
                     source, shard, revision=source_rev)
-                break
             except (OSError, ValueError, *HUB_UNREACHABLE) as e:
                 last_err = e
                 _time.sleep(0.4 * (attempt + 1))
-        else:
-            raise OSError(f"{model_id}: shard {shard} header unreadable: {last_err}")
+        raise OSError(f"{model_id}: shard {shard} header unreadable: {last_err}")
+
+    # Read side by side; tensors are added in shard order, so the header
+    # does not depend on which read came back first.
+    total = len(shards)
+    if _progress_hook is not None:
+        _progress_hook(0, total)
+    ex = ThreadPoolExecutor(max_workers=min(_SHARD_READERS, total))
+    try:
+        futures = {ex.submit(read_one, shard): shard for shard in shards}
+        metas = {}
+        for done, fut in enumerate(as_completed(futures), 1):
+            metas[futures[fut]] = fut.result()
+            if _progress_hook is not None:
+                _progress_hook(done, total)
+    finally:
+        # One unreadable shard fails the read: the rest are not fetched.
+        ex.shutdown(cancel_futures=True)
+    read = ReadTensors()
+    for shard in shards:
+        file_meta = metas[shard]
         for name, t in file_meta.tensors.items():
             read.add(name, str(t.dtype), t.shape,
                      int(t.data_offsets[1] - t.data_offsets[0]), shard=shard)
