@@ -127,6 +127,16 @@ class FusedProgram:
         written. A consumer that reads the order as a schedule (activation
         liveness) sees a launch between its producers and its readers,
         not after the whole layer."""
+        return iter(self._order)
+
+    @memo_property
+    def _order(self) -> Tuple[Any, ...]:
+        """`nodes`, placed once: the program is frozen, and every later
+        fusion pass wraps it and asks again (a chain of passes would
+        otherwise re-place every pass beneath on every ask)."""
+        return tuple(self._placed())
+
+    def _placed(self) -> Iterator[Any]:
         order = list(self.base.nodes())
         slots = self._slots(order)
         by_slot: Dict[int, List[Tuple[int, int, FusedNode]]] = {}
@@ -201,17 +211,26 @@ class FusedProgram:
 
     def walked_nodes(self) -> Iterator[Any]:
         """`nodes` of the walked stacks: a kernel fuses walked nodes only."""
+        return iter(self._walked)
+
+    @memo_property
+    def _walked(self) -> Tuple[Any, ...]:
         walked = {node.uid for node in self.base.walked_nodes()}
         mine = {fused.uid for fused in self.fused}
-        for node in self.nodes():
-            if node.uid in walked or node.uid in mine:
-                yield node
+        return tuple(node for node in self.nodes()
+                     if node.uid in walked or node.uid in mine)
 
     def by_uid(self, uid: int) -> Any:
+        node = self._fused_by_uid.get(uid)
+        return self.base.by_uid(uid) if node is None else node
+
+    @memo_property
+    def _fused_by_uid(self) -> Dict[int, FusedNode]:
+        """This pass's kernels by uid, the first of a repeated one."""
+        out: Dict[int, FusedNode] = {}
         for node in self.fused:
-            if node.uid == uid:
-                return node
-        return self.base.by_uid(uid)
+            out.setdefault(node.uid, node)
+        return out
 
     def occurrence_layers(self, uid: int) -> Tuple[Optional[int], ...]:
         """The iterations a node runs at, read off this pass's one statement
