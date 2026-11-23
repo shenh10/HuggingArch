@@ -279,21 +279,23 @@ def _each_law_once(exprs: Sequence[Any]
     named: Dict[Any, sp.Symbol] = {}
     assigned: List[Tuple[sp.Symbol, Any]] = []
     out: List[Any] = []
-    for i, expr in enumerate(exprs):
-        if not isinstance(expr, sp.Basic) or expr.is_Atom:
-            out.append(expr)
-            continue
-        if expr in named:
-            out.append(named[expr])
-            continue
-        variable = sp.Symbol(f"_law{i}")
-        if named:
-            # Rebuilt as written: a `Max` of a variable is not compared again.
-            with sp.evaluate(False):
+    # Rebuilt as written: a `Max` of a variable is not compared again. One
+    # context for the list: entering and leaving `evaluate(False)` clears
+    # SymPy's cache each time.
+    with sp.evaluate(False):
+        for i, expr in enumerate(exprs):
+            if not isinstance(expr, sp.Basic) or expr.is_Atom:
+                out.append(expr)
+                continue
+            if expr in named:
+                out.append(named[expr])
+                continue
+            variable = sp.Symbol(f"_law{i}")
+            if named:
                 expr = expr.xreplace(named)
-        assigned.append((variable, expr))
-        named[expr] = variable
-        out.append(variable)
+            assigned.append((variable, expr))
+            named[expr] = variable
+            out.append(variable)
     return assigned, out
 
 

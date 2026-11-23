@@ -91,12 +91,14 @@ def _csePreservingExtrema(values: Sequence[sp.Expr]):
         else:
             if not args:
                 return expr
-            with sp.evaluate(False):
-                return expr.func(*args)
+            return expr.func(*args)
         extrema[inert] = expr
         return inert
 
-    masked = [mask(value) for value in values]
+    # Every node is rebuilt as written; one context for the whole walk, as
+    # entering and leaving `evaluate(False)` clears SymPy's cache each time.
+    with sp.evaluate(False):
+        masked = [mask(value) for value in values]
     definitions, reduced = sp.cse(
         masked, symbols=sp.numbered_symbols("u"), order="canonical", list=True)
 
