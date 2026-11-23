@@ -131,5 +131,5 @@ def test_cgroup_cpu_quota_caps_the_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(_sweep_pool.os, "sched_getaffinity",
                         lambda _pid: set(range(112)), raising=False)
     monkeypatch.delenv("HA_SWEEP_POOL_WORKERS", raising=False)
-    assert _sweep_pool._usable_cpus() == 12
+    assert _sweep_pool.usable_cpus() == 12
     assert _sweep_pool._max_workers() == 10

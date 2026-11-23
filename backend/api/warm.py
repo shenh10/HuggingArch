@@ -359,11 +359,14 @@ class WarmProcess:
         (`HA_SWEEP_POOL_WORKERS`): the warm runs beside the API's pool in one
         container, so it is budgeted apart (fly.toml) — else min(32, cpu-2):
         run offline, a cold warm is thousands of independent layout walks,
-        and a 4-worker pool left a 112-core box idle for hours."""
+        and a 4-worker pool left a 112-core box idle for hours. The CPUs are
+        the ones this process may use (`pool.usable_cpus`: affinity and
+        cgroup quota), not the machine's: a 112-core box capped at 12
+        CPUs runs 10."""
         raw = os.environ.get("HA_WARM_WORKERS", "").strip()
         if raw:
             return int(raw)
-        return max(0, min(32, (os.cpu_count() or 1) - 2))
+        return max(0, min(32, pool.usable_cpus() - 2))
 
     def __enter__(self) -> "WarmProcess":
         current = os.nice(0)

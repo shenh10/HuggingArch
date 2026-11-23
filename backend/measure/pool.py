@@ -165,10 +165,11 @@ def _cgroup_cpu_quota(path: str = _CGROUP_CPU_MAX) -> Optional[int]:
     return max(1, -(-q // p))
 
 
-def _usable_cpus() -> int:
+def usable_cpus() -> int:
     """The CPUs this process may run on: its affinity mask (which a
     container's cpuset narrows), capped by its cgroup CPU quota — not the
-    machine's count."""
+    machine's count. The one answer to "how many CPUs may this use":
+    every pool and slot count here and above reads it."""
     try:
         cpus = len(os.sched_getaffinity(0)) or 1
     except AttributeError:  # no affinity call on this platform
@@ -180,10 +181,10 @@ def _usable_cpus() -> int:
 def _max_workers() -> int:
     """Pool size: `HA_SWEEP_POOL_WORKERS` when set (the out-of-process warm
     job sets a small one so it leaves cores to the server), else
-    min(16, usable cpus - 2) (`_usable_cpus`). In the server every heavy request and every
+    min(16, usable cpus - 2) (`usable_cpus`). In the server every heavy request and every
     sweep cell is a job of this pool, so its size is the server's compute
     parallelism."""
-    cpu = _usable_cpus()
+    cpu = usable_cpus()
     raw = os.environ.get("HA_SWEEP_POOL_WORKERS", "").strip()
     if raw:
         return max(0, min(int(raw), cpu))

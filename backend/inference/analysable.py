@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from backend.arch.eval.cache_view import cache_view_from_analysis
+from backend.measure import pool
 from backend.arch.eval.program import Program
 from backend.arch.eval.refusal import (
     LayoutRefusal, refusal_stage, stage_context,
@@ -255,7 +256,7 @@ def _replay_dir() -> Path:
 
 def _host_slots() -> int:
     raw = os.environ.get("HA_VALIDATE_REPLAY_SLOTS")
-    return int(raw) if raw else max(MIN_WORKERS, (os.cpu_count() or 1) - 2)
+    return int(raw) if raw else max(MIN_WORKERS, pool.usable_cpus() - 2)
 
 
 def _locked(handle: Any) -> bool:

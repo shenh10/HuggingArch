@@ -256,17 +256,28 @@ def test_an_offline_warm_takes_up_to_32_workers_and_leaves_two_cores(monkeypatch
     """Unset, the warm's pool is as wide as the box allows up to 32, two
     cores left to everything else."""
     monkeypatch.delenv("HA_WARM_WORKERS", raising=False)
-    monkeypatch.setattr(warm.os, "cpu_count", lambda: 112)
+    monkeypatch.setattr(warm.pool, "usable_cpus", lambda: 112)
     assert warm.WarmProcess.default_workers() == 32
-    monkeypatch.setattr(warm.os, "cpu_count", lambda: 8)
+    monkeypatch.setattr(warm.pool, "usable_cpus", lambda: 8)
     assert warm.WarmProcess.default_workers() == 6
+
+
+def test_the_warm_pool_counts_the_cpus_it_may_use(monkeypatch):
+    """A box whose cgroup grants 12 of its 112 CPUs warms on 10 workers: the
+    count is the pool's (`pool.usable_cpus`), not `os.cpu_count`."""
+    monkeypatch.delenv("HA_WARM_WORKERS", raising=False)
+    monkeypatch.setattr(warm.os, "cpu_count", lambda: 112)
+    monkeypatch.setattr(warm.pool, "_cgroup_cpu_quota", lambda: 12)
+    monkeypatch.setattr(warm.pool.os, "sched_getaffinity",
+                        lambda _pid: set(range(112)))
+    assert warm.WarmProcess.default_workers() == 10
 
 
 def test_the_default_warm_pool_uses_the_wide_offline_budget(monkeypatch):
     """The offline warm is the only heavy process on its machine, so its
     default reaches 32 workers rather than the API's conservative default."""
     monkeypatch.delenv("HA_WARM_WORKERS", raising=False)
-    monkeypatch.setattr(warm.os, "cpu_count", lambda: 112)
+    monkeypatch.setattr(warm.pool, "usable_cpus", lambda: 112)
     assert warm.WarmProcess.default_workers() == 32
 
 
