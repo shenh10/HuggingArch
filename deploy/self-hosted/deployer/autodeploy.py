@@ -71,11 +71,13 @@ def read_env_file(path: Path) -> dict[str, str]:
     return env
 
 
-def github_json(url: str, token: str | None) -> dict:
+def github_json(url: str, token: str | None, proxy: str | None = None) -> dict:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "huggingarch-deployer"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {}))
+    with opener.open(urllib.request.Request(url, headers=headers), timeout=20) as r:
         return json.load(r)
 
 
@@ -184,9 +186,22 @@ class Deployer:
 
     # ---- what to deploy
 
+    def network_env(self) -> dict[str, str]:
+        """The deployer's own outbound (git, the GitHub API, the smoke) takes
+        the host's proxy too, when it names one; loopback stays direct."""
+        secrets = read_env_file(self.env_file)
+        proxy = secrets.get("HTTPS_PROXY") or secrets.get("HTTP_PROXY")
+        if not proxy:
+            return {}
+        no_proxy = ",".join(filter(None, ["localhost,127.0.0.1,::1", secrets.get("NO_PROXY")]))
+        return {"HTTP_PROXY": secrets.get("HTTP_PROXY") or proxy, "HTTPS_PROXY": proxy,
+                "http_proxy": secrets.get("HTTP_PROXY") or proxy, "https_proxy": proxy,
+                "NO_PROXY": no_proxy, "no_proxy": no_proxy}
+
     def head(self) -> str:
         out = self.run(["git", "ls-remote", self.repo_url, f"refs/heads/{self.branch}"],
-                       check=True, capture_output=True, text=True).stdout.split()
+                       check=True, capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, **self.network_env())).stdout.split()
         if not out or not SHA.match(out[0]):
             raise RuntimeError(f"git ls-remote named no head for {self.branch}: {out!r}")
         return out[0]
@@ -200,7 +215,7 @@ class Deployer:
         token = read_env_file(self.env_file).get("HA_DEPLOY_GITHUB_TOKEN") or None
         url = (f"https://api.github.com/repos/{self.slug}/commits/{sha}/check-runs"
                f"?check_name={self.gate_check}&filter=latest")
-        runs = self.api(url, token).get("check_runs", [])
+        runs = self.api(url, token, self.network_env().get("HTTPS_PROXY")).get("check_runs", [])
         if not runs:
             return "pending"
         if any(r.get("status") != "completed" for r in runs):
@@ -210,13 +225,16 @@ class Deployer:
     # ---- doing it
 
     def deploy(self, sha: str) -> bool:
+        net = dict(os.environ, **self.network_env())
         if not (self.checkout / ".git").exists():
-            self.run(["git", "clone", "--quiet", self.repo_url, str(self.checkout)], check=True)
+            self.run(["git", "clone", "--quiet", self.repo_url, str(self.checkout)], check=True,
+                     timeout=900, env=net)
         git = ["git", "-C", str(self.checkout)]
-        self.run([*git, "fetch", "--quiet", "origin", self.branch], check=True)
+        self.run([*git, "fetch", "--quiet", "origin", self.branch], check=True, timeout=600,
+                 env=net)
         self.run([*git, "checkout", "--quiet", "--detach", sha], check=True)
         secrets = read_env_file(self.env_file)
-        env = dict(os.environ, NO_PULL="1", HA_ENV_FILE=str(self.env_file),
+        env = dict(net, NO_PULL="1", HA_ENV_FILE=str(self.env_file),
                    HA_PUBLIC_URL=secrets.get("HA_PUBLIC_URL", ""))
         return self.run(["bash", str(self.checkout / "deploy/self-hosted/deploy.sh")],
                         env=env).returncode == 0
@@ -261,7 +279,8 @@ class Deployer:
         while True:
             try:
                 self.step()
-            except (subprocess.CalledProcessError, urllib.error.URLError, OSError,
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                    urllib.error.URLError, OSError,
                     RuntimeError, ValueError) as e:
                 log(f"pass failed: {type(e).__name__}: {e}")
             time.sleep(self.interval)

@@ -30,9 +30,12 @@ class World:
         self.checked_out = None
         self.iptables: list[list[str]] = []
         self.now, self.api_calls = 0.0, 0
+        self.git_env: list[dict] = []
 
     def run(self, cmd, **kw):
         ok = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "git" and {"ls-remote", "clone", "fetch"} & set(cmd):
+            self.git_env.append(kw.get("env") or {})
         if cmd[:2] == ["git", "ls-remote"]:
             ok.stdout = f"{self.head}\trefs/heads/main\n"
         elif cmd[0] == "git" and "checkout" in cmd:
@@ -64,8 +67,9 @@ class World:
             self.chains[chain].insert(0, f"-A {chain} {' '.join(args[3:])}")
         return ok
 
-    def api(self, url, token):
+    def api(self, url, token, proxy=None):
         self.api_calls += 1
+        self.api_proxy = proxy
         sha = url.split("/commits/")[1].split("/")[0]
         gate = self.gates.get(sha)
         if gate is None:
@@ -235,3 +239,25 @@ def test_deploy_sh_completes_no_proxy_with_loopback_and_the_compose_services(tmp
     assert https_proxy == "http://192.168.5.2:7897"
     assert "proxy.compose.yml" in args
 
+
+def test_the_deployer_reaches_github_through_the_hosts_proxy(world, deployer, tmp_path):
+    """Where the host's only reliable route out is its proxy, the deployer's
+    own git and API calls take it too — a direct ls-remote stalled for
+    minutes on the first trial."""
+    (tmp_path / "prod.env").write_text("HTTPS_PROXY=http://192.168.5.2:7897\nNO_PROXY=beszel\n")
+    world.gates[A] = ("completed", "success")
+    assert deployer.step() == "deployed"
+    assert world.api_proxy == "http://192.168.5.2:7897"
+    assert len(world.git_env) == 3                              # ls-remote, clone, fetch
+    for env in world.git_env:
+        assert env.get("HTTPS_PROXY") == "http://192.168.5.2:7897"
+        assert env.get("NO_PROXY") == "localhost,127.0.0.1,::1,beszel"
+
+
+def test_without_a_proxy_the_deployer_goes_direct(world, deployer, monkeypatch):
+    monkeypatch.delenv("HTTPS_PROXY", raising=False)
+    world.gates[A] = ("completed", "success")
+    deployer.step()
+    assert world.api_proxy is None
+    assert len(world.git_env) == 3
+    assert not [e for e in world.git_env if "HTTPS_PROXY" in e]
