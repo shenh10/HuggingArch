@@ -29,6 +29,7 @@ class World:
         self.deployed: list[str] = []
         self.checked_out = None
         self.iptables: list[list[str]] = []
+        self.now, self.api_calls = 0.0, 0
 
     def run(self, cmd, **kw):
         ok = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -64,6 +65,7 @@ class World:
         return ok
 
     def api(self, url, token):
+        self.api_calls += 1
         sha = url.split("/commits/")[1].split("/")[0]
         gate = self.gates.get(sha)
         if gate is None:
@@ -84,15 +86,17 @@ def deployer(world, tmp_path):
     (tmp_path / "work").mkdir()
     env = {"HA_REPO_URL": "https://github.com/o/r.git", "HA_GATE_CHECK": "release-gate",
            "HA_ENV_FILE": str(secrets), "HA_WORK": str(tmp_path / "work")}
-    return autodeploy.Deployer(env, run=world.run, api=world.api)
+    return autodeploy.Deployer(env, run=world.run, api=world.api, clock=lambda: world.now)
 
 
 def test_deploys_only_a_head_whose_gate_passed_and_only_once(world, deployer):
     assert deployer.step() == "gate-pending"                 # no check run yet
     world.gates[A] = ("in_progress", None)
+    world.now += 200
     assert deployer.step() == "gate-pending"
     assert world.deployed == []
     world.gates[A] = ("completed", "success")
+    world.now += 200
     assert deployer.step() == "deployed"
     assert world.deployed == [A]
     assert deployer.step() == "current"
@@ -126,18 +130,29 @@ def test_manual_deploy_rolls_the_current_head_again(world, deployer):
     assert world.deployed == [A, A]
 
 
-def test_egress_rules_are_applied_once_and_left_alone_while_intact(world, deployer):
+def test_egress_rules_are_in_place_before_a_deploy_and_untouched_by_idle_passes(world, deployer):
+    assert deployer.step() == "gate-pending"
+    assert world.iptables == []                                 # an idle pass reads no rules
     world.gates[A] = ("completed", "success")
+    world.now += 200
     deployer.step()
     chain = world.chains["HA-EGRESS"]
     for net in autodeploy.Egress.PRIVATE:
         assert f"-A HA-EGRESS -d {net} -j DROP" in chain
     assert world.chains["DOCKER-USER"] == ["-A DOCKER-USER -j HA-EGRESS"]
     world.iptables.clear()
-    deployer.step()
+    deployer.step()                                             # current: nothing to do
+    assert world.iptables == []
+
+
+def test_ensure_repairs_lost_rules_and_leaves_intact_ones_alone(world, deployer):
+    deployer.egress.ensure()
+    chain = list(world.chains["HA-EGRESS"])
+    world.iptables.clear()
+    deployer.egress.ensure()
     assert not [a for a in world.iptables if a[0] in ("-F", "-N", "-A", "-I")], world.iptables
     world.chains["HA-EGRESS"] = chain[:2]                       # a VM restart lost some
-    deployer.step()
+    deployer.egress.ensure()
     assert world.chains["HA-EGRESS"] == chain
 
 
@@ -149,3 +164,51 @@ def test_the_gate_the_deployer_waits_for_is_a_job_of_the_release_workflow():
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "deploy.yml").read_text())
     assert gate in workflow["jobs"], (gate, list(workflow["jobs"]))
     assert "main" in workflow[True]["push"]["branches"]
+
+
+def test_a_pending_gate_is_asked_about_at_most_once_per_poll_interval(world, deployer):
+    """30 s passes against a pending gate must not spend the anonymous API
+    quota (60 an hour)."""
+    for _ in range(4):                                          # two minutes of passes
+        assert deployer.step() == "gate-pending"
+        world.now += 30
+    assert world.api_calls == 1
+    world.gates[A] = ("completed", "success")
+    world.now += 1
+    assert deployer.step() == "deployed"
+    assert world.api_calls == 2
+
+
+def test_the_named_proxy_is_the_one_private_destination_let_through(world, deployer, tmp_path):
+    secrets = tmp_path / "prod.env"
+    secrets.write_text(secrets.read_text() + "HA_EGRESS_PROXY='192.168.5.2:7897'\n")
+    deployer.ensure_egress()
+    chain = world.chains["HA-EGRESS"]
+    allow = "-A HA-EGRESS -d 192.168.5.2/32 -p tcp -m tcp --dport 7897 -j RETURN"
+    assert allow in chain
+    assert chain.index(allow) < chain.index("-A HA-EGRESS -d 192.168.0.0/16 -j DROP")
+    world.iptables.clear()
+    deployer.ensure_egress()                                    # listed form matches: no rebuild
+    assert not [a for a in world.iptables if a[0] in ("-F", "-N", "-A", "-I")]
+    secrets.write_text("HA_EGRESS_PROXY=proxy.lan:7897\n")      # iptables -d would resolve it once
+    with pytest.raises(ValueError, match="HA_EGRESS_PROXY"):
+        deployer.ensure_egress()
+
+
+def test_no_proxy_means_no_allowance(world, deployer):
+    deployer.ensure_egress()
+    assert not [r for r in world.chains["HA-EGRESS"] if "--dport" in r]
+
+
+def test_the_proxy_reaches_the_build_and_every_running_container():
+    """proxy.compose.yml hands the same variables to the app's build and to
+    each service docker-compose.yml runs."""
+    proxy = yaml.safe_load((HOST / "proxy.compose.yml").read_text())
+    base = yaml.safe_load((HOST / "docker-compose.yml").read_text())
+    names = set(proxy["x-proxy"])
+    assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= names
+    assert set(proxy["services"]["app"]["build"]["args"]) == names
+    assert set(proxy["services"]) == set(base["services"])
+    for service in proxy["services"].values():
+        assert set(service["environment"]) == names
+

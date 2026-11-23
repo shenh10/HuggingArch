@@ -14,7 +14,21 @@ cd "$root"
 [ -f "$HA_ENV_FILE" ] || { echo "missing $HA_ENV_FILE (template: $here/env.example)" >&2; exit 1; }
 [ "${NO_PULL:-0}" = 1 ] || git pull --ff-only
 export HA_GIT_SHA="$(git rev-parse HEAD)"
-compose=(docker compose -f "$here/docker-compose.yml" --env-file "$HA_ENV_FILE")
+# A value of the secrets file (KEY=value, optionally quoted), empty when unset.
+secret() { sed -n "s/^$1=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}\$/\1/p" "$HA_ENV_FILE" | tail -n 1; }
+compose=(docker compose -f "$here/docker-compose.yml")
+# A host whose containers reach the internet through a proxy on the VM's
+# gateway names it once (HA_EGRESS_PROXY=<ip>:<port>); the build and the
+# running containers get it from proxy.compose.yml, the egress rules let it
+# through (the deployer). Unset: neither file nor variables are involved.
+proxy="$(secret HA_EGRESS_PROXY)"
+if [ -n "$proxy" ]; then
+  export HTTP_PROXY="http://$proxy" HTTPS_PROXY="http://$proxy"
+  extra="$(secret HA_EGRESS_NO_PROXY)"
+  export NO_PROXY="localhost,127.0.0.1,::1,app,tunnel${extra:+,$extra}"
+  compose+=(-f "$here/proxy.compose.yml")
+fi
+compose+=(--env-file "$HA_ENV_FILE")
 "${compose[@]}" build app
 "${compose[@]}" up -d
 # The engine hash the new image serves, read inside it (no host Python env).

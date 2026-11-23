@@ -19,6 +19,7 @@ What is where:
 | Secrets | the `huggingarch-secrets` volume in the VM (template `env.example`) |
 | Build + restart + content smoke | `deploy.sh` |
 | Pull, gate check, deploy; container egress rules | `deployer/` (`deployer.compose.yml`) |
+| Proxy for a host that needs one (only with `HA_EGRESS_PROXY`) | `proxy.compose.yml` |
 | Release gate | `.github/workflows/deploy.yml`, check run `release-gate` |
 
 ## How a commit ships
@@ -26,7 +27,8 @@ What is where:
 1. Push to `main`; the `tests` workflow runs the full suite and
    `release-gate` waits for it, then runs the release subset.
 2. The deployer sees the new head (`git ls-remote` every 30 s), asks GitHub
-   for the head's `release-gate` check run, and waits while it is pending.
+   for the head's `release-gate` check run, and waits while it is pending
+   (asking again every 2 minutes).
 3. Passed: it checks the commit out in its own clone and runs `deploy.sh`
    (build, roll, smoke on the loopback port and on `HA_PUBLIC_URL`). Failed:
    the commit is never deployed; the next head is.
@@ -89,9 +91,18 @@ later starts. `http://127.0.0.1:8000/health`: the lake reports
 The deployer keeps the VM's `DOCKER-USER` chain jumping to `HA-EGRESS`, which
 drops container traffic to private, link-local and CGNAT ranges — the LAN and
 the VM's gateway to the machine's own localhost — and lets
-container-to-container and internet traffic through. It checks the rules
-every pass, so a restarted VM gets them back; `EGRESS NOT APPLIED` in its log
-means they are missing. IPv4 only.
+container-to-container and internet traffic through. It applies them at
+start (a VM restart empties iptables and restarts the deployer with it) and
+again before every deploy; `EGRESS NOT APPLIED` in its log means they are
+missing. IPv4 only.
+
+**Behind a proxy.** Where the containers reach the internet only through a
+proxy on the VM's gateway, name it in the secrets: `HA_EGRESS_PROXY=<ip>:<port>`
+(plus `HA_EGRESS_NO_PROXY` for extra names on the compose network). That one
+TCP destination is let through ahead of the drops; `deploy.sh` loads
+`proxy.compose.yml`, which hands `HTTP(S)_PROXY` / `NO_PROXY` to the image
+build and to the app and tunnel. Base-image pulls are the Docker daemon's own
+and follow its proxy settings, not these.
 
 ## Running beside Fly
 
