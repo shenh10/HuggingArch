@@ -705,6 +705,82 @@ class TestCheckpointAddress(unittest.TestCase):
                        checkpoint={"index": "local"})
 
 
+    def test_a_call_nothing_repeats_takes_no_index_from_its_group(self):
+        """An indexed group's index is its repeated stack's: a component call
+        beside it that nothing repeats hangs off the root it declares (Hy4's
+        DFly drafter: `model.dfly_layers.X.*` layers beside
+        `model.dfly_layers.mtp_fusion.*`), else the group's root — not under
+        the stack's index, where the checkpoint has no such module."""
+        import tempfile
+
+        from backend.arch.spec_tree import iter_leaves
+
+        spec = """\
+match: { model_type: [_draft_group], model_id: [_draft_group] }
+dims: { d_model: config.hidden_size, n_layers: "1", n_mtp_layers: "2" }
+blocks:
+  blk:
+    graph:
+      n: { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+    outputs: [n]
+  fuse:
+    graph:
+      enorm: { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+    outputs: [enorm]
+model_inputs:
+  input_ids: { kind: tokens }
+checkpoint: { root: model }
+model:
+  - { name: embed, op: embedding, inputs: [input_ids], boundary_role: input_embedding,
+      dims: { n_vocab: d_model, d_model: d_model },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: layers, template: blk, repeat: n_layers, inputs: [embed],
+      checkpoint: { prefix: model.layers }, streams: { hidden: { carries: true } } }
+  - name: draft
+    group: true
+    aux_kind: speculative
+    checkpoint: { prefix: model.draft, index: local }
+    inputs: [layers]
+    layers:
+      - { name: fusion, template: fuse, inputs: [layers],
+          checkpoint: { root: model.draft.fusion } }
+      - { name: layers, template: blk, repeat: n_mtp_layers, inputs: [fusion],
+          streams: { hidden: { carries: true } } }
+      - { name: tail, template: fuse, inputs: [layers] }
+      - { name: head, op: linear, boundary_role: output_head, inputs: [tail],
+          dims: { in: d_model, out: d_model },
+          weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: lm_head, op: linear, boundary_role: output_head, inputs: [layers],
+      dims: { in: d_model, out: d_model },
+      weight_axes: [{ replicated: true }, { replicated: true }] }
+"""
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            for sub in ("components/library", "components/adapters",
+                        "components/drafts", "models"):
+                (base / sub).mkdir(parents=True)
+            (base / "models" / "_draft_group.yaml").write_text(spec)
+            resolved = SpecLoader(base_dir=str(base)).match(
+                {"model_type": "_draft_group", "hidden_size": 8,
+                 "torch_dtype": "bfloat16"}, model_id="_draft_group")
+            names = {lt.tensor_name for lt in iter_leaves(resolved)}
+        self.assertIn("model.draft.fusion.enorm.weight", names)
+        self.assertIn("model.draft.X.n.weight", names)
+        self.assertIn("model.enorm.weight", names)
+        self.assertFalse({n for n in names if n.startswith("model.draft.X.enorm")})
+
+    def test_a_call_nothing_repeats_declares_only_its_root(self):
+        from pydantic import ValidationError
+
+        from backend.arch.schema import ModelLayer
+
+        ModelLayer(name="fusion", template="t",
+                   checkpoint={"root": "model.draft.fusion"})
+        with self.assertRaises(ValidationError):
+            ModelLayer(name="fusion", template="t",
+                       checkpoint={"prefix": "model.draft"})
+
+
 class TestQuantOverrideSelector(unittest.TestCase):
     def test_stack_scope_lives_under_select(self):
         from pydantic import ValidationError

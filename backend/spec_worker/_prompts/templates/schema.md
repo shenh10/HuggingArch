@@ -139,7 +139,7 @@ are rejected rather than ignored:
 | form | required discriminator | form-specific fields |
 |---|---|---|
 | direct op | `op:` | `boundary_role`, `dims` or `dim`, `axis`, `shape`, `weight_axes`, `expert_weight`, `stored_axes`, `tied_weight`, `quant_metadata`, `module`, `inner_modules`, `checkpoint: {path, index: local}` |
-| homogeneous block | `template:` | `params`, optional repeated-stack `streams`, `checkpoint: {prefix, index}` |
+| homogeneous block | `template:` | `params`, optional repeated-stack `streams`, `checkpoint: {prefix, index}` when repeated, `checkpoint: {root}` when not |
 | heterogeneous block | `per_layer:` | repeated-stack `streams`, `checkpoint: {prefix, index}`; `repeat` is required |
 | auxiliary group | `group: true` | non-empty `layers`, `aux_kind`, `checkpoint: {prefix, index}` when it contains an indexed block stack, `checkpoint: {root}` when its tensors hang off another path than the model's |
 
@@ -153,7 +153,12 @@ scope — the model's, or its group's `checkpoint.root`. An op elsewhere declare
 its full `checkpoint: { path: lm_head }`; a stack elsewhere declares its full
 `checkpoint: { prefix: model.mtp.layers }`. A repeated op or graph node whose
 copies the checkpoint indexes declares `checkpoint: { index: local }`; a repeat
-without it is stored as one module. `streams` is valid only
+without it is stored as one module. A `template:` call nothing repeats has no
+index, even inside an indexed group: its component's names hang off its scope's
+root, or off the `checkpoint: { root: ... }` it declares — so a module that sits
+beside a group's indexed layers (`model.draft.fusion.*` next to
+`model.draft.<i>.*`) is a component called once with that root, its nodes named
+relative to it, not a run of direct ops each spelling the full path. `streams` is valid only
 on a repeated template/per-layer/aux stack. Do not put op geometry on a template
 or group, and do not put template `params` on a direct op.
 

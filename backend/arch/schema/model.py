@@ -1699,10 +1699,14 @@ class ModelLayer(BaseModel):
                     "stores one copy of a repeated op under each index of "
                     "that stack, at the module `path` inside it; it needs "
                     "`path:` and `repeat:`, and no `index:`")
+        elif self.checkpoint is not None and self.repeat is None:
+            # A component call nothing repeats has no index: its address is
+            # the root its component's names hang off.
+            self.checkpoint.only("root", where=f"model layer {self.name!r}")
         elif self.checkpoint is not None:
             self.checkpoint.only("prefix", "index",
                                  where=f"model layer {self.name!r}")
-            if self.checkpoint.prefix is None or self.repeat is None:
+            if self.checkpoint.prefix is None:
                 raise ValueError(
                     f"Model layer {self.name!r}: a stack's `checkpoint` "
                     "declares the `prefix` its `repeat:` index follows")

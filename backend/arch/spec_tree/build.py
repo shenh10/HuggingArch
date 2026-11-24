@@ -499,7 +499,8 @@ class _BlockEnumerator:
         op's name follows. A stack without `repeat:` has no index, and its
         tensors hang off the root itself."""
         if layer.repeat is None:
-            return CheckpointAddress(root=self.root)
+            return CheckpointAddress(
+                root=scope_checkpoint_root(layer.checkpoint, self.root))
         declared = layer.checkpoint or CheckpointAddress(
             prefix=".".join(part for part in (self.root, layer.name) if part))
         return with_root(declared, self.root)
@@ -562,8 +563,13 @@ class _BlockEnumerator:
             site = self.resolved.site
             # A second indexed stack in the group (Qwen3-VL's
             # `deepstack_merger_list.X` beside `blocks.X`) declares its own
-            # address; it indexes locally.
+            # address; it indexes locally. A call nothing repeats has no
+            # index: it hangs off the group's root, or the root it declares
+            # (DFly's `model.dfly_layers.mtp_fusion` beside the indexed
+            # `model.dfly_layers.X`).
             own = sub.checkpoint
+            if sub.repeat is None and layer.repeat is None:
+                own = CheckpointAddress(root=scope_checkpoint_root(own, root))
             sub_path = (*layer_path, sub_index)
             # A call of an earlier template call beside it, or a template
             # call in a call of a group: the called one at the same place.
@@ -588,7 +594,8 @@ class _BlockEnumerator:
                 stack_name=stack,
                 aux_kind=layer.aux_kind,
                 group_name=layer.name,
-                checkpoint=(with_root(own, root) if own is not None
+                checkpoint=(own if own is not None and own.prefix is None
+                            else with_root(own, root) if own is not None
                             else group_checkpoint),
                 backbone_layers=(self.tail_index_base(own) if own is not None
                                  else group_backbone_layers),
