@@ -13,7 +13,7 @@ architecture review (Kimi) at R1 with three required fixes, the technical
 review (Codex) at R4 after three rounds of not signing, with two required
 hardenings of the oracle's own checks — an empty-container sentinel, and
 `--refusal` asserting against a clean baseline rather than in isolation.
-Both are in. Every round is archived under `reviews/`.
+Both are in. The review files themselves stay out of the repository; what they found is recorded here and in the commit that carries this file.
 
 What the rounds changed: the question table gained three classes it
 was missing (§2); "answerable before the walk" became "off the card-free
