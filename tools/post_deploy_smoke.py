@@ -231,7 +231,10 @@ class Client:
             self.base + path, data=data, method="POST" if data else "GET",
             headers={"Content-Type": "application/json",
                      "Accept": "application/json",
-                     "Accept-Encoding": "gzip"})
+                     "Accept-Encoding": "gzip",
+                     # urllib's default (Python-urllib/3.x) is refused at a
+                     # Cloudflare edge by Browser Integrity Check (403, 1010).
+                     "User-Agent": "huggingarch-smoke/1"})
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=self.ctx) as r:
                 return r.status, _decode_json(r)

@@ -980,7 +980,9 @@ def _cmd_upload(argv: List[str]) -> int:
                             "make_public": bool(args.public)}).encode()
         req = urllib.request.Request(url, data=body, method="POST", headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {args.token}"})
+            "Authorization": f"Bearer {args.token}",
+            # urllib's default UA is refused at a Cloudflare edge (403, 1010).
+            "User-Agent": "huggingarch-kernel-bench/1"})
         tag = os.path.basename(f)
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:

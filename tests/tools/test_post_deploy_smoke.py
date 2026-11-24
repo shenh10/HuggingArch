@@ -204,3 +204,33 @@ def test_a_measurement_is_reproduced_under_its_own_deployment():
         "physical_shape": '{"B":8,"d_out":1,"d_reduce":1,"s_query":1}',
         "dtype_env_json": {"activation": "bf16"}}])
     assert groups[0][0] == ("m/a", "H100-SXM", "tp_attention=4", 8)
+
+
+def test_the_client_is_not_refused_by_an_edge_that_blocks_default_user_agents():
+    """Cloudflare's Browser Integrity Check answers urllib's default
+    `Python-urllib/3.x` with 403 (error 1010); a real request to a server
+    that does the same must get through."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from tools.post_deploy_smoke import Client
+
+    class Edge(BaseHTTPRequestHandler):
+        def do_GET(self):
+            refused = self.headers.get("User-Agent", "").startswith("Python-urllib")
+            body = b"error code: 1010" if refused else b'{"ok": true}'
+            self.send_response(403 if refused else 200)
+            self.send_header("Content-Type", "text/plain" if refused else "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Edge)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        status, body = Client(f"http://127.0.0.1:{server.server_port}").call("/health", timeout=5)
+    finally:
+        server.shutdown()
+    assert (status, body) == (200, {"ok": True})
