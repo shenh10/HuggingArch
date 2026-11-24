@@ -55,7 +55,6 @@ import yaml
 
 from backend.hf.header import SafetensorsHeader
 
-_TAG_RE = re.compile(r"`(src|cfg|ckpt|count):\s*([^`]+?)\s*`")
 # Line numbers of a citation: `120`, `120-122`, and the `L120` / `L120-L122`
 # spelling review agents also write.
 _LINES = r"L?(\d+)(?:\s*[-–]\s*L?(\d+))?"
@@ -65,6 +64,11 @@ _SRC_TAG_RE = re.compile(rf"^(\S+?):{_LINES}\s*(.*?)\s*$", re.S)
 # (`"gate = ..." / "up = ..."`): pieces that must appear in this order.
 _QUOTE = r'"(?:[^"\\]|\\.)*"'
 _QUOTES_RE = re.compile(rf"{_QUOTE}(?:\s*/\s*{_QUOTE})*")
+# A backticked tag. A quote ends a `src:` tag only after its closing `"`:
+# quoted code may hold backticks of its own (a docstring's `pixel_values`).
+_TAG_RE = re.compile(
+    r"`(src|cfg|ckpt|count):\s*"
+    rf"([^\s`]+?:L?\d+(?:\s*[-–]\s*L?\d+)?\s*{_QUOTES_RE.pattern}|[^`]+?)\s*`")
 # Tags written without backticks. Only forms whose end is unambiguous in
 # running text are tags: `src:` with its quote, and `cfg:` / `ckpt:` /
 # `count:` with `= value` (a number, a boolean, `[...]` or `absent`).
@@ -83,7 +87,7 @@ _LEGACY_SHAPE_RE = re.compile(
 _NUMBER_RE = re.compile(
     r"(?<![\w.,])-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w]|[.,]\d)")
 _NOT_A_CLAIM_RE = re.compile(
-    r"`(?:src|cfg|ckpt|count):[^`]*`"            # tags: checked on their own
+    rf"{_TAG_RE.pattern}"                        # tags: checked on their own
     rf"|{_BARE_SRC_RE.pattern}|{_BARE_VALUE_RE.pattern}"  # unbackticked tags
     r"|[\w./-]*:L?\d+(?:\s*[-–]\s*L?\d+)?(?:\s*,\s*L?\d+(?:\s*[-–]\s*L?\d+)?)*"  # file:line refs
     r"|\b(?:steps?|rows?|layers? index|#)\s*\d+(?:\s*[-–,]\s*\d+)*"

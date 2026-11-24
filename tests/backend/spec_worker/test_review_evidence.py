@@ -207,6 +207,31 @@ def test_pass_quoting_code_the_forward_does_not_have_is_not_recorded():
     assert _final_verdict("pass", {"valid": True}, ev) == "pass"
 
 
+# A docstring that writes its names in backticks, as markdown docstrings do.
+PIPIT = SnapshotFacts({}, _header({}), {"preprocess_pipit.py": "\n".join([
+    "def pack(images):",                                                       # 1
+    '    """`pixel_values` holds every patch; each image has `prod(grid[i])`.',  # 2
+    "    Only the `<|media_pad|>` positions are embedding slots.",             # 3
+    '    """',                                                                 # 4
+])})
+
+
+def test_a_quote_holding_backticks_is_read_to_its_closing_quote():
+    # The quote's own backticks once ended the tag at the first one, so a
+    # verbatim docstring quote read as no quote and a PASS was not recorded.
+    report = TABLE_F + (
+        '| 1 | patches | `src: preprocess_pipit.py:2 "`pixel_values` holds every '
+        'patch; each image has `prod(grid[i])`."` | patchify | | match |\n'
+        '| 2 | media slots | `src: preprocess_pipit.py:3 "Only the `<|media_pad|>` '
+        'positions are embedding slots."` | embed_merge | | match |\n') + TABLE_S
+    ev = ReviewEvidence.audit(report, PIPIT)
+    assert [r.status for r in ev.rows] == [VERIFIED, VERIFIED]
+    assert _final_verdict("pass", {"valid": True}, ev) == "pass"
+
+    wrong = report.replace("holds every patch", "holds one patch")
+    assert ReviewEvidence.audit(wrong, PIPIT).rows[0].status == CONTRADICTED
+
+
 def test_config_key_the_config_does_not_hold_is_contradicted():
     absent = ORCA.check_tag("cfg", "num_draft_layers = 6")
     said_absent = ORCA.check_tag("cfg", "num_draft_layers = absent")
