@@ -1,5 +1,10 @@
 # Deployment — Fly.io + GitHub Actions + custom domain
 
+> **Production is self-hosted now** — see
+> [`deploy/self-hosted/README.md`](../deploy/self-hosted/README.md). Fly is
+> retired: the app is scaled to zero and `fly.toml` is kept only as a
+> rollback target. This page describes that Fly setup.
+
 This walks through the platform's setup. A normal release uses the one
 producer-to-production entry point in [Standard release](#standard-release).
 

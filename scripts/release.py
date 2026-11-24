@@ -6,12 +6,14 @@ A release is not a sequence of facts remembered by an operator.  It is:
 1. warm the local release caches;
 2. publish the three immutable Supabase artifacts;
 3. verify the indexes this deployment will read;
-4. push ``HEAD`` to ``main`` and wait for the tests -> deploy workflow;
-5. let that workflow's post-deploy content smoke fail the release.
+4. push ``HEAD`` to ``main`` and wait for the tests -> release gate;
+5. wait for the self-hosted host to deploy it (it pulls main once the gate
+   passed) and let the public content smoke fail the release.
 
 The trace provider is the error that motivated this entry point: warm, publish
-and deployment must all name the same one.  ``fly.toml`` is that single
-source; this script sets ``HA_CODE_TRACE`` from it before any backend module
+and deployment must all name the same one.  The production host's runtime
+configuration (``deploy/self-hosted/runtime.env``, read through
+``tools.deploy_env``) is that single source; this script sets ``HA_CODE_TRACE`` from it before any backend module
 is imported in this process or in a child.
 
 Run it from the release checkout:
@@ -34,7 +36,6 @@ import re
 import subprocess
 import sys
 import time
-import tomllib
 import urllib.error
 import urllib.request
 from typing import Any
@@ -43,24 +44,26 @@ from dotenv import load_dotenv
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from tools.deploy_env import host_env
 TRACE_MODES = {"global", "functions"}
 
 
-def _fly_trace_mode(path: pathlib.Path = ROOT / "fly.toml") -> str:
-    """The deployment's trace provider, the one fact every producer shares."""
-    document = tomllib.loads(path.read_text(encoding="utf-8"))
-    mode = (document.get("env") or {}).get("HA_CODE_TRACE")
+def _trace_mode(root: pathlib.Path = ROOT) -> str:
+    """The deployment's trace provider, the one fact every producer shares:
+    the production host's environment."""
+    mode = host_env(root).get("HA_CODE_TRACE")
     if mode not in TRACE_MODES:
         raise ValueError(
-            f"fly.toml HA_CODE_TRACE must be one of {sorted(TRACE_MODES)}, "
-            f"got {mode!r}")
+            f"the production host's HA_CODE_TRACE must be one of "
+            f"{sorted(TRACE_MODES)}, got {mode!r}")
     return str(mode)
 
 
 def _load_release_env() -> str:
     """Load credentials, then return the deployment's trace provider."""
     load_dotenv(ROOT / ".env", override=False)
-    return _fly_trace_mode()
+    return _trace_mode()
 
 
 def _child_env(mode: str) -> dict[str, str]:
@@ -171,7 +174,7 @@ def _wait_for_release_workflow(
             time.sleep(30)
             continue
         runs = {run["name"]: run for run in document.get("workflow_runs", [])}
-        tests, deploy = runs.get("tests"), runs.get("deploy")
+        tests, deploy = runs.get("tests"), runs.get("release gate")
         if tests is not None:
             print(f"  tests: {tests['status']} {tests['conclusion']}",
                   flush=True)
@@ -198,7 +201,8 @@ def _wait_for_release_workflow(
 
 
 def promote(timeout_minutes: int) -> None:
-    """Publish ``HEAD`` through the repository's tests -> deploy gate."""
+    """Publish ``HEAD`` through the repository's tests -> release gate, then
+    wait for the host to serve it."""
     verify()
     subprocess.run(["git", "fetch", "origin"], cwd=ROOT, check=True)
     if _git("status", "--porcelain"):
@@ -210,12 +214,15 @@ def promote(timeout_minutes: int) -> None:
             ["git", "merge-base", "--is-ancestor", remote, head],
             cwd=ROOT, check=True)
         _run(["git", "push", "origin", "HEAD:main"],
-             mode=_fly_trace_mode())
+             mode=_trace_mode())
     _wait_for_release_workflow(head, timeout_minutes=timeout_minutes)
+    # The host pulls main after the gate; the smoke waits for it to serve
+    # this commit's engine.
+    smoke("https://www.huggingarch.com")
 
 
 def smoke(base_url: str) -> None:
-    """Run the same content smoke the deploy workflow runs."""
+    """The content smoke the host's deployer runs, against ``base_url``."""
     mode = _load_release_env()
     from backend.fingerprint import engine_version
     _run([

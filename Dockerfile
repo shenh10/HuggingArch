@@ -88,17 +88,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # Consumed by backend/spec_worker/overlay.py.
     HA_SPEC_RUNS_ROOT=/app/.cache/ha_spec_runs \
     HA_USER_SPECS_ROOT=/app/.cache/ha_user_specs \
-    # The builder may bake an image-local Gallery cache. Runtime release
-    # state also lives on the persistent volume and is merged from the
-    # versioned shared artifact by scripts/entrypoint.sh.
-    HA_GALLERY_CACHE_DIR=/app/.cache/huggingarch/gallery-cache \
-    HA_SOL_POOL_DIR=/app/var/sol-pool \
+    # The release caches' identity and locations (HA_CODE_TRACE, the SOL /
+    # Gallery / sweep / code-trace directories on the volume, the artifact
+    # bucket) are the host's runtime configuration, not the image's:
+    # deploy/self-hosted/runtime.env (fly.toml [env] on the retired Fly
+    # host), which scripts/release_warm.py reproduces when it publishes.
     HA_SOL_POOL_ONLY=0 \
-    # Nothing is baked for the sweep answers (the builder's warm runs with
-    # HA_SOL_POOL_ONLY), so they live on the volume with the trace bodies
-    # their entries name; scripts/entrypoint.sh merges the published artifact.
-    HA_SWEEP_CACHE_DIR=/app/.cache/huggingarch/sweep-cache \
-    HA_CODE_TRACE_DIR=/app/.cache/huggingarch/code-traces \
     # The corpus admitter's per-(base, environment) baseline cache, on the
     # persistent volume so a restart does not re-measure the corpus.
     # Consumed by backend/service/admission.py.

@@ -56,7 +56,7 @@ export function Privacy() {
         <h2 className="text-base font-semibold text-gray-900 mt-8 mb-2">Third-party providers</h2>
         <ul className="text-sm text-gray-700 list-disc list-inside space-y-1 mb-4">
           <li><strong>Supabase</strong> — auth + database hosting. <a className="text-amber-700 hover:underline" href="https://supabase.com/privacy" target="_blank" rel="noopener">supabase.com/privacy</a></li>
-          <li><strong>Fly.io</strong> — application hosting. <a className="text-amber-700 hover:underline" href="https://fly.io/legal/privacy-policy" target="_blank" rel="noopener">fly.io/legal/privacy-policy</a></li>
+          <li><strong>Cloudflare</strong> — network edge: every request passes through it (it sees your IP address). <a className="text-amber-700 hover:underline" href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">cloudflare.com/privacypolicy</a></li>
           <li><strong>HuggingFace</strong> — public model metadata fetched on every analyze request (no PII sent). <a className="text-amber-700 hover:underline" href="https://huggingface.co/privacy" target="_blank" rel="noopener">huggingface.co/privacy</a></li>
           <li><strong>GitHub / Google</strong> — only when you choose to sign in via OAuth. Each provider has its own privacy policy.</li>
         </ul>

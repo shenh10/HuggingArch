@@ -285,9 +285,10 @@ class TestCoverage:
         core reports from `offload.within_deadline` and a route of its own
         work calls itself. A limited handler that reaches neither would be
         limited in name only. Derived: a function starts work when it calls
-        `within_deadline` / `starts_work` or a function that does (to a
-        fixed point over the API and service modules); every handler of a
-        limited route must."""
+        `within_deadline` / `starts_work` or a function that does — calls
+        it, or hands it to a call that runs it (`measured_or_sol(run, …)`) —
+        to a fixed point over the API and service modules; every handler of
+        a limited route must."""
         import ast
         from pathlib import Path
         from backend.service import rate_limit
@@ -298,9 +299,10 @@ class TestCoverage:
                  *sorted((backend / "service" / "routes").glob("*.py"))]
 
         def called(fn):
-            return {n.func.id if isinstance(n.func, ast.Name) else n.func.attr
-                    for n in ast.walk(fn) if isinstance(n, ast.Call)
-                    and isinstance(n.func, (ast.Name, ast.Attribute))}
+            calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+            return ({n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+                     for n in calls if isinstance(n.func, (ast.Name, ast.Attribute))}
+                    | {a.id for n in calls for a in n.args if isinstance(a, ast.Name)})
 
         calls: dict = {}
         handlers = []
@@ -352,3 +354,23 @@ class TestCoverage:
         r = client.post("/analyze", json={"model_id": "x"},
                         headers={"Fly-Client-IP": "2.2.2.2"})
         assert r.status_code == 429, "untrusted Fly-Client-IP rotated the bucket"
+
+    def test_configured_edge_header_is_the_only_one_trusted(self, client, monkeypatch):
+        """Behind a Cloudflare Tunnel the edge writes `CF-Connecting-IP`;
+        a `Fly-Client-IP` there is client-supplied. The spoofed header must
+        not rotate the bucket, and the configured one must separate clients."""
+        from backend.service import rate_limit
+        monkeypatch.delenv("FLY_APP_NAME")
+        monkeypatch.setenv("HA_TRUST_PROXY_HEADERS", "1")
+        monkeypatch.setenv("HA_CLIENT_IP_HEADER", "CF-Connecting-IP")
+        monkeypatch.setitem(rate_limit._LIMITS, "/analyze", 1)
+        _reset_buckets(monkeypatch)
+        _patch_clock(monkeypatch)
+        client.post("/analyze", json={"model_id": "x"},
+                    headers={"CF-Connecting-IP": "9.9.9.9", "Fly-Client-IP": "1.1.1.1"})
+        r = client.post("/analyze", json={"model_id": "x"},
+                        headers={"CF-Connecting-IP": "9.9.9.9", "Fly-Client-IP": "2.2.2.2"})
+        assert r.status_code == 429, "spoofed Fly-Client-IP escaped the bucket"
+        r = client.post("/analyze", json={"model_id": "x"},
+                        headers={"CF-Connecting-IP": "8.8.8.8"})
+        assert r.status_code != 429, "the configured edge header did not separate clients"
