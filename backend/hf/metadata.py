@@ -20,7 +20,7 @@ local-repo header readers, the record a snapshot stores (`metadata_record`), tot
 """
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from huggingface_hub import errors as hf_errors
 
@@ -29,6 +29,8 @@ from backend.custom_id import is_custom_id, model_path, strip_prefix
 from ._cache import cache_load_raw, cache_store
 from .header import ReadTensors, SafetensorsHeader
 from backend.arch.quant_schemes import (
+    PackedStorageMismatch,
+    resolve_scheme,
     SCHEME_NONE,
     QuantScheme,
     is_quantization_metadata,
@@ -125,7 +127,8 @@ def metadata_record(meta: Dict[str, Any]) -> Dict[str, Any]:
     return record
 
 
-def metadata_from_record(record: Dict[str, Any], *, source: str
+def metadata_from_record(record: Dict[str, Any], *, source: str,
+                         legacy_config: Optional[Callable[[], Optional[dict]]] = None
                          ) -> Dict[str, Any]:
     """`summarize` over a stored record, under the scheme its writer
     resolved. A record without the verbatim header predates it and is
@@ -138,10 +141,21 @@ def metadata_from_record(record: Dict[str, Any], *, source: str
             f"them: its tensor names were folded when it was written). "
             f"Refetch it: `python -m backend.hf.snapshot <model_id>`, or "
             f"re-register a custom model with --hf-model-path.")
-    return summarize(SafetensorsHeader.from_json(raw),
-                     scheme=scheme_named(record["quant_scheme"]),
-                     num_bits=int(record["num_bits"]),
-                     unknown_method=record.get("quant_method_unknown"))
+    header = SafetensorsHeader.from_json(raw)
+    scheme = scheme_named(record["quant_scheme"])
+    try:
+        return summarize(header, scheme=scheme, num_bits=int(record["num_bits"]),
+                         unknown_method=record.get("quant_method_unknown"))
+    except PackedStorageMismatch:
+        # Older writers persisted the wrapper scheme before resolving its
+        # delegated packing format. Recover only a target the wrapper declares,
+        # from the config stored alongside this same header.
+        if not scheme.delegates_to or legacy_config is None:
+            raise
+        resolved, bits, unknown = resolve_scheme(legacy_config())
+        if resolved.name not in {target for _, _, target in scheme.delegates_to}:
+            raise
+        return summarize(header, scheme=resolved, num_bits=bits, unknown_method=unknown)
 
 
 def scan_local_hf_repo(repo_dir, *, scheme: "QuantScheme", num_bits: int,
@@ -273,7 +287,7 @@ def fetch_metadata(model_id: str, overlay_dir: Optional[str] = None
                     f"custom model {model_id} checkpoint_header.json is "
                     f"corrupt: {e}") from e
             return metadata_from_record(
-                record, source=f"custom model {model_id}")
+                record, source=f"custom model {model_id}", legacy_config=lambda: fetch_config(model_id))
         if (root / "tensor_patterns.json").is_file():
             return metadata_from_record(
                 {}, source=f"custom model {model_id}")
@@ -286,7 +300,8 @@ def fetch_metadata(model_id: str, overlay_dir: Optional[str] = None
         # The snapshot's sidecars are classified under the scheme its writer
         # resolved from the config (recorded beside the header); serving does
         # not parse the config itself (CLAUDE.md §2.4).
-        return metadata_from_record(meta, source=f"snapshot {model_id}")
+        return metadata_from_record(meta, source=f"snapshot {model_id}",
+                                    legacy_config=lambda: snap.get("config"))
     # No snapshot: serving holds no checkpoint scheme, so no tensor is a
     # sidecar (`SCHEME_NONE`); spec generation snapshots a model first.
     return _fetch_metadata_hf(model_id, scheme=SCHEME_NONE, num_bits=0)

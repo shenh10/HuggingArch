@@ -56,6 +56,9 @@ deepseek-ai/DeepSeek-V2-Lite
 # routes to the q-comp variant of MLA, not the no-qcomp DSv2-Lite spec.
 deepseek-ai/DeepSeek-V2
 
+## kimi_k31
+moonshotai/Kimi-K3.1-Pro
+
 ## kimi_k3
 moonshotai/Kimi-K3
 

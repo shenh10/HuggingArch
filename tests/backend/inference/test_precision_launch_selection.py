@@ -32,6 +32,7 @@ _DOT_STEMS = (
 _PACK_STEMS = (
     "XiaomiMiMo__MiMo-V2.6-Pro-RL",
     "moonshotai__Kimi-K3",
+    "moonshotai__Kimi-K3.1-Pro",
 )
 _GPT_OSS_STEM = "openai__gpt-oss-20b"
 _ALL_STEMS = (*_DOT_STEMS, *_PACK_STEMS, _GPT_OSS_STEM)

@@ -87,6 +87,9 @@
     "moonshotai__Kimi-K2.5.json": {
       "match/header_ok": 9
     },
+    "moonshotai__Kimi-K3.1-Pro.json": {
+      "match/header_ok": 6
+    },
     "moonshotai__Kimi-K3.json": {
       "match/header_ok": 6
     },
@@ -163,6 +166,7 @@
     "moonshotai__Kimi-K2-Instruct.json": "d59da0e5059bc1cd",
     "moonshotai__Kimi-K2-Thinking.json": "18a1d25dfe61bc02",
     "moonshotai__Kimi-K2.5.json": "5985491387f0ee8e",
+    "moonshotai__Kimi-K3.1-Pro.json": "98d0baa984c769cc",
     "moonshotai__Kimi-K3.json": "98d0baa984c769cc",
     "nvidia__NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.json": "045d0aa5ce9919c0",
     "nvidia__NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16.json": "85b7953baed05e7f",
@@ -209,6 +213,7 @@
     "moonshotai__Kimi-K2-Instruct.json": 6,
     "moonshotai__Kimi-K2-Thinking.json": 9,
     "moonshotai__Kimi-K2.5.json": 9,
+    "moonshotai__Kimi-K3.1-Pro.json": 6,
     "moonshotai__Kimi-K3.json": 6,
     "nvidia__NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.json": 2,
     "nvidia__NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16.json": 4,

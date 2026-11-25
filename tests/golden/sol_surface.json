@@ -34147,6 +34147,120 @@
       }
     }
   },
+  "moonshotai__Kimi-K3.1-Pro.json|eight": {
+    "model": {
+      "constant_kv_bytes_per_rank": 56807424.0,
+      "max_batch_per_gpu": 0,
+      "max_tokens_per_gpu": 0,
+      "per_token_kv_bytes_per_rank": 18912.0,
+      "static_kv_bytes_per_rank": 0.0,
+      "total_params": 2779663004416,
+      "weight_bytes_per_rank": 205413665792.0
+    },
+    "ops": {
+      "decode": {
+        "by_op": {},
+        "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "row_digests": {},
+        "rows": 0
+      },
+      "prefill": {
+        "by_op": {},
+        "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "row_digests": {},
+        "rows": 0
+      }
+    },
+    "phases": {
+      "decode": {
+        "access_bytes_per_rank": null,
+        "activation_bytes_per_rank": null,
+        "activation_read_bytes_per_rank": null,
+        "activation_write_bytes_per_rank": null,
+        "batch": null,
+        "flops_per_step": null,
+        "kv_read_bytes_per_rank": null,
+        "mem_read_bytes": null,
+        "mem_write_bytes": null,
+        "metadata_read_bytes_per_rank": null,
+        "t_sol_s": null,
+        "time_unpublished_reason": "weights (191.31 GiB) + recurrent state (0.05 GiB) exceed usable HBM (72.00 GiB) on H100-SXM at this parallel config. Raise TP/EP or use a smaller-weight model.",
+        "weight_read_bytes_per_rank": null
+      },
+      "prefill": {
+        "access_bytes_per_rank": null,
+        "activation_bytes_per_rank": null,
+        "activation_read_bytes_per_rank": null,
+        "activation_write_bytes_per_rank": null,
+        "batch": null,
+        "flops_per_step": null,
+        "kv_read_bytes_per_rank": null,
+        "mem_read_bytes": null,
+        "mem_write_bytes": null,
+        "metadata_read_bytes_per_rank": null,
+        "t_sol_s": null,
+        "time_unpublished_reason": "weights (191.31 GiB) + recurrent state (0.05 GiB) exceed usable HBM (72.00 GiB) on H100-SXM at this parallel config. Raise TP/EP or use a smaller-weight model.",
+        "weight_read_bytes_per_rank": null
+      }
+    }
+  },
+  "moonshotai__Kimi-K3.1-Pro.json|single": {
+    "model": {
+      "constant_kv_bytes_per_rank": 454459392.0,
+      "max_batch_per_gpu": 0,
+      "max_tokens_per_gpu": 0,
+      "per_token_kv_bytes_per_rank": 18912.0,
+      "static_kv_bytes_per_rank": 0.0,
+      "total_params": 2779663004416,
+      "weight_bytes_per_rank": 1560322659328.0
+    },
+    "ops": {
+      "decode": {
+        "by_op": {},
+        "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "row_digests": {},
+        "rows": 0
+      },
+      "prefill": {
+        "by_op": {},
+        "digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "row_digests": {},
+        "rows": 0
+      }
+    },
+    "phases": {
+      "decode": {
+        "access_bytes_per_rank": null,
+        "activation_bytes_per_rank": null,
+        "activation_read_bytes_per_rank": null,
+        "activation_write_bytes_per_rank": null,
+        "batch": null,
+        "flops_per_step": null,
+        "kv_read_bytes_per_rank": null,
+        "mem_read_bytes": null,
+        "mem_write_bytes": null,
+        "metadata_read_bytes_per_rank": null,
+        "t_sol_s": null,
+        "time_unpublished_reason": "weights (1453.16 GiB) + recurrent state (0.42 GiB) exceed usable HBM (72.00 GiB) on H100-SXM at this parallel config. Raise TP/EP or use a smaller-weight model.",
+        "weight_read_bytes_per_rank": null
+      },
+      "prefill": {
+        "access_bytes_per_rank": null,
+        "activation_bytes_per_rank": null,
+        "activation_read_bytes_per_rank": null,
+        "activation_write_bytes_per_rank": null,
+        "batch": null,
+        "flops_per_step": null,
+        "kv_read_bytes_per_rank": null,
+        "mem_read_bytes": null,
+        "mem_write_bytes": null,
+        "metadata_read_bytes_per_rank": null,
+        "t_sol_s": null,
+        "time_unpublished_reason": "weights (1453.16 GiB) + recurrent state (0.42 GiB) exceed usable HBM (72.00 GiB) on H100-SXM at this parallel config. Raise TP/EP or use a smaller-weight model.",
+        "weight_read_bytes_per_rank": null
+      }
+    }
+  },
   "moonshotai__Kimi-K3.json|eight": {
     "model": {
       "constant_kv_bytes_per_rank": 56807424.0,

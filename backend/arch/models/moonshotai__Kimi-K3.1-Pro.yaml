@@ -1,0 +1,4 @@
+# SGLang flashmla_kv serving reference (commit 1b2870d33de7b5f31844fd74e97eea6d7896c53a).
+base: kimi_k31
+match:
+  model_id: [moonshotai/Kimi-K3.1-Pro]
