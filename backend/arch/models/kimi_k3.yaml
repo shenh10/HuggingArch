@@ -123,8 +123,8 @@ blocks:
       # Layer 0: `block_residual` is empty, so attention reads `x` directly;
       # the layer's self_attention_res_* weights are stored and never read
       # (sglang loads them and returns before scoring: attn_residual.py:487-492).
-      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "modeling_kimi_linear.py:986-993; sglang layers/attn_residual.py:487-492 (nvb == 0 returns before the score weights)" } }
-      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "modeling_kimi_linear.py:986-993; sglang layers/attn_residual.py:487-492 (nvb == 0 returns before the score weights)" } }
+      self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "modeling_kimi_linear.py:986-993; sglang layers/attn_residual.py:487-492 (v0.5.22), :507-513 (1b2870d3): nvb == 0 returns before the score weights" } }
+      self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }], stored_without_graph_reader: { kind: forward_unread, reason: "layer 0's AttnRes history is empty, so no combine runs before attention", source_anchor: "modeling_kimi_linear.py:986-993; sglang layers/attn_residual.py:487-492 (v0.5.22), :507-513 (1b2870d3): nvb == 0 returns before the score weights" } }
       input_layernorm:           { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
       self_attn:                 { op: kimi_k3_kda_attention, in: input_layernorm }
       # torch.cat([empty, x]): the history the MLP combine reads.
@@ -173,13 +173,15 @@ blocks:
     outputs: [mlp_residual]
 
   block_mla_moe:
+    params:
+      attn: { kind: component }
     reads: [block_residual]
     graph:
       self_attention_res_norm.weight:   { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
       self_attention_res_proj.weight:   { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
       attn_res:                  { op: attn_res_combine, in: [x, block_residual, self_attention_res_norm.weight, self_attention_res_proj.weight] }
       input_layernorm:           { op: rmsnorm, in: attn_res, dim: d_model, weight_axes: [{ replicated: true }] }
-      self_attn:                 { op: mla_output_gate_attention, in: input_layernorm }
+      self_attn:                 { op: <attn>, in: input_layernorm }
       attn_residual:             { op: add, in: [x, self_attn], dim: d_model }
       mlp_res_norm.weight:              { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
       mlp_res_proj.weight:              { op: parameter_tensor, shape: ["1", d_model], weight_axes: [{ replicated: true }, { replicated: true }] }
@@ -248,7 +250,7 @@ model:
         - { type: kda_moe, rest: true }
       map:
         kda_dense_first: { template: block_kda_dense_first }
-        mla_moe:         { template: block_mla_moe }
+        mla_moe:         { template: block_mla_moe, params: { attn: mla_output_gate_attention } }
         kda_moe_start:   { template: block_kda_moe_start }
         kda_moe:         { template: block_kda_moe }
   # After the last layer: one more combine over the whole history

@@ -37,6 +37,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from backend.arch.activation_formats import ACTIVATION_FORMATS
+from backend.arch.dtypes import canonical
 from backend.arch.eval.scheme_dialect import eval_predicate
 
 
@@ -210,6 +211,11 @@ class QuantScheme:
     # writes UE8M0 scales at `.scale`, the `fp8_ue8m0` layout). Siblings
     # only: a packed weight is told by the method's own variants.
     also_stores: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
+    # Sub-format delegation: `(field, value, scheme)` — when
+    # `quantization_config.<field> == value`, `resolve_scheme` selects
+    # `scheme` wholesale instead of this umbrella method (e.g.
+    # compressed-tensors `format: mxfp4-pack-quantized`).
+    delegates_to: Tuple[Tuple[str, str, str], ...] = field(default_factory=tuple)
 
     # Whether, and how, a DEPLOYMENT may run weights in this scheme when the
     # checkpoint saved them otherwise (a precision profile's weight rule).
@@ -327,10 +333,10 @@ def _parse_format_variants(raw: Dict[str, Any], scheme_name: str) -> Dict[str, F
             continue
         pf = vraw.get("packing_factor")
         pf_map = vraw.get("packing_factor_per_num_bits")
-        if pf is not None and pf_map is not None:
+        if (pf is None) == (pf_map is None):
             raise ValueError(
                 f"quant_schemes/{scheme_name}.yaml format_variants[{variant_name!r}]: "
-                f"set EITHER `packing_factor` OR `packing_factor_per_num_bits`, not both."
+                f"set EITHER `packing_factor` OR `packing_factor_per_num_bits` (exactly one)."
             )
         if pf is not None and pf not in _ALLOWED_PACKING_FACTORS:
             raise ValueError(
@@ -349,12 +355,25 @@ def _parse_format_variants(raw: Dict[str, Any], scheme_name: str) -> Dict[str, F
 
         sd = vraw.get("storage_dtype")
         sd_map = vraw.get("storage_dtype_per_num_bits")
-        if sd is not None and sd_map is not None:
+        if (sd is None) == (sd_map is None):
             raise ValueError(
                 f"quant_schemes/{scheme_name}.yaml format_variants[{variant_name!r}]: "
-                f"set EITHER `storage_dtype` OR `storage_dtype_per_num_bits`, not both."
+                f"set EITHER `storage_dtype` OR `storage_dtype_per_num_bits` (exactly one)."
             )
-
+        if sd is not None:
+            canonical(str(sd))
+        if isinstance(sd_map, dict):
+            for dtype_val in sd_map.values():
+                canonical(str(dtype_val))
+            if isinstance(pf_map, dict):
+                missing_bits = {
+                    int(nb) for nb, factor in pf_map.items() if int(factor) > 1
+                } - {int(nb) for nb in sd_map}
+                if missing_bits:
+                    raise ValueError(
+                        f"quant_schemes/{scheme_name}.yaml format_variants[{variant_name!r}]: "
+                        f"storage_dtype_per_num_bits is missing packed bit widths {sorted(missing_bits)}."
+                    )
         out[variant_name] = FormatVariant(
             name=variant_name,
             packing_factor=pf,
@@ -597,6 +616,7 @@ def _load_quant_schemes() -> Dict[str, QuantScheme]:
             valid_status=valid_status,
             default_fields=tuple(sorted(defaults_raw.items())),
             also_stores=_parse_also_stores(data.get("also_stores") or [], name),
+            delegates_to=_parse_also_stores(data.get("delegates_to") or [], name, key="delegates_to"),
             deployment_fields=tuple(sorted(
                 (data.get("deployment_fields") or {}).items())),
             activation_options=_parse_activation_options(
@@ -604,11 +624,13 @@ def _load_quant_schemes() -> Dict[str, QuantScheme]:
             activation=_parse_activation(data.get("activation"), name),
         )
     for name, scheme in out.items():
-        for _field, _value, other in scheme.also_stores:
-            if other not in out:
-                raise ValueError(
-                    f"quant_schemes/{name}.yaml: also_stores names scheme "
-                    f"{other!r}, which no file in quant_schemes/ registers.")
+        for field_name, rows in (("also_stores", scheme.also_stores),
+                                 ("delegates_to", scheme.delegates_to)):
+            for _field, _value, other in rows:
+                if other not in out:
+                    raise ValueError(
+                        f"quant_schemes/{name}.yaml: {field_name} names scheme "
+                        f"{other!r}, which no file in quant_schemes/ registers.")
     return out
 
 
@@ -734,16 +756,18 @@ def _parse_activation_options(raw: Any, scheme_name: str
     return tuple(out)
 
 
-def _parse_also_stores(raw: Any, scheme_name: str) -> Tuple[Tuple[str, str, str], ...]:
-    """Parse `also_stores:` — `{field, equals, scheme}` rows."""
+def _parse_also_stores(
+    raw: Any, scheme_name: str, *, key: str = "also_stores"
+) -> Tuple[Tuple[str, str, str], ...]:
+    """Parse `also_stores:` / `delegates_to:` — `{field, equals, scheme}` rows."""
     if not isinstance(raw, list):
         raise ValueError(
-            f"quant_schemes/{scheme_name}.yaml: also_stores must be a list.")
+            f"quant_schemes/{scheme_name}.yaml: {key} must be a list.")
     out = []
     for entry in raw:
         if not isinstance(entry, dict) or set(entry) != {"field", "equals", "scheme"}:
             raise ValueError(
-                f"quant_schemes/{scheme_name}.yaml: each also_stores row is "
+                f"quant_schemes/{scheme_name}.yaml: each {key} row is "
                 f"exactly {{field, equals, scheme}}; got {entry!r}.")
         out.append((str(entry["field"]), str(entry["equals"]), str(entry["scheme"])))
     return tuple(out)
@@ -818,10 +842,13 @@ def resolve_scheme(config: Optional[Dict[str, Any]]) -> tuple:
     if method and method not in QUANT_SCHEMES:
         return SCHEME_NONE, 0, method
     scheme = QUANT_SCHEMES.get(method, SCHEME_NONE)
+    for key, value, target in scheme.delegates_to:
+        if str(qc.get(key)) == value:
+            scheme = QUANT_SCHEMES[target]
+            break
     also = [QUANT_SCHEMES[other] for key, value, other in scheme.also_stores
             if str(qc.get(key)) == value]
     return _with_layouts(scheme, also), scheme.read_num_bits(qc), None
-
 
 def _with_layouts(scheme: QuantScheme, also) -> QuantScheme:
     """`scheme` carrying the metadata siblings of the `also_stores` layouts
@@ -857,26 +884,59 @@ def is_quantization_metadata(name: str, scheme: QuantScheme) -> bool:
     return any(name.endswith(sib.suffix) for sib in scheme.metadata_siblings)
 
 
+class PackedStorageMismatch(ValueError):
+    """A dedicated packed weight suffix has the wrong physical dtype."""
+
+
 def packed_unpack_factor(name: str, dtype: str, num_bits: int,
                           scheme: QuantScheme) -> int:
     """Elements-per-packed-unit factor for `name` under `scheme`.
 
     Driven by `scheme.format_variants[*].weight_storage_suffix` — find
-    the variant whose suffix this name ends with and apply its
-    `packing_factor` (or `packing_factor_per_num_bits[num_bits]`).
+    the variant whose suffix AND storage dtype match this tensor, then
+    apply its `packing_factor` (or `packing_factor_per_num_bits[num_bits]`).
     Returns 1 when no variant declares packing for this name. A variant that
     packs by bit width and has no entry for `num_bits` refuses: the config
     did not state a width this scheme packs at, and 1 would undercount.
 
-    `dtype` is no longer consulted — the variant's declared storage
-    word size encodes packing implicitly via packing_factor. Kept in
-    the signature for backward compat.
+    Matching the suffix alone is insufficient for mixed checkpoints: a
+    scheme may store packed U8 under `.weight` alongside unquantized BF16
+    tensors using that same suffix. `.weight` is the one suffix a method
+    shares with its unquantized tensors, so a header-dtype mismatch there
+    means "not this variant" and scans on for a 1. Any other packing
+    suffix (`.weight_packed` / `.qweight` / `_blocks`) failing its declared
+    storage dtype means the header and the scheme disagree — refused, since
+    the alternative is the silent-under-count path 1 would take; the scheme
+    remains the sole owner of the unpacking factor.
     """
     if not scheme.format_variants:
         return 1
+    header_dtype = canonical(dtype)
     for fv in scheme.format_variants.values():
         if not name.endswith(fv.weight_storage_suffix):
             continue
+        if fv.packing_factor == 1:
+            continue
+        if fv.storage_dtype is None and not fv.storage_dtype_per_num_bits:
+            raise ValueError(
+                f"{name}: scheme {scheme.name!r} variant {fv.name!r} declares "
+                f"packing without a storage_dtype")
+        if fv.storage_dtype_per_num_bits:
+            storage_dtype = fv.storage_dtype_per_num_bits.get(num_bits)
+            if storage_dtype is None:
+                raise ValueError(
+                    f"{name}: scheme {scheme.name!r} declares storage dtypes "
+                    f"per bit width {sorted(fv.storage_dtype_per_num_bits)}, "
+                    f"and the quantization config states num_bits={num_bits}")
+        else:
+            storage_dtype = fv.storage_dtype
+        if header_dtype != canonical(storage_dtype):
+            if fv.weight_storage_suffix == ".weight":
+                continue
+            raise PackedStorageMismatch(
+                f"{name}: scheme {scheme.name!r} stores "
+                f"`*{fv.weight_storage_suffix}` as {canonical(storage_dtype)}, "
+                f"but the header records {header_dtype}")
         if fv.packing_factor_per_num_bits:
             if num_bits not in fv.packing_factor_per_num_bits:
                 raise ValueError(
@@ -885,11 +945,12 @@ def packed_unpack_factor(name: str, dtype: str, num_bits: int,
                     f"{sorted(fv.packing_factor_per_num_bits)}, and the "
                     f"quantization config states num_bits={num_bits}")
             pf = fv.packing_factor_per_num_bits[num_bits]
-        else:
+        elif fv.packing_factor is not None:
             pf = fv.packing_factor
-        if pf and pf > 1:
+        else:
+            raise ValueError(
+                f"{name}: scheme {scheme.name!r} variant {fv.name!r} declares "
+                f"no packing_factor")
+        if pf > 1:
             return pf
-        # Variant matches but doesn't pack (e.g. fp8 default `.weight`
-        # with packing_factor=1) — keep searching for a better-matching
-        # variant before giving up.
     return 1

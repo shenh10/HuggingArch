@@ -26,7 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.corpus_pins.decisions import tp_split
 from tools.corpus_pins.decisions.framework_split import (
-    MANIFEST, SOURCE_KINDS, FrameworkSplit, Oracle, ReferenceSplit, VllmSplit)
+    MANIFEST, SOURCE_KINDS, FrameworkSplit, Oracle, ReferenceSplit, SglangSplit,
+    VllmSplit)
 from tools.corpus_pins.decisions.tp_split import FRAMEWORK, VERDICTS, framework_entry
 
 # ── vLLM: the class name, through the table ─────────────────────────────
@@ -390,8 +391,32 @@ class Head(nn.Module):
 
 
 def test_every_kind_is_defined_once(tmp_path):
-    assert list(SOURCE_KINDS) == [VllmSplit.kind, ReferenceSplit.kind]
+    assert list(SOURCE_KINDS) == [VllmSplit.kind, SglangSplit.kind,
+                                 ReferenceSplit.kind]
     assert all(kind == impl.kind for kind, impl in SOURCE_KINDS.items())
+
+
+def test_sglang_staging_preserves_framework_and_refuses_unknown_groups(tmp_path):
+    source = _staged(tmp_path, (("python/sglang/srt/models/test.py", '''
+class Model:
+    def __init__(self):
+        self.embed_tokens = VocabParallelEmbedding(vocab, hidden)
+        self.lm_head = ParallelLMHead(vocab, hidden)
+        self.norm = RMSNorm(hidden)
+        self.output_attn_res_proj = ReplicatedLinear(hidden, 1)
+        self.custom = ColumnParallelLinear(hidden, hidden, parallel_group=group)
+        self.unknown = SomeExpertFactory(hidden)
+'''),), {"kind": "sglang", "revision": "sglang-test-revision"})
+    oracle = Oracle([source])
+    for node in ("embed_tokens", "lm_head"):
+        answer = oracle.answer(node)
+        assert answer.placement == "split"
+        assert answer.decided_by == "sglang"
+    for node in ("norm", "output_attn_res_proj"):
+        assert oracle.answer(node).placement == "replicated"
+    for node in ("custom", "unknown"):
+        assert oracle.answer(node).placement is None
+    assert source.provenance == "SGLang sglang-test-revision"
 
 
 # ── the migrated record ─────────────────────────────────────────────────

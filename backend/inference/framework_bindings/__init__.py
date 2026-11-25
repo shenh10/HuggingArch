@@ -233,6 +233,41 @@ class ServingDeployment:
 #: `linear_backend=auto` or `flash_attn_version=3`).
 ServerOption = Union[bool, str, int]
 
+#: A flag's required value: one option, or a frozenset of options the YAML
+#: list spelling puts together — `server_flag.value: [auto, flashinfer_mxfp4]`
+#: holds when the deployment states any one of them. A list of several
+#: `server_flag` *mappings* is the other axis (`DispatchCondition.flag_conditions`):
+#: every one of those holds.
+ServerValue = Union[ServerOption, frozenset]
+
+
+def _option(item: Any) -> bool:
+    """Whether `item` is one server option (a truthy one, never a list)."""
+    return (isinstance(item, (bool, int))
+            or (isinstance(item, str) and bool(item.strip())))
+
+
+def _holds_option(fact: ServerOption, value: ServerValue) -> bool:
+    """Whether the deployment's `fact` satisfies one required `value`.
+
+    A frozenset is the `value: [...]` any-of spelling; a scalar is equality.
+    """
+    return fact in value if isinstance(value, frozenset) else fact == value
+
+
+def _server_value_as_yaml(value: ServerValue) -> Any:
+    """`value` as the YAML `server_flag.value` spelling: a sorted list for a
+    frozenset (the `[...]` any-of), the option itself otherwise."""
+    return sorted(value) if isinstance(value, frozenset) else value
+
+
+def _server_values_overlap(left: ServerValue, right: ServerValue) -> bool:
+    """Whether two required flag values can name the same deployment fact —
+    the any-of spelling intersects, a scalar equals."""
+    def options(value: ServerValue) -> frozenset:
+        return value if isinstance(value, frozenset) else frozenset((value,))
+    return bool(options(left) & options(right))
+
 
 def capability(text: str, where: str = "compute capability"
                ) -> Tuple[int, int]:
@@ -360,7 +395,9 @@ class DispatchCondition:
       sets it through the API (`framework_options`); unset, the default holds.
       A non-boolean choice is stated the same way: vLLM's audited linear
       path is `linear_backend=auto`, while another request may say
-      `flashinfer_cutedsl`.
+      `flashinfer_cutedsl`. A list `value` is the any-of spelling — the flag
+      holds on any listed option — and a LIST of `server_flag` mappings asks
+      every one of them (a conjunction, read through `flag_conditions`).
     * `activation_dtype: [...]` — the deployment's activation dtype.
     * `kv_block_size: [<positive page>, ...]` — the paged-KV page the request
       deploys with. The binding's default is resolved once by the caller
@@ -401,7 +438,21 @@ class DispatchCondition:
     below_compute_capability: Optional[Tuple[int, int]] = None
     unquantized_bf16_launch: Optional[bool] = None
     graph: GraphCondition = field(default_factory=GraphCondition)
-    server_flag_value: ServerOption = True
+    server_flag_value: ServerValue = True
+    #: The conjuncts a list-valued `server_flag` declaration added beyond the
+    #: first: `(name, default, required value)` each, all of which must hold.
+    additional_server_flags: Tuple[Tuple[str, ServerOption, ServerValue], ...] = ()
+
+    def flag_conditions(self) -> Tuple[Tuple[str, ServerOption, ServerValue], ...]:
+        """Every `(name, default, required value)` this condition asks, in file
+        order — `server_flag` first, then `additional_server_flags`. A single
+        mapping keeps the historical `server_flag` / `server_flag_value`
+        spelling; a `when.server_flag` LIST of mappings is the way to ask
+        several flags at once, each of which must hold."""
+        first = (() if self.server_flag is None else
+                 ((self.server_flag[0], self.server_flag[1],
+                   self.server_flag_value),))
+        return first + self.additional_server_flags
 
     KEYS = frozenset({"server_flag", "activation_dtype", "device",
                       "kv_block_size", "tensor_parallel",
@@ -448,9 +499,8 @@ class DispatchCondition:
         activation = (deployment.activation_dtype if launch is None
                       else launch.activation_dtype)
         return (self.holds_for_card(deployment)
-                and (self.server_flag is None
-                or deployment.flag(*self.server_flag)
-                    == self.server_flag_value)
+                and all(_holds_option(deployment.flag(name, default), value)
+                        for name, default, value in self.flag_conditions())
                 and _among(activation, self.activation_dtype)
                 and (self.unquantized_bf16_launch is None
                      or (launch is not None
@@ -483,10 +533,19 @@ class DispatchCondition:
         """The condition as the binding file states it (set keys only)."""
         out: Dict[str, Any] = {}
         if self.server_flag is not None:
-            out["server_flag"] = {"name": self.server_flag[0],
-                                  "default": self.server_flag[1]}
-            if self.server_flag_value != self.server_flag[1]:
-                out["server_flag"]["value"] = self.server_flag_value
+            name, default = self.server_flag
+            if self.additional_server_flags:
+                out["server_flag"] = [
+                    {"name": flag_name, "default": flag_default,
+                     "value": _server_value_as_yaml(flag_value)}
+                    for flag_name, flag_default, flag_value
+                    in self.flag_conditions()
+                ]
+            else:
+                out["server_flag"] = {"name": name, "default": default}
+                if self.server_flag_value != default:
+                    out["server_flag"]["value"] = _server_value_as_yaml(
+                        self.server_flag_value)
         for key, value in (("architectures", self.graph.architectures),
                            ("excluded_architectures",
                             self.graph.excluded_architectures),
@@ -535,32 +594,65 @@ class DispatchCondition:
             raise ValueError(
                 f"{where}: `when` keys {unknown} are not in the vocabulary "
                 f"{sorted(allowed)}")
-        flag = raw.get("server_flag")
-        value = True
-        if flag is not None:
-            def option(item: Any) -> bool:
-                return (isinstance(item, (bool, int))
-                        or (isinstance(item, str) and bool(item.strip())))
-            if (not isinstance(flag, dict)
-                    or not {"name", "default"} <= set(flag)
-                    or not set(flag) <= {"name", "default", "value"}
-                    or not isinstance(flag["name"], str)
-                    or (isinstance(flag["name"], str) and not flag["name"])
-                    or not option(flag["default"])
-                    or not option(flag.get("value", flag["default"]))):
-                raise ValueError(
-                    f"{where}: `when.server_flag` is "
-                    f"{{ name: <server argument>, default: <bool, string, "
-                    f"or integer>, value: <that type, default when "
-                    f"omitted> }}")
-            # Boolean switches preserve Batch 1's spelling: an omitted value
-            # means TRUE even when the framework's default is false. A
-            # choice-valued selector instead keeps its declared default when
-            # the request does not state one.
-            value = flag.get(
-                "value", True if isinstance(flag["default"], bool)
-                else flag["default"])
-            flag = (flag["name"], flag["default"])
+        flag_raw = raw.get("server_flag")
+        flag: Optional[Tuple[str, ServerOption]] = None
+        additional_flags: Tuple[Tuple[str, ServerOption, ServerValue], ...] = ()
+        value: ServerValue = True
+        if flag_raw is not None:
+            def parse_flag(item: Any
+                           ) -> Tuple[str, ServerOption, ServerValue]:
+                if (not isinstance(item, dict)
+                        or not {"name", "default"} <= set(item)
+                        or not set(item) <= {"name", "default", "value"}
+                        or not isinstance(item["name"], str)
+                        or not item["name"]
+                        or not _option(item["default"])):
+                    raise ValueError(
+                        f"{where}: `when.server_flag` is "
+                        f"{{ name: <server argument>, default: <bool, "
+                        f"string, or integer>, value: <that type or a list "
+                        f"of them, default when omitted> }}; a list of these "
+                        f"mappings asks every one of them")
+                default = item["default"]
+                if "value" not in item:
+                    # Boolean switches keep the historical spelling: an
+                    # omitted value means TRUE even when the default is
+                    # false. A choice-valued selector keeps its declared
+                    # default when the request does not state one.
+                    return item["name"], default, (
+                        True if isinstance(default, bool) else default)
+                stated = item["value"]
+                if isinstance(stated, list):
+                    if not stated or not all(_option(v) and type(v) is type(default) for v in stated):
+                        raise ValueError(
+                            f"{where}: `when.server_flag.value` is one option "
+                            f"or a non-empty list of them")
+                    return item["name"], default, frozenset(stated)
+                if not _option(stated) or type(stated) is not type(default):
+                    raise ValueError(
+                        f"{where}: `when.server_flag.value` is one option "
+                        f"or a non-empty list of them")
+                return item["name"], default, stated
+
+            if isinstance(flag_raw, list):
+                if not flag_raw or not all(isinstance(item, dict)
+                                           for item in flag_raw):
+                    raise ValueError(
+                        f"{where}: a `when.server_flag` list states two or "
+                        f"more `{{name, default, value}}` mappings")
+                parsed = tuple(parse_flag(item) for item in flag_raw)
+                flags_names = [name for name, _d, _v in parsed]
+                if len(set(flags_names)) != len(flags_names):
+                    raise ValueError(
+                        f"{where}: `when.server_flag` conjuncts must name "
+                        f"distinct flags, got {flags_names}")
+                flag = (parsed[0][0], parsed[0][1])
+                value = parsed[0][2]
+                additional_flags = parsed[1:]
+            else:
+                name, default, parsed_value = parse_flag(flag_raw)
+                flag = (name, default)
+                value = parsed_value
 
         def names(key: str) -> Tuple[str, ...]:
             value = raw.get(key) or []
@@ -682,6 +774,7 @@ class DispatchCondition:
                                  roles=declared_roles,
                                  routed=routed,
                                  block_reads_stream=reads_stream),
+            additional_server_flags=additional_flags,
             server_flag_value=value)
 
 
@@ -1332,30 +1425,58 @@ class FrameworkBinding:
                 "`implementations_for(fused_op)`")
         return impls[0] if impls else None
 
-    def precision_launches_for(self) -> Tuple[PrecisionLaunch, ...]:
-        """The precision launches this deployed framework takes.
+    @staticmethod
+    def _precision_program_matches(when: DispatchCondition, program: Any,
+                                   analysis: Any) -> bool:
+        """The walk half of a precision launch's `when:` — the framework's own
+        dispatch key (`architectures` / `excluded_architectures` / `phase`),
+        read by the same matcher every other binding fact uses. A condition
+        that asks none of those admits every walk; one that names a phase
+        needs the walk it ran (`analysis`) and refuses to guess without it."""
+        if not when.graph.asks_program():
+            return True
+        if when.graph.phase and analysis is None:
+            return False
+        return when.graph.admits_program(program, analysis)
+
+    def precision_launches_for(self, program: Any, analysis: Any = None
+                               ) -> Tuple[PrecisionLaunch, ...]:
+        """Ordered launches this deployment AND this walk (`program`) admit.
 
         An entry with alternative `when:` conditions is selected when any one
-        holds, exactly as a fused-op implementation is. An unknown deployment
-        fact makes a condition false: no launch is guessed for a card the
-        caller did not name.
+        holds, exactly as a fused-op implementation is. Both halves of each
+        `when:` are answered: the deployment's (`holds_for`) and the whole
+        walk's (`_precision_program_matches`); an unknown fact on either side
+        makes a condition false. `program` is required so a caller cannot
+        silently drop an architecture/phase-gated launch by not naming one.
         """
         return tuple(launch for launch in self.precision_launches
                      if not launch.whens
                      or any(when.holds_for(self.deployment)
+                            and self._precision_program_matches(
+                                when, program, analysis)
                             for when in launch.whens))
 
-    def unavailable_precision_launches_for(self) -> Tuple[PrecisionLaunch, ...]:
-        """Launch candidates this deployment did not satisfy, in file order.
+    def unavailable_precision_launches_for(self, program: Any,
+                                           analysis: Any = None
+                                           ) -> Tuple[PrecisionLaunch, ...]:
+        """Program-applicable launch candidates missing deployment facts, in
+        file order.
 
-        They remain audit facts, not selectable entries: `ResolvedPrecision`
-        records one as a selector gap when its scheme/request matches but a
-        required deployment fact (for example an explicit MoE backend) is
-        absent.
+        A launch for a different architecture is not an audit gap for this
+        walk, and a missing walk fact cannot invent one. They remain audit
+        facts, not selectable entries: `ResolvedPrecision` records one as a
+        selector gap when its scheme/request matches but a required
+        deployment fact (for example an explicit MoE backend) is absent.
         """
         return tuple(launch for launch in self.precision_launches
-                     if launch.whens and not any(
+                     if launch.whens
+                     and any(self._precision_program_matches(
+                         when, program, analysis) for when in launch.whens)
+                     and not any(
                          when.holds_for(self.deployment)
+                         and self._precision_program_matches(
+                             when, program, analysis)
                          for when in launch.whens))
 
     def dispatch_for(self, op: str, program: Any = None,
@@ -1403,19 +1524,14 @@ class FrameworkBinding:
 
     def server_flag_names(self) -> FrozenSet[str]:
         """The server flags this binding's conditions read
-        (`DispatchCondition.server_flag`)."""
-        return frozenset(when.server_flag[0]
-                         for _op, impl in self.op_implementations
-                         for when in impl.whens
-                         if when.server_flag is not None) | frozenset(
-                             when.server_flag[0]
-                             for dispatch in self.kernel_dispatches
-                             for when in dispatch.whens
-                             if when.server_flag is not None) | frozenset(
-                                 when.server_flag[0]
-                                 for launch in self.precision_launches
-                                 for when in launch.whens
-                                 if when.server_flag is not None)
+        (`DispatchCondition.flag_conditions` — every conjunct name, across
+        `op_implementations`, `kernel_dispatches`, `precision_launches` and
+        `edge_dtypes`)."""
+        entries = (*[impl for _op, impl in self.op_implementations],
+                   *self.kernel_dispatches, *self.precision_launches,
+                   *self.edge_dtypes)
+        return frozenset(name for entry in entries for when in entry.whens
+                         for name, _default, _value in when.flag_conditions())
 
     def deployed(self, deployment: ServingDeployment) -> "FrameworkBinding":
         """This binding, answering its conditions against `deployment`. A
@@ -1522,10 +1638,13 @@ def _conditions_can_overlap(left: DispatchCondition,
     value satisfies both.
     """
     if left.server_flag is not None and right.server_flag is not None:
-        if left.server_flag[0] != right.server_flag[0]:
-            return True
-        if left.server_flag_value != right.server_flag_value:
-            return False
+        left_flags = {name: value
+                      for name, _default, value in left.flag_conditions()}
+        right_flags = {name: value
+                       for name, _default, value in right.flag_conditions()}
+        for name in left_flags.keys() & right_flags.keys():
+            if not _server_values_overlap(left_flags[name], right_flags[name]):
+                return False
     for left_value, right_value in (
             (left.activation_dtype, right.activation_dtype),
             (left.kv_block_size, right.kv_block_size),
@@ -1840,6 +1959,13 @@ def _precision_launches(raw: Any, fname: str
         if not isinstance(anchor, str) or not anchor:
             raise ValueError(f"{where}: needs the `source_anchor` that shows "
                              "the framework selects this launch")
+        whens = _parse_whens(entry.get("when"), where)
+        allowed = _KERNEL_DISPATCH_WHEN - DispatchCondition.LAUNCH_KEYS
+        for when in whens:
+            if set(when.as_dict()) - allowed:
+                raise ValueError(
+                    f"{where}: precision launch conditions must be card, "
+                    "deployment or whole-program facts")
         out.append(PrecisionLaunch(
             name=str(name),
             schemes=tuple(schemes),
@@ -1848,7 +1974,7 @@ def _precision_launches(raw: Any, fname: str
             compute_dtype=compute,
             mma_dtypes=families,
             promotion_ladder=promotion_ladder,
-            whens=_parse_whens(entry.get("when"), where),
+            whens=whens,
             source_anchor=SourceAnchor.parse(anchor, where),
         ))
     return tuple(out)

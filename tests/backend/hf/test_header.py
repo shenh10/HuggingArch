@@ -90,3 +90,21 @@ def test_a_record_with_folded_names_is_refused():
            "pattern_counts": {"model.layers.X.mlp.gate_proj.weight": 3}}
     with pytest.raises(ValueError, match="no verbatim safetensors header"):
         metadata_from_record(old, source="snapshot org/m")
+
+
+def test_legacy_wrapper_record_recovers_only_its_declared_delegate():
+    import pytest
+    from backend.arch.quant_schemes import PackedStorageMismatch
+    from backend.arch.snapshots import load_snapshot
+    from backend.hf.metadata import metadata_from_record
+
+    snapshot = load_snapshot("moonshotai/Kimi-K3")
+    current = snapshot["metadata"]
+    legacy = {**current, "quant_scheme": "compressed-tensors"}
+    restored = metadata_from_record(
+        legacy, source="legacy snapshot", legacy_config=lambda: snapshot["config"])
+    expected = metadata_from_record(current, source="current snapshot")
+    assert restored["quant_scheme"] == expected["quant_scheme"]
+    assert restored["total_params"] == expected["total_params"]
+    with pytest.raises(PackedStorageMismatch):
+        metadata_from_record(legacy, source="unrelated config", legacy_config=lambda: {})

@@ -148,26 +148,95 @@ precision_launches:
   mxfp4_pack_quantized_trtllm_mxfp8:
     schemes: [mxfp4-pack-quantized]
     when:
-      device: [cuda]
-      min_compute_capability: "10.0"
-      below_compute_capability: "11.0"
-      server_flag: {name: flashinfer_mxfp4_moe_precision,
-                    default: default, value: default}
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - &precision_mxfp8 {name: flashinfer_mxfp4_moe_precision, default: default, value: default}
+          - &runner_exchange {name: moe_a2a_backend, default: none, value: none}
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        architectures: [MiMoV2ForCausalLM, MiMoV2FlashForCausalLM]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - *precision_mxfp8
+          - {name: moe_a2a_backend, default: none, value: none}
+      - &kimi_auto_mxfp8
+        device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration]
+        server_flag: [{name: moe_runner_backend, default: auto, value: auto}, *precision_mxfp8, *runner_exchange]
+      - <<: *kimi_auto_mxfp8
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+      - <<: *kimi_auto_mxfp8
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
     launch:
       activation: fp8_token_group32_ue8m0
       compute_dtype: F8_E4M3
       mma_dtypes: [F8_E4M3, MXFP4]
-    source_anchor: "Kimi-K3 resolves moe_runner_backend=auto to flashinfer_mxfp4 on SM100/103/107 (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:186-205) and MiMo-V2 does the same for its FP4-expert checkpoints (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:33-48) and Mxfp4MoEMethod takes its trtllm-gen entry point there (python/sglang/srt/layers/quantization/mxfp4.py:420-425); with flashinfer_mxfp4_moe_precision at its default (python/sglang/srt/arg_groups/fields/exec_.py:829-834) that launch quantises the activation to MXFP8 (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1086-1096) through _prepare_flashinfer_mxfp8_activations, FP8 E4M3 with UE8M0 scales over groups of 32 (python/sglang/srt/layers/quantization/mxfp4.py:78-117), and feeds trtllm_fp4_block_scale_routed_moe the MXFP4 weights beside it (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1137-1180)"
+    source_anchor: "Kimi-K3 resolves moe_runner_backend=auto to flashinfer_mxfp4 on SM100/103/107 and only for a pack-quantized checkpoint (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:186-205) and MiMo-V2 does the same for its FP4-expert checkpoints with no a2a backend (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:33-48); MegaMoE bypasses the runner (python/sglang/srt/layers/quantization/mxfp4.py:1438-1442; the FlashInfer MXFP4 fused runner registers the standard exchange in python/sglang/srt/layers/moe/moe_runner/flashinfer_cutlass.py:370); an explicit moe_runner_backend=flashinfer_mxfp4 reaches the same runner on any model, because Mxfp4MoEMethod reads only the backend flag and the platform, not the model (python/sglang/srt/layers/quantization/mxfp4.py:398, python/sglang/srt/layers/quantization/mxfp4.py:420-425). With flashinfer_mxfp4_moe_precision at its default (python/sglang/srt/arg_groups/fields/exec_.py:829-834) that trtllm-gen launch quantises the activation to MXFP8 (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1088-1096) through _prepare_flashinfer_mxfp8_activations, FP8 E4M3 with UE8M0 scales over groups of 32 (python/sglang/srt/layers/quantization/mxfp4.py:78-117)"
   mxfp4_pack_quantized_weight_only:
     schemes: [mxfp4-pack-quantized]
     when:
-      device: [cuda]
-      below_compute_capability: "10.0"
+      - device: [cuda]
+        below_compute_capability: "10.0"
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: [auto, triton, triton_kernel]}
+          - *runner_exchange
+      - &marlin_weight_only
+        device: [cuda]
+        min_compute_capability: "9.0"
+        below_compute_capability: "11.0"
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: marlin}
+          - *runner_exchange
+      - <<: *marlin_weight_only
+        min_compute_capability: "12.0"
+        below_compute_capability: "13.0"
+      - device: [cuda]
+        min_compute_capability: "9.0"
+        below_compute_capability: "10.0"
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - {name: flashinfer_mxfp4_moe_precision, default: default, value: [default, bf16]}
+          - *runner_exchange
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: flashinfer_mxfp4}
+          - &precision_bf16 {name: flashinfer_mxfp4_moe_precision, default: default, value: bf16}
+          - *runner_exchange
+      - device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "11.0"
+        architectures: [MiMoV2ForCausalLM, MiMoV2FlashForCausalLM]
+        server_flag:
+          - {name: moe_runner_backend, default: auto, value: auto}
+          - *precision_bf16
+          - {name: moe_a2a_backend, default: none, value: none}
+      - &kimi_auto_bf16
+        device: [cuda]
+        min_compute_capability: "10.0"
+        below_compute_capability: "10.1"
+        architectures: [KimiK3ForConditionalGeneration]
+        server_flag: [{name: moe_runner_backend, default: auto, value: auto}, *precision_bf16, *runner_exchange]
+      - <<: *kimi_auto_bf16
+        min_compute_capability: "10.3"
+        below_compute_capability: "10.4"
+      - <<: *kimi_auto_bf16
+        min_compute_capability: "10.7"
+        below_compute_capability: "10.8"
     launch:
       activation: none
       compute_dtype: BF16
       mma_dtypes: [BF16]
-    source_anchor: "Below SM100 the Kimi-K3 MoE override does not fire (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:195-199), so moe_runner_backend stays auto and Mxfp4MoEMethod builds the Triton runner (python/sglang/srt/layers/quantization/mxfp4.py:1443-1450), whose fused-MoE path dequantises the packed weight and multiplies at the activation's own width (python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py:808-818); MiMo-V2's SM90 branch pins marlin for the same packed weights (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:49-57), which dequantises them the same way (python/sglang/srt/layers/quantization/mxfp4.py:1460-1466)"
+    source_anchor: "Marlin on SM90/100/120 prepares and runs the MXFP4 × BF16 kernel (python/sglang/srt/layers/quantization/mxfp4.py:641-663; python/sglang/srt/layers/quantization/mxfp4.py:1509-1529); below SM100 the Kimi-K3 MoE override does not fire (python/sglang/srt/arg_groups/model_overrides/kimi_k3.py:195-199), so moe_runner_backend stays auto and Mxfp4MoEMethod builds the Triton runner (python/sglang/srt/layers/quantization/mxfp4.py:1443-1450), whose fused-MoE path dequantises the packed weight and multiplies at the activation's own width (python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py:808-818); MiMo-V2's SM90 branch pins marlin for the same packed weights (python/sglang/srt/arg_groups/model_overrides/mimo_v2.py:49-57), which dequantises them the same way (python/sglang/srt/layers/quantization/mxfp4.py:1460-1466). On SM100 the same flashinfer_mxfp4 runner keeps the operand BF16 when flashinfer_mxfp4_moe_precision=bf16: the trtllm-gen path takes the activation as it arrived, x_quant = x with x_scale = None (python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py:1077-1080)"
 
 edge_dtypes:
   deepseek_v4_router_logits_fp32:

@@ -623,9 +623,10 @@ def test_the_as_shipped_column_keeps_the_launches_selection_environment():
     binding = get_binding("vllm").deployed(deployment)
     walk = shared_walk(Deployment(program).at(batch=1, input_tokens=16))
     served = replace(walk, precision=walk.resolved_precision.with_launches(
-        binding.precision_launches_for(),
+        binding.precision_launches_for(program),
         peak_families=deployment.peak_families,
-        unavailable_launches=binding.unavailable_precision_launches_for()))
+        unavailable_launches=binding.unavailable_precision_launches_for(
+            program)))
     assert served.resolved_precision.launches, "the card took a launch"
     assert served.shipped_precision.launch_peak_families == (
         deployment.peak_families), "the as-shipped side kept the card"

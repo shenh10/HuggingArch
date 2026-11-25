@@ -257,6 +257,13 @@
     },
     "note": ""
   },
+  "moonshotai__Kimi-K3.1-Pro": {
+    "count": 16,
+    "families": {
+      "exp@1": 16
+    },
+    "note": ""
+  },
   "nvidia__NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": {
     "count": 0,
     "families": {},

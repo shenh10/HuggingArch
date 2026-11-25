@@ -146,9 +146,16 @@ def _reach(assigns: List[ast.Assign], start: int, names: Set[str],
 
 def quantised_writes(files: List[Dict[str, str]]) -> List[QuantisedWrite]:
     """Every write into a registered buffer that the forward quantises
-    first, one per (write, quantising call)."""
+    first, one per (write, quantising call).
+
+    A frozen source may also carry CUDA/C++ implementation evidence. Those
+    files are not Python AST inputs; the Python scan keeps only the `.py`
+    files (the same forward predicate `tools/corpus_admit.py` stages a
+    source with), rather than abort on a native kernel's syntax.
+    """
     trees = [(f.get("path") or "", ast.parse(f.get("text") or ""))
-             for f in files]
+             for f in files
+             if (f.get("path") or "").endswith(".py")]
     buffers = _buffers(trees)
     out: List[QuantisedWrite] = []
     for path, tree in trees:
