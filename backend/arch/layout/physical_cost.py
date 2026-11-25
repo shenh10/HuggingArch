@@ -195,7 +195,10 @@ def physical_traffic_geometry(
                 shapes = row.runtime_shape
                 resident = rep.resident
                 projected_metadata = []
-                for metadata_index, metadata in enumerate(resident.metadata):
+                layout = resident.block_scale_layout
+                tp = analysis.rule.world_degree(layout.world) if layout else 1
+                metadata_rows = resident.metadata if resident.has_rank_metadata(tp) else ()
+                for metadata_index, metadata in enumerate(metadata_rows):
                     key = (uid, index, segment_index, metadata_index)
                     metadata_row = resident_metadata.get(key)
                     if metadata_row is None:

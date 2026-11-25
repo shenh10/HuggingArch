@@ -75,6 +75,12 @@ def _scale_block_refusal(row: Dict[str, Any]) -> Optional[str]:
     order they are packed in is the framework's; sglang wants every merged
     partition whole and avoids DeepSeek-V3's case by not merging it).
 
+    An explicit `block_scale_layout` can instead state that checkpoint TP
+    chunks own the grids. The selected loader either merges whole chunks
+    (SGLang) or gathers heads (vLLM), then requantizes a fresh rank-local
+    fused grid. Logical Q/K/V boundaries need no block alignment on those
+    paths. See docs/fp8_tp_interleaved.md for the audited source contracts.
+
     A per-GROUP scale (GPTQ / AWQ, Marlin) is refused on a ragged reduction
     width whether or not it was cut: Marlin and AWQ raise on a K that is
     not a whole number of groups at any degree (vLLM `marlin_utils`
@@ -91,6 +97,10 @@ def _scale_block_refusal(row: Dict[str, Any]) -> Optional[str]:
     """
     ragged_uncut: Dict[Tuple[int, int], List[int]] = {}
     for shard in (MatrixShard.of(s) for s in row.get("weight_shards") or ()):
+        layout = shard.block_scale_layout
+        loader = layout.get("loader") if layout is not None else None
+        if layout is not None and layout.get("load_refusal"):
+            return str(layout["load_refusal"])
         gran = shard.granularity or ""
         if gran.startswith("per-tile:"):
             block_n, _, block_k = gran[len("per-tile:"):].partition("x")
@@ -110,6 +120,15 @@ def _scale_block_refusal(row: Dict[str, Any]) -> Optional[str]:
         grouped = gran.startswith("per-group:")
         if width_k and shard.k_local % width_k and (shard.cuts_k or grouped):
             return refusal("d_reduce", shard.k_local, width_k)
+        if loader:
+            # SGLang loads whole checkpoint chunks at matching TP. At lower
+            # TP it dequantizes those chunks, deinterleaves Q/K/V and
+            # requantizes the entire fused rank matrix, padding its final
+            # block. vLLM can also gather individual heads from those
+            # chunks and requantize at higher TP, replicating KV as needed.
+            # Neither loader cuts scale blocks at logical Q/K/V boundaries.
+            # The reduction-axis check above still applies.
+            continue
         if not width_n or not shard.n_local % width_n:
             continue
         if shard.cuts_n:
@@ -527,6 +546,24 @@ def _build_jobs_over_points(
             return [_encode_results(point.batch)]
         return _step_results(point)
 
+    def _analyze(*, batch_size: int, step_eval: Any, phase: str,
+                 **kwargs: Any) -> Any:
+        """One walk of the cell under the inputs every forward shares.
+
+        `allow_load_refusals` is on for every forward: a deployment the
+        selected loader refuses is still walked, and its refusal is
+        published on the per-rank scale surface (and read back as an
+        unplaced cell below) rather than aborting the whole plan. Every
+        forward goes through here, so adding a new one cannot drop the flag
+        again (a draft walk once did — the MTP plan vanished instead of the
+        one cell being marked unplaced).
+        """
+        return analyze(
+            resolved, parallel=parallel, framework_binding=binding,
+            batch_size=batch_size, step_eval=step_eval, phase=phase,
+            allow_load_refusals=True, precision=precision, gpu=card,
+            breakdown=False, **kwargs)
+
     def _encode_results(batch_size: int) -> List[_Forward]:
         # Each encoder over the stated media, in its own encode phase: the
         # shapes its kernels run at grow from the media's axes.
@@ -541,16 +578,12 @@ def _build_jobs_over_points(
         stacks = sorted({entry.stack for name, entry
                          in program.model_inputs.items()
                          if name in media and entry.stack is not None})
-        return [_Forward(analyze(
-            resolved, parallel=parallel, framework_binding=binding,
+        return [_Forward(_analyze(
             batch_size=batch_size, phase=phase,
             step_eval=evaluate_encode(resolved, parallel, stack=stack,
                                       batch=batch_size, media=media,
                                       precision=precision),
             timed_stacks=frozenset({stack}),
-            precision=precision,
-            gpu=card,
-            breakdown=False,
         )) for stack in stacks]
 
     def _step_results(point: PlanPoint) -> List[List[_Forward]]:
@@ -574,21 +607,19 @@ def _build_jobs_over_points(
             program, style="recursive", draft_tokens=point.s_verify - 1)
 
         def at_stage(stage: Optional[int]) -> _Forward:
-            return _Forward(analyze(
-                resolved, parallel=parallel, framework_binding=binding,
+            # Every stage reads the one walk of the cell (`StepCells`).
+            # The verify width binds the walk's own `n_verify` too, as
+            # the estimate's walk does (`overlay_walk`): a verify step
+            # takes logits at every verified position, not only the last.
+            return _Forward(_analyze(
                 batch_size=point.batch,
-                # Every stage reads the one walk of the cell (`StepCells`).
-                # The verify width binds the walk's own `n_verify` too, as
-                # the estimate's walk does (`overlay_walk`): a verify step
-                # takes logits at every verified position, not only the last.
                 step_eval=evaluate_step(
                     resolved, parallel, phase=phase, batch=point.batch,
                     input_tokens=point.seq_len,
                     output_tokens=avg_output_tokens,
                     s_prefix_cached=point.s_prefix_cached,
-                        s_verify=point.s_verify, precision=precision,
-                        ep_load_factor=point.ep_load_factor,
-                    cells=cells),
+                    s_verify=point.s_verify, precision=precision,
+                    ep_load_factor=point.ep_load_factor, cells=cells),
                 phase=phase,
                 # The pipeline stage whose rank these rows describe: what it
                 # runs, and the hops across its own exit cut
@@ -603,14 +634,10 @@ def _build_jobs_over_points(
                 # width, not at K+1. At K=0 the old whole-step behaviour
                 # remains: every aux stack the step walks is measurable.
                 include_aux_timing=draft is None,
-                precision=precision,
-                gpu=card,
-                breakdown=False,
             ))
 
         def draft_forward() -> _Forward:
-            return _Forward(analyze(
-                resolved, parallel=parallel, framework_binding=binding,
+            return _Forward(_analyze(
                 batch_size=point.batch,
                 step_eval=draft.step(
                     resolved, parallel,
@@ -625,9 +652,6 @@ def _build_jobs_over_points(
                 # account happened to bind.
                 stage=(parallel.pp - 1) if parallel.pp > 1 else None,
                 timed_stacks=draft.stacks,
-                precision=precision,
-                gpu=card,
-                breakdown=False,
             ), draft)
 
         # One rank per pipeline stage. A per-layer kernel's `count_per_step`

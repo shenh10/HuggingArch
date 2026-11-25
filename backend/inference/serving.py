@@ -26,6 +26,7 @@ from backend.arch.eval.fusion import (
     union_consts,
 )
 from backend.arch.eval.layer import Layer, Rewrite
+from backend.arch.eval.refusal import DeploymentRefusal
 from backend.arch.eval.access import LeafAccess, routed_launches
 from backend.arch.eval.values import Cost, Shape
 from backend.arch.layout.physical import physical_kernel_shapes
@@ -327,10 +328,28 @@ class LayersAt:
 _UNREAD = object()
 
 
+def load_walk(
+    base: Any,
+    framework_binding: Optional[FrameworkBinding],
+    *,
+    allow_refusals: bool = False,
+) -> Any:
+    """Apply `framework_binding`'s weight loaders to `base` and enforce refusals."""
+    loaders = (framework_binding.weight_loaders_for(base.program, base)
+               if framework_binding is not None else {})
+    analysis = base.with_load_formats(loaders) if loaders else base
+    if analysis.load_refusals and not allow_refusals:
+        raise DeploymentRefusal(
+            "; ".join(analysis.load_refusals),
+            knobs=analysis.load_refusal_knobs)
+    return analysis
+
+
 def build_serving_layers(cell: Any, *,
                           framework_binding: Optional[FrameworkBinding],
                           stage: Optional[int],
-                          timed: FrozenSet[str]) -> ServingLayers:
+                          timed: FrozenSet[str],
+                          allow_load_refusals: bool = False) -> ServingLayers:
     """A cell's serving layers for one reader configuration
     (`Cell.serving`), off its walk, its per-rank projections
     (`Cell.physical`) and into its book of laws (`Cell.laws`). The readers
@@ -358,7 +377,11 @@ def build_serving_layers(cell: Any, *,
     # selector gaps nothing had answered.
     apply_launches = bool(launches) or bool(
         unavailable_launches and framework_binding.deployment.peak_families)
-    if apply_launches or required:
+    loaded = load_walk(
+        analysis, framework_binding, allow_refusals=allow_load_refusals)
+    load_changed = loaded is not analysis
+    analysis = loaded
+    if apply_launches or required or load_changed:
         # The binding has already answered each launch's `when:` for this
         # deployment. Materialize the ordered candidates before access reads
         # matmul dtypes: the walk's scheme says what a checkpoint allows,

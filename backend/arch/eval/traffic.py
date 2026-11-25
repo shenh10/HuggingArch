@@ -376,7 +376,7 @@ class TrafficGeometry:
         )
 
     @classmethod
-    def _format_identity(cls, reps: Any) -> tuple:
+    def _format_identity(cls, reps: Any, *, project_with: Any = None) -> tuple:
         """One stored tensor's formats, over every layer segment it has.
 
         A tensor whose node stores it one way across its layers is one
@@ -385,17 +385,22 @@ class TrafficGeometry:
         are the identity. Asking for "the" format would raise here, and
         comparing one of them would let a projection drop a segment and still
         look unchanged."""
-        def _tensor_format(fmt: Any) -> Any:
+        def _tensor_format(fmt: Any, resident: bool) -> Any:
             if fmt is None:
                 return None
+            metadata = fmt.metadata
+            if resident and project_with is not None and fmt.block_scale_layout is not None:
+                degree = project_with.world_degree(fmt.block_scale_layout.world)
+                if not fmt.has_rank_metadata(degree):
+                    metadata = ()
             return (
                 replace(fmt, metadata=()),
-                tuple(cls._stored_tensor_identity(row) for row in fmt.metadata),
+                tuple(cls._stored_tensor_identity(row) for row in metadata),
             )
 
         return tuple(
-            (segment.layers, _tensor_format(segment.saved),
-             _tensor_format(segment.intent))
+            (segment.layers, _tensor_format(segment.saved, segment.intent is None),
+             _tensor_format(segment.intent, True))
             for segment in reps)
 
     @staticmethod
@@ -475,7 +480,7 @@ class TrafficGeometry:
                     f"traffic geometry changed storage tensor identity for owner {uid}"
                 )
             if tuple(map(self._format_identity, local_formats)) != tuple(
-                map(self._format_identity, source_formats)
+                self._format_identity(rep, project_with=analysis.rule) for rep in source_formats
             ):
                 raise ValueError(
                     f"traffic geometry changed format identity for owner {uid}"

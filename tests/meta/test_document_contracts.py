@@ -241,6 +241,23 @@ def test_quant_context_validates_roles_and_scheme_fields_at_load_time():
         ])
 
 
+def test_block_scale_layout_contains_only_checkpoint_facts():
+    with pytest.raises(ValidationError, match="loaders"):
+        QuantContext(per_role={"attention": {
+            "method": "fp8", "block_h": 128, "block_w": 128,
+            "block_scale_layout": {
+                "kind": "tp_interleaved", "checkpoint_tp": 4,
+                "world": "tp_attention",
+                "loaders": {"sglang": "whole_chunks"},
+            },
+        }})
+    with pytest.raises(ValidationError, match="without block_scale_layout"):
+        QuantContext(per_role={"attention": {
+            "method": "fp8", "block_h": 128, "block_w": 128,
+            "scale_shape": ["chunks_per_rank", "1"],
+        }})
+
+
 def test_custom_op_cannot_shadow_a_registered_primitive():
     custom = CustomOpSpec(
         signature={"x": ["B", "s_ctx", "d_model"]},

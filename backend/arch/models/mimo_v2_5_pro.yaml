@@ -128,21 +128,16 @@ quant_context:
     router:    { method: none, dtype: F32 }
     default:   { method: none }
   overrides:
-    # The fused QKV's scale grid is blocked per SEGMENT, each ceil-padded on
-    # its own, with the K segment blocked per head inside that:
-    # 192 + 8x2 + 8 = 216 rows where the flat rule gives ceil(27136/128) = 212,
-    # and the file says [216, 48]. Every layer of this model carries it — the
-    # windowed class shares the backbone's head counts here, and the MTP stack
-    # holds the identical shape — so it is not scoped to a stack.
+    # Eight interleaved [Q|K|V] checkpoint chunks, each with its own
+    # ceil-padded FP8 grid: 8 * ceil((27136 / 8) / 128) = 216 rows.
     - tensors_re: '\.qkv_proj\.weight$'
       dtype: F8_E4M3
       method: fp8
       block_h: 128
       block_w: 128
+      block_scale_layout: { kind: tp_interleaved, checkpoint_tp: 8, world: tp_attention }
       scale_shape:
-        - "((n_heads * d_head + block_h - 1) // block_h)
-           + n_kv_heads * ((d_head + block_h - 1) // block_h)
-           + ((n_kv_heads * d_v_head + block_h - 1) // block_h)"
+        - "chunks_per_rank * ((out // chunks_per_rank + block_h - 1) // block_h)"
         - "(in + block_w - 1) // block_w"
     - tensors_re: 'mlp\.gate\.e_score_correction_bias$'
       dtype: F32

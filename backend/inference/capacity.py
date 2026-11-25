@@ -34,7 +34,7 @@ from backend.arch.eval.dim import value_of
 from backend.arch.eval.formats import quant_granularity
 from backend.arch.eval.precision import PrecisionProfile
 from backend.arch.eval.program import Program
-from backend.arch.eval.refusal import stage_context
+from backend.arch.eval.refusal import DeploymentRefusal, stage_context
 from backend.arch.eval.transforms import Workload
 from backend.arch.layout.stages import StagePlacement
 from backend.arch.loader import get_default_loader
@@ -1334,6 +1334,7 @@ class CellBasis:
     _cells: StepCells
     _lock: Any = field(default_factory=threading.RLock)
     _views: Dict[FrozenSet[str], Tuple[Any, Any]] = field(default_factory=dict)
+    _artifacts_by_walk: Dict[int, Tuple[Any, Tuple[Any, ...]]] = field(default_factory=dict)
 
     @memo_property
     def analysis(self) -> Any:
@@ -1349,6 +1350,25 @@ class CellBasis:
         from backend.arch.layout.persistent import physical_artifacts
         with self._lock:
             return physical_artifacts(self.analysis)
+
+    def loaded(
+        self,
+        framework_binding: Any,
+        *,
+        allow_refusals: bool = False,
+    ) -> Tuple[Any, Tuple[Any, ...]]:
+        """Price the resident view selected by the same loader as the serving cell."""
+        from backend.arch.layout.persistent import physical_artifacts
+        from backend.inference.serving import load_walk
+
+        analysis = load_walk(self.analysis, framework_binding, allow_refusals=allow_refusals)
+        if analysis is self.analysis:
+            return analysis, self.artifacts
+        with self._lock:
+            key = id(analysis)
+            if key not in self._artifacts_by_walk:
+                self._artifacts_by_walk[key] = (analysis, physical_artifacts(analysis))
+            return self._artifacts_by_walk[key]
 
     @memo_property
     def placement(self) -> Optional[StagePlacement]:
@@ -1527,7 +1547,8 @@ def _capacity_preparation(
             server_flags=knobs.framework_options),
     )
 
-    artifacts = all_artifacts = basis.artifacts
+    analysis, artifacts = basis.loaded(framework_binding)
+    all_artifacts = artifacts
     # Weights kept in host memory are not GPU weights: every per-rank weight
     # sum below — the stage profiles, the cache room — reads the device
     # artifacts alone. A weight's scale metadata goes with it.

@@ -2090,7 +2090,9 @@ def compute_per_op_timing(
                      "rows_local": as_number(shard.rows_local),
                      "width": as_number(shard.width),
                      "width_local": as_number(shard.width_local),
-                     "granularity": shard.granularity}
+                     "granularity": shard.granularity,
+                    **({"block_scale_layout": shard.block_scale_layout._asdict()}
+                       if shard.block_scale_layout is not None else {})}
                     # A row with no access record streams no stored tensor.
                     for shard in (weight_shards(ab.weight_packs)
                                   if ab is not None else ())],

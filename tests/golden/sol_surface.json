@@ -16024,7 +16024,7 @@
       "per_token_kv_bytes_per_rank": 51200.0,
       "static_kv_bytes_per_rank": 0.0,
       "total_params": 1021248126336,
-      "weight_bytes_per_rank": 1030905902592.0
+      "weight_bytes_per_rank": 1030905848832.0
     },
     "ops": {
       "decode": {
@@ -16807,7 +16807,7 @@
       "per_token_kv_bytes_per_rank": 23040.0,
       "static_kv_bytes_per_rank": 0.0,
       "total_params": 308778780864,
-      "weight_bytes_per_rank": 311862258560.0
+      "weight_bytes_per_rank": 311862256256.0
     },
     "ops": {
       "decode": {

@@ -46,7 +46,7 @@ from .routed import RoutedLaunch
 from .rule import Rule
 from .values import Cost, Shape
 from .. import dims as dims_mod
-from backend.code_trace.memo import memo_property
+from backend.code_trace.memo import Memo, memo_property
 
 
 
@@ -74,6 +74,17 @@ def _format_label(fmt: Any) -> str:
     return name
 
 
+class BlockScaleLayoutInfo(NamedTuple):
+    """Typed checkpoint-chunk / loader contract carried on a `WeightShard`."""
+
+    kind: str
+    checkpoint_tp: int
+    world: str
+    loader: Optional[str]
+    load_refusal: Optional[str]
+    runtime_tp: int
+
+
 class WeightShard(NamedTuple):
     """One partition of a matrix a kernel multiplies, as the grid a weight's
     scale tiles: its rows and its reduction width, as the checkpoint holds
@@ -89,6 +100,8 @@ class WeightShard(NamedTuple):
     plans) — keyed with the tensor's layer segment, since a layer carve-out
     is its own weight. `granularity` is this tensor's own scale layout
     (`TensorFormat.weight_granularity`), None when it stores no scale.
+    `block_scale_layout` carries an explicit checkpoint chunk/load contract,
+    with runtime TP and the full fused rank extent beside logical segments.
     """
 
     pack: Tuple[int, int]
@@ -97,6 +110,7 @@ class WeightShard(NamedTuple):
     width: Any
     width_local: Any
     granularity: Optional[str]
+    block_scale_layout: Optional[BlockScaleLayoutInfo] = None
 
 
 def _dtype_name(row: TensorRow) -> str:
@@ -1571,6 +1585,72 @@ class Analysis:
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
     @memo_property
+    def load_refusals(self) -> Tuple[str, ...]:
+        """Why this deployment's selected loaders cannot materialize a rank."""
+        return tuple(dict.fromkeys(
+            rep.resident.load_refusal
+            for tensors in self.formats.values.values()
+            for reps in tensors
+            for rep in reps
+            if rep.resident.load_refusal is not None))
+
+    @memo_property
+    def load_refusal_knobs(self) -> Tuple[str, ...]:
+        """The parallelism worlds named by this walk's `load_refusals`."""
+        return tuple(dict.fromkeys(
+            rep.resident.block_scale_layout.world
+            for tensors in self.formats.values.values()
+            for reps in tensors
+            for rep in reps
+            if rep.resident.load_refusal is not None
+            and rep.resident.block_scale_layout is not None
+        ))
+
+    @memo_property
+    def _loaded_formats(self) -> Memo:
+        return Memo()
+
+    def with_load_formats(self, loaders: Mapping[str, str]) -> "Analysis":
+        """This walk with the resident representations its loader creates.
+
+        The checkpoint side of every representation is preserved. The caller
+        resolves each layout kind to a framework's loader and passes only that
+        plain mapping; metadata, residency and rank projection share one format.
+        """
+        if not loaders:
+            return self
+        key = tuple(sorted(loaders.items()))
+        return self._loaded_formats.get(key, lambda: self._apply_load_formats(dict(key)))
+
+    def _apply_load_formats(self, loaders: Mapping[str, str]) -> "Analysis":
+        values = {}
+        changed = False
+        for uid, tensors in self.storage.values.items():
+            formats = []
+            for index, (stored, reps) in enumerate(
+                    zip(tensors, self.formats.values[uid], strict=True)):
+                segments = []
+                for segment_index, rep in enumerate(reps):
+                    contract = rep.resident.block_scale_layout
+                    loaded = rep.resident
+                    loader = (loaders.get(contract.kind)
+                              if contract is not None else None)
+                    if loader is not None:
+                        axes = self._axis_segments[(uid, index, segment_index)]
+                        local_stored = replace(stored, shape=tuple(
+                            sum(local for _, local in parts) for parts in axes))
+                        loaded = rep.resident.for_loader(
+                            stored, local_stored, loader=loader,
+                            runtime_tp=self.rule.world_degree(contract.world))
+                    changed |= loaded is not rep.resident
+                    segments.append(rep if loaded is rep.resident
+                                    else replace(rep, intent=loaded))
+                formats.append(formats_mod.Representations.of(*segments))
+            values[uid] = tuple(formats)
+        return (replace(self, formats=Layer(self.program, values))
+                if changed else self)
+
+    @memo_property
     def _axis_segments(self) -> Dict[Any, Any]:
         return self.rule.local_axis_segments(self)
 
@@ -1617,6 +1697,17 @@ class Analysis:
                                 if row.rep is not None else None)
                     granularity = (resident.weight_granularity
                                    if resident is not None else None)
+                    load_layout = None
+                    if resident is not None and resident.block_scale_layout is not None:
+                        contract = resident.block_scale_layout
+                        load_layout = BlockScaleLayoutInfo(
+                            kind=contract.kind,
+                            checkpoint_tp=contract.checkpoint_tp,
+                            world=contract.world,
+                            loader=resident.loader,
+                            load_refusal=resident.load_refusal,
+                            runtime_tp=self.rule.world_degree(contract.world),
+                        )
                     for size, local in axes[-2]:
                         whole = replace(row.tensor, shape=(
                             *row.tensor.shape[:-2],
@@ -1629,7 +1720,7 @@ class Analysis:
                         width_held, rows_held = held.matrix_dims
                         out.append(WeightShard(
                             (group, row.segment_index), rows, rows_held,
-                            width, width_held, granularity))
+                            width, width_held, granularity, load_layout))
         return tuple(out)
 
     def local_tensors(self) -> Iterator["TensorRow"]:
