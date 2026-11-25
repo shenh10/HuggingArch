@@ -1,0 +1,382 @@
+# tencent/Hy4 (hy_v4_vl) — multimodal Hy4: the 78-layer MLA + DSA + iHC text
+# backbone of tencent/Hy4-preview (see backend/arch/models/tencent__Hy4-preview.yaml
+# for the backbone's architectural notes), plus a ViT vision tower at `vit.*`
+# and the 5-layer DFly2 speculative drafter at `model.dfly_layers.*`
+# (num_nextn_predict_layers=0 — there is no DeepSeek-style MTP stack).
+#
+# Deltas vs the text-only Hy4-preview spec:
+#
+#   1. Vision tower (vit.*, file root): Conv2d 16x16 patch embed (biased) +
+#      interpolated learned position grid [16385, 1536] + 40 pre-norm LayerNorm
+#      ViT blocks (biased MHA q/k/v/o, 16 heads x 96, non-causal per cu_seqlens
+#      chunk, no RoPE — HYV4VLVisionAttention, modeling_hy_v4_vl.py:871-950) +
+#      PatchMerger (vit.perceive): RMSNorm -> 2x2 conv merge -> gelu -> 1x1 conv
+#      straight to the text width, one image_newline token per merged row
+#      (:826-868). Blocks are library hunyuan_vit_block (the checkpoint uses the
+#      same input_layernorm / post_attention_layernorm / mlp.dense_h_to_4h
+#      naming); the tower wrapper is draft vit_convmerge_newline_tower because
+#      library hunyuan_vl_vision_tower's merger tail (post-concat mlp,
+#      image_begin/end/sep, after_rms, 4*d_vis-wide newline) does not exist in
+#      this checkpoint and cannot be switched off there (component_reuse edge
+#      share 1.00 on the stem; the difference is the tail DAG and its widths).
+#      Videos run through the same tower (get_video_features = get_image_features,
+#      :1401-1411), modelled as a `call`.
+#
+#   2. Text RoPE is multimodal: rope_parameters carries mrope_section
+#      [12, 10, 10] with mrope_interleaved=true (HYV4VLRotaryEmbedding.forward /
+#      recomposition_frequencies, :1112-1133; 3-D position ids from
+#      get_rope_index, :1298-1399). The library components
+#      mla_dsa_gated_sink_attention{,_shared} hardcode `op: rope` and declare
+#      no `params: { rope: ... }` slot (unlike
+#      gqa_qknorm_partial_rope_sigmoid_gated_attention), so the drafts
+#      mla_dsa_gated_sink_mrope_attention{,_shared} restate them with
+#      `op: mrope` and nothing else changed; the decode-time absorbed forms
+#      stay the library's.
+#
+#   3. DFly2 drafter (model.dfly_layers.*) replaces the preview's MTP layer.
+#      HF ignores these weights entirely (no dfly modules in modeling_hy_v4_vl.py;
+#      _keys_to_ignore_on_load_unexpected covers only mtp_layers, :718), so the
+#      drafter's forward follows vLLM (models/hy_v4/nvidia/dfly.py,
+#      dfly_speculator.py):
+#        embeddings = embed_tokens(draft ids)            # shared target table
+#        anchors += gate * eh_proj(cat[enorm(anchors), hnorm(target_hidden)])
+#                                                       # HYV4DFlyFusion, dfly.py:77-99
+#        hidden = 5 x pre_norm(MLA-shared-topk + dense SwiGLU-18432) layers
+#                                                       # HYV4DFlyModel.forward, dfly.py:297-312
+#        hidden = final_norm(hidden + residual)
+#        hidden += hidden_correction: SwiGLU over cat[hidden_norm(hidden),
+#                 embed_norm(embed(prev ids))]           # dfly.py:102-138
+#        logits via the shared lm_head                   # dfly.py:370-375
+#      Draft layers own no indexer (dfly_external_topk, dfly.py:221): draft
+#      layer i reuses backbone layer dfly_target_index_layer[i] = 61+4i 's
+#      top-K (dfly_target_reuse.py update_indices / snapshots), modelled by
+#      reading the backbone's `dsa_topk` stream cross-stack. Draft KV is
+#      aliased onto target layers dfly_target_kv_layers (dfly_target_reuse.py
+#      :117-156: same MLA cache storage, draft writes its query-block KV into
+#      it) — a storage alias the spec's cache model cannot express, so the
+#      draft attention keeps its own MLA cache entries (weights/compute are
+#      the draft's own either way). confidence_head.proj is stored but read by
+#      no forward (vLLM drops it on load: dfly.py:334 _ignored_prefixes).
+#
+# Config-coverage review (fields intentionally not consumed), beyond the ones
+# the Hy4-preview spec already documents:
+#   mlp_layer_types / layer_types  — live under text_config; the dense/sparse
+#                            split is layer-0-dense (first_k_dense_replace=1),
+#                            and layer_types is uniform
+#                            "deepseek_sparse_attention". Same resolution as
+#                            Hy4-preview / glm_moe_dsa.
+#   vision_config.perceive_pre_norm / perceive_post_norm / remove_prenorm /
+#     vision_full_attention / learnable_mlp_pooling_size / cat_extra_token /
+#     spatial_patch_size / anyres_vit_max_image_size / resize_resolution /
+#     video_* — not read by HYV4VLVisionModel/Block/Merger forward paths;
+#     legacy processor-side fields.
+#   enable_lm_head_fp32    — lm_head runs in fp32 (modeling_hy_v4_vl.py:1611-1613,
+#                            :1715) but the checkpoint stores it BF16; a compute
+#                            cast only.
+#   dfly_mtp_fusion="slot0" / dfly_block_size=7 / dfly_attn_causal /
+#     dfly_enable_hidden_correction / dfly_target_index_topk /
+#     dfly_context_local_window=null — vLLM speculator scheduling constants
+#     (query width, index round-up), not graph structure. The drafter always
+#     builds mtp_fusion and hidden_correction (dfly.py:257-262).
+#   rope_parameters.rope_type="default" — plain theta, no yarn mscale
+#                            (yarn_apply_mscale passes scaling through,
+#                            modeling_hy_v4_vl.py:263-269); attention scale is
+#                            qk_head_dim^-0.5 (:321).
+#   gating_type="elementwise" — the sigmoid output gate is per-channel
+#                            (gate_projection_size = v_head_dim, :325-326).
+#
+# Weights are pure BF16 except the F32 tensors the Hy4-preview spec already
+# enumerates (iHC parameters, backbone e_score_correction_bias, backbone
+# learnable_sink_param); the overrides are anchored at `model.layers.` /
+# `model.hc_head.` and so do not touch the BF16 dfly sinks.
+
+match:
+  model_type: [hy_v4_vl]
+  model_id: [tencent/Hy4]
+
+drafts:
+  - vit_convmerge_newline_tower
+  - mla_dsa_gated_sink_mrope_attention
+  - mla_dsa_gated_sink_mrope_attention_shared
+
+components:
+  attention: mla_dsa_gated_sink_mrope_attention
+  ffn_dense: swiglu_ffn
+  ffn_moe: moe_ffn_gate_routing_bias_packed_clamped
+  norm: rmsnorm
+  block: hc_independent_pre_norm_block
+
+
+dims:
+  d_model:    config.hidden_size
+  n_heads:    config.num_attention_heads
+  d_qk_nope:    config.qk_nope_head_dim
+  d_qk_rope:    config.qk_rope_head_dim
+  d_v_head:   config.v_head_dim ?? d_qk_nope
+  d_kv_lora:    config.kv_lora_rank
+  d_q_lora:   config.q_lora_rank
+  n_indexer_heads:   config.index_n_heads ?? "0"
+  d_indexer_head:   config.index_head_dim ?? "0"
+  n_topk_keys:   config.index_topk ?? "0"
+  d_ffn:    config.intermediate_size
+  d_ffn_expert:   config.moe_intermediate_size
+  n_vocab:    config.vocab_size
+  n_layers:    config.num_hidden_layers
+  n_experts:    config.n_routed_experts
+  n_experts_active:    config.num_experts_per_tok
+  n_expert_groups:    config.n_group
+  n_groups_active:    config.topk_group
+  n_shared_experts:   config.n_shared_experts ?? "0"
+  n_hidden_copies:   config.hc_mult ?? "4"
+  s_max: config.max_position_embeddings
+  # vision tower
+  d_vis_model:     config.vision_config.hidden_size
+  n_vis_heads:     config.vision_config.num_attention_heads
+  d_vis_head:      "d_vis_model // n_vis_heads"
+  d_vis_ffn:       config.vision_config.intermediate_size
+  n_vis_layers:    config.vision_config.num_hidden_layers
+  n_vis_channels:  config.vision_config.num_channels
+  s_patch:         config.vision_config.patch_size
+  n_spatial_merge: config.vision_config.spatial_merge_size
+  # num_positions = (max_image_size // patch_size) ** 2 + 1 (CLS slot + patch
+  # grid); modeling_hy_v4_vl.py:785-786. With max_image_size=2048,
+  # patch_size=16: 128**2 + 1 = 16385. The dim registry has no symbol for
+  # max_image_size (binding one is refused as unregistered; `config.*` cannot
+  # appear inside an expression), so the extent is read from the table's
+  # stored header instead of a literal. Registry gap for maintainers: a
+  # `whole` symbol for the ViT's max image side in pixels would let this be
+  # written from config.
+  n_vis_pos_slots: checkpoint.vit.embeddings.position_embedding.weight[0]
+  # DFly2 drafter (config.dfly_*; 5 layers in this checkpoint)
+  n_dfly_layers: config.dfly_num_hidden_layers ?? "0"
+
+view:
+  hidden_act: config.hidden_act
+  norm.eps: config.rms_norm_eps
+  rope_theta: config.rope_parameters.rope_theta
+
+model_inputs:
+  input_ids: { kind: tokens }
+  # Images per request, then each image's size as the processor hands it to
+  # the tower; videos as frames through the same tower.
+  pixel_values: { kind: image, axes: [n_img, img_h, img_w] }
+  pixel_values_videos: { kind: video, axes: [n_vid, vid_frames, vid_h, vid_w] }
+
+# The text backbone's tensors sit under `model.` (embed_tokens, layers, norm,
+# hc_head, dfly_layers); lm_head and the vision tower sit at the file root.
+checkpoint: { root: model }
+
+model:
+  - { name: embed_tokens, inputs: [input_ids], op: embedding, boundary_role: input_embedding, dims: { n_vocab: n_vocab, d_model: d_model }, weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }] }
+
+  # Vision tower reads pixels (no inputs); its output is the merged image
+  # embeds at the text width (one newline token per merged row included).
+  - name: vit
+    group: true
+    aux_kind: vision
+    # The vision tower's tensors sit at the file root (`vit.*`).
+    checkpoint: { root: "" }
+    layers:
+      # The processor resizes each image to a multiple of patch_size *
+      # spatial_merge_size = 16 * 2 = 32 and cuts 16x16 patches of 3 channels
+      # (temporal_patch_size 1): the tower reshapes the flat per-patch rows to
+      # (num_patches, 3, 16, 16) (modeling_hy_v4_vl.py:808-816) and merges by
+      # a stride-2 conv (:832-837), so height/width must be even in patch
+      # units; one attention segment per temporal patch (cu_seqlens from
+      # get_vision_attention_seqlens, :1047), which for an image is the whole
+      # image.
+      - name: vit.patchify
+        op: patchify
+        inputs: [pixel_values]
+        dims: { patch: s_patch, temporal: "1", channels: n_vis_channels, align: "s_patch * n_spatial_merge" }
+        segment: temporal_patch
+        source_anchor: "modeling_hy_v4_vl.py:808-816 pixel_values reshape (num_patches, C, 16, 16), patch_size 16 / num_channels 3 / temporal_patch_size 1 (vision_config); :1047 get_vision_attention_seqlens one cu_seqlens segment per temporal patch; merger proj_conv kernel=stride=spatial_merge_size=2 at :832-837"
+      - { name: vit, template: vit_convmerge_newline_tower, inputs: [vit.patchify] }
+  # The videos, through the same tower with the same weights in a call of
+  # their own (modeling_hy_v4_vl.py:1401-1411 get_video_features =
+  # get_image_features); each frame is merged on its own (:851-852).
+  - { name: video, call: vit, inputs: [pixel_values_videos] }
+
+  # Image and video features overwrite their placeholder rows of the token
+  # embeddings before the decoder runs (modeling_hy_v4_vl.py:1558-1574
+  # `inputs_embeds.masked_scatter(image_mask, image_embeds)` / video).
+  - name: embed_merge
+    op: scatter_rows_replace
+    inputs: [embed_tokens, vit, video]
+    prompt_slots:
+      vit:   { domain: pixel_values, defines: true, source_anchor: "modeling_hy_v4_vl.py:1558-1565 masked_scatter(image_mask, image_embeds); per-image row count t*(h/merge)*(w/2+1) at :1423-1426" }
+      video: { domain: pixel_values_videos, defines: true, source_anchor: "modeling_hy_v4_vl.py:1567-1574 masked_scatter(video_mask, video_embeds)" }
+
+  # Network entry (iHC): lift [B,s_ctx,d_model] to [B,s_ctx,n_hidden_copies,d_model]
+  # so the decoder stack carries 4 parallel residual copies (enable_ihc=true;
+  # modeling_hy_v4_vl.py:1206 — the embed output is replicated along a new
+  # axis, zero-FLOPs/zero-params).
+  - { name: hc_expand, op: broadcast, axis: -2, dims: { width: n_hidden_copies }, inputs: [embed_merge] }
+
+  - name: layers
+    inputs: [hc_expand]
+    repeat: n_layers
+    # `hidden` is the [B,s_ctx,n_hidden_copies,d_model] iHC state the stack
+    # carries layer to layer (modeling_hy_v4_vl.py:1209-1219). `dsa_topk` is
+    # DSA indexer sharing as an inner stream: full layers (and dense layer 0)
+    # compute the top-K; "shared" layers reuse the nearest earlier full
+    # layer's selection (prev_topk_indices threading, :1208-1218).
+    streams:
+      hidden: { carries: true }
+      dsa_topk:
+        shape: [B, s_query, n_topk_keys]
+        src: "HYV4VLTextModel.forward threads `prev_topk_indices` across layers (modeling_hy_v4_vl.py:1208-1219)"
+    # Heterogeneity: indexer_types (full vs shared indexer) is read straight
+    # from the config list; the dense/sparse FFN split is layer-0-dense
+    # (first_k_dense_replace=1; mlp_layer_types is NOT read by a generator —
+    # the schedule gate would require a primary generator per list value and
+    # the FFN split is orthogonal to the indexer split; the Hy4-preview spec
+    # documents the same choice). The dense generator claims layer 0 first
+    # (it is also "full" in indexer_types); `rest` is the fallback when
+    # indexer_types is absent (every non-dense layer gets a full indexer).
+    per_layer:
+      assign:
+        - { type: dense,  layers: ["0"] }
+        - { type: full,   from: "config.indexer_types ?? absent", is: full }
+        # A shared layer reads the top-K of the nearest full layer before it.
+        - { type: shared, from: "config.indexer_types ?? absent", is: shared,
+            reads_from: { dsa_topk: { nearest: { from: "config.indexer_types ?? absent", is: full } } } }
+        - { type: full,   rest: true }
+      map:
+        dense:  { attention: mla_dsa_gated_sink_mrope_attention,        ffn: swiglu_ffn }
+        full:   { attention: mla_dsa_gated_sink_mrope_attention,        ffn: moe_ffn_gate_routing_bias_packed_clamped }
+        shared: { attention: mla_dsa_gated_sink_mrope_attention_shared, ffn: moe_ffn_gate_routing_bias_packed_clamped }
+
+  # Network exit (iHC): model.hc_head reduces [B,s_ctx,n_hidden_copies,d_model]
+  # back to [B,s_ctx,d_model] before the final norm
+  # (HYV4VLHyperHead, modeling_hy_v4_vl.py:609-630, called at :1221). Three
+  # nn.Parameters at `model.hc_head.hc_head_{fn,base,scale}`, then one
+  # pure-function invocation (weights passed as inputs).
+  - { name: hc_head.hc_head_fn,    op: parameter_tensor, shape: [n_hidden_copies, "n_hidden_copies * d_model"], weight_axes: [{ replicated: true }, { replicated: true }] }
+  - { name: hc_head.hc_head_base,  op: parameter_vector, dim: n_hidden_copies, weight_axes: [{ replicated: true }] }
+  - { name: hc_head.hc_head_scale, op: parameter_vector, dim: "1", weight_axes: [{ replicated: true }] }
+  - name: hc_head
+    op: hc_head_independent
+    inputs: [layers, hc_head.hc_head_fn, hc_head.hc_head_scale, hc_head.hc_head_base]
+
+  - { name: norm, op: rmsnorm, dim: d_model, weight_axes: [{ replicated: true }], inputs: [hc_head] }
+  # tie_word_embeddings=false: the checkpoint ships a separate BF16
+  # lm_head.weight at the file root, so no tied_weight here.
+  - { name: lm_head, op: linear, checkpoint: { path: lm_head }, boundary_role: output_head, dims: { in: d_model, out: n_vocab }, weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }], inputs: [norm] }
+
+  # DFly2 speculative drafter (config.dfly_*, dfly_num_hidden_layers=5). HF
+  # stores but never runs these weights (modeling_hy_v4_vl.py has no dfly
+  # modules); the forward follows vLLM models/hy_v4/nvidia/dfly.py —
+  # HYV4DFlyModel.forward (:297-312): embed (shared table) -> mtp_fusion on
+  # the anchor embeddings -> 5 pre_norm layers (MLA with shared top-K, dense
+  # SwiGLU, NO iHC — dfly_enable_ihc=false and no hc_* tensors) -> final_norm.
+  # Then per draft step hidden_correction + the shared lm_head
+  # (dfly_speculator.py:92-98, dfly.py:370-375).
+  - name: dfly
+    group: true
+    aux_kind: speculative
+    # Draft layers are indexed directly under model.dfly_layers
+    # (model.dfly_layers.{0-4}.*); the fusion / correction / final_norm /
+    # confidence_head siblings hang off the same path without an index.
+    checkpoint: { prefix: model.dfly_layers, index: local }
+    inputs: [norm]
+    layers:
+      # HYV4DFlyFusion (vLLM models/hy_v4/nvidia/dfly.py:77-99), run once per
+      # draft query block on each request's anchor embedding
+      # (dfly_speculator.py:85-87):
+      #   out = anchors + gate * eh_proj(cat[enorm(anchors),
+      #                                hnorm(target hidden)])
+      # Written as direct ops — a template call inside this indexed group
+      # would be given the group's layer index. `gate` is a bare nn.Parameter
+      # (dfly.py:91), stored with no `.weight` suffix.
+      - { name: dfly_layers.mtp_fusion.enorm, op: rmsnorm, inputs: [embed_tokens], dim: d_model, weight_axes: [{ replicated: true }] }
+      - { name: dfly_layers.mtp_fusion.hnorm, op: rmsnorm, inputs: [norm], dim: d_model, weight_axes: [{ replicated: true }] }
+      - { name: dfly_layers.mtp_fusion.concat, op: concat, inputs: [dfly_layers.mtp_fusion.enorm, dfly_layers.mtp_fusion.hnorm], dims: { in_a: d_model, in_b: d_model, out: d_fuse_in } }
+      - { name: dfly_layers.mtp_fusion.eh_proj, op: linear, inputs: [dfly_layers.mtp_fusion.concat], dims: { in: d_fuse_in, out: d_model }, weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: dfly_layers.mtp_fusion.gate, op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+      - { name: dfly_layers.mtp_fusion.gate_mul, op: mul, inputs: [dfly_layers.mtp_fusion.eh_proj, dfly_layers.mtp_fusion.gate], dim: d_model }
+      - { name: dfly_layers.mtp_fusion.add, op: add, inputs: [embed_tokens, dfly_layers.mtp_fusion.gate_mul], dim: d_model }
+      # The 5 draft layers: plain pre_norm blocks; the attention is the Hy4
+      # shared-indexer variant (own MLA projections + sink + gate, no indexer
+      # weights) reading the backbone's dsa_topk stream. Draft layer i reuses
+      # backbone layer dfly_target_index_layer[i] = 61 + 4*i (a "full"
+      # indexer layer; vLLM dfly_target_reuse.py:46-60,110-114).
+      - name: layers
+        repeat: n_dfly_layers
+        template: pre_norm
+        params: { attn: mla_dsa_gated_sink_mrope_attention_shared, ffn: swiglu_ffn, norm: rmsnorm }
+        inputs: [dfly_layers.mtp_fusion.add]
+        streams:
+          hidden: { carries: true }
+        reads_from:
+          dsa_topk:
+            map:
+              "0": { stack: layers, layer: 61 }   # config.dfly_target_index_layer[0]
+              "1": { stack: layers, layer: 65 }   # config.dfly_target_index_layer[1]
+              "2": { stack: layers, layer: 69 }   # config.dfly_target_index_layer[2]
+              "3": { stack: layers, layer: 73 }   # config.dfly_target_index_layer[3]
+              "4": { stack: layers, layer: 77 }   # config.dfly_target_index_layer[4]
+      # HYV4DFlyModel.forward returns self.norm(hidden + residual)
+      # (dfly.py:312); the checkpoint stores it as final_norm (vLLM renames it
+      # to `norm` on load, dfly.py:428-429).
+      - { name: dfly_layers.final_norm, op: rmsnorm, inputs: [layers], dim: d_model, weight_axes: [{ replicated: true }] }
+      # HYV4DFlyHiddenCorrection (vLLM dfly.py:102-138), run per draft step on
+      # the stack output (dfly_speculator.py:92-98):
+      #   out = hidden + down_proj(silu(gate) * up) over the concat of the two
+      #   normed streams; the previous token's embedding comes from the shared
+      #   table (dfly.py:365-368). The checkpoint stores gate_proj / up_proj
+      #   separately ([6144, 12288]), so the fused gate_up is two linears.
+      - { name: dfly_layers.hidden_correction.hidden_norm, op: rmsnorm, inputs: [dfly_layers.final_norm], dim: d_model, weight_axes: [{ replicated: true }] }
+      - { name: dfly_layers.hidden_correction.embed_norm, op: rmsnorm, inputs: [embed_tokens], dim: d_model, weight_axes: [{ replicated: true }] }
+      - { name: dfly_layers.hidden_correction.concat, op: concat, inputs: [dfly_layers.hidden_correction.hidden_norm, dfly_layers.hidden_correction.embed_norm], dims: { in_a: d_model, in_b: d_model, out: d_fuse_in } }
+      - { name: dfly_layers.hidden_correction.gate_proj, op: linear, inputs: [dfly_layers.hidden_correction.concat], dims: { in: d_fuse_in, out: d_model }, weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: dfly_layers.hidden_correction.up_proj, op: linear, inputs: [dfly_layers.hidden_correction.concat], dims: { in: d_fuse_in, out: d_model }, weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: dfly_layers.hidden_correction.silu, op: silu, inputs: [dfly_layers.hidden_correction.gate_proj], dim: d_model }
+      - { name: dfly_layers.hidden_correction.gate_mul, op: mul, inputs: [dfly_layers.hidden_correction.silu, dfly_layers.hidden_correction.up_proj], dim: d_model }
+      - { name: dfly_layers.hidden_correction.down_proj, op: linear, inputs: [dfly_layers.hidden_correction.gate_mul], dims: { in: d_model, out: d_model }, weight_axes: [{ replicated: true }, { replicated: true }] }
+      - { name: dfly_layers.hidden_correction.add, op: add, inputs: [dfly_layers.final_norm, dfly_layers.hidden_correction.down_proj], dim: d_model }
+      # Stored but never read: vLLM's DFly loader drops `confidence_head.*`
+      # (dfly.py:334 `_ignored_prefixes = ("confidence_head.",)`,
+      # :348-351) and HF has no dfly modules at all.
+      - name: dfly_layers.confidence_head.proj.weight
+        op: parameter_tensor
+        shape: ["1", d_model]
+        weight_axes: [{ replicated: true }, { replicated: true }]
+        stored_without_graph_reader:
+          kind: forward_unread
+          reason: "the DFly confidence head is not run by any forward: vLLM drops it on load (dfly.py:334,348-351) and HF ignores model.dfly_layers entirely"
+          source_anchor: "vllm/models/hy_v4/nvidia/dfly.py:334"
+      - name: dfly_layers.confidence_head.proj.bias
+        op: parameter_vector
+        dim: "1"
+        weight_axes: [{ replicated: true }]
+        stored_without_graph_reader:
+          kind: forward_unread
+          reason: "the DFly confidence head is not run by any forward: vLLM drops it on load (dfly.py:334,348-351) and HF ignores model.dfly_layers entirely"
+          source_anchor: "vllm/models/hy_v4/nvidia/dfly.py:334"
+      # The drafter's logits use the shared lm_head (dfly.py:370-375
+      # compute_logits with the target head bound at load, has_own_lm_head =
+      # False :320).
+      - { name: dfly_logits, op: linear, boundary_role: output_head, dims: { in: d_model, out: n_vocab }, weight_axes: [{ world: attention, parts: n_vocab, fit: pad }, { replicated: true }], tied_weight: { to: lm_head }, inputs: [dfly_layers.hidden_correction.add] }
+
+# Hy4 ships pure BF16 weights — no weight quantization. The exceptions are
+# F32 on disk (backbone only; the DFly stack's own sinks are BF16 and it has
+# no router bias or iHC tensors, so the overrides are anchored at
+# `model.layers.` / `model.hc_head.` and do not reach `model.dfly_layers.`):
+#   - every iHC parameter (hc_attn_layer/hc_mlp_layer hc_pre.{hc_fn,hc_base,
+#     hc_scale} and model.hc_head.hc_head_{fn,base,scale})
+#   - the noaux_tc router's e_score_correction_bias
+#   - the attention learnable_sink_param
+quant_context:
+  per_role:
+    default: { method: none }
+  default_dtype: BF16
+  overrides:
+    - tensors_re: '^model\.layers\..*hc_(?:attn|mlp)_layer\.hc_pre\.hc_(?:fn|base|scale)$'
+      dtype: F32
+    - tensors_re: '^model\.hc_head\.hc_head_(?:fn|base|scale)$'
+      dtype: F32
+    - tensors_re: '^model\.layers\..*e_score_correction_bias$'
+      dtype: F32
+    - tensors_re: '^model\.layers\..*learnable_sink_param$'
+      dtype: F32
