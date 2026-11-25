@@ -1,0 +1,60 @@
+# Hy4-VL vision tower (HYV4VLVisionModel) + patch merger (vit.perceive).
+# Singleton aux_block wrapper — leaves land at bare checkpoint paths (vit.*).
+#
+# forward (modeling_hy_v4_vl.py):
+#   x = embeddings.patch_embedding(pixel_values)          # Conv2d 16x16 -> d_vis_model, biased (:808-816)
+#   x = x + interpolate(embeddings.position_embedding)    # learned patch grid PE, bilinear (:791-806, :818-823)
+#   for blk in layers: x = blk(x)                         # n_vis_layers pre-norm LayerNorm ViT blocks (:1049-1056)
+#   x = patch_merger(x) per image                         # HYV4VLVisionPatchMerger (:848-868)
+#
+# PatchMerger (HYV4VLVisionPatchMerger).forward (:848-868):
+#   x = before_rms(x)                                     # RMSNorm(d_vis_model) — checkpoint names it `norm`
+#   x = proj.0(reshape2x2(x))                             # Conv2d(d_vis_model -> 4*d_vis_model, k=2,s=2), biased
+#   x = gelu(x); x = proj.2(x)                            # Conv2d(4*d_vis_model -> d_model, k=1), biased
+#   x = cat([x, image_newline], width axis)               # one newline column per merged row
+# There is NO post-merge MLP, no image_begin/end/sep embeddings and no
+# after_rms (unlike the HunYuanVL merger): proj_out projects directly to the
+# text width (:839-843).
+#
+# The proj.0 Conv2d (kernel=stride=2) folds a 2x2 spatial patch into channels,
+# so it is modelled as spatial_merge (d_vis_model -> 4*d_vis_model) + linear.
+#
+# Required dims: n_vis_channels, s_patch, d_vis_model, n_vis_heads, d_vis_head,
+#                d_vis_ffn, n_vis_layers, n_spatial_merge, d_model, n_vis_pos_slots
+role: aux_block
+description: "Hy4-VL vision tower: biased conv patch embed + interpolated learned PE + n_vis_layers pre-norm LN ViT blocks + RMSNorm -> 2x2 conv merge -> gelu -> 1x1 conv to text width, one image_newline token per merged row. Singleton wrapper (bare vit.* paths)."
+graph:
+  vit.embeddings.patch_embedding:  { op: linear, in: x, dims: { in: "n_vis_channels * s_patch * s_patch", out: d_vis_model, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  # nn.Embedding(num_positions, embed_dim) used only as a weight table
+  # (modeling_hy_v4_vl.py:789); never indexed by token ids. Named for the
+  # tensor the checkpoint stores, `vit.embeddings.position_embedding.weight`.
+  vit.embeddings.position_embedding.weight: { op: parameter_tensor, shape: [n_vis_pos_slots, d_vis_model], weight_axes: [{ replicated: true }, { replicated: true }] }
+  # modeling_hy_v4_vl.py:791-806 interpolate_pos_encoding (row 0 = CLS slot
+  # dropped, scale_factor (size + 0.1) / edge) + :818-823 repeat over t, add.
+  vit.embeddings.add_pe:
+    op: position_table_add
+    in: [vit.embeddings.patch_embedding, vit.embeddings.position_embedding.weight]
+    dim: d_vis_model
+    formula: "y[(t,i,j), :] = x[(t,i,j), :] + bilinear_resize(table[1:].reshape(E, E, D), (h, w))[i, j, :]   (row 0 = CLS slot dropped; E = max_image_size // patch_size; repeated over t frames)"
+  vit.layers:                      { op: hunyuan_vit_block, in: vit.embeddings.add_pe, chain: n_vis_layers, checkpoint: { index: local }, role: aux_block }
+  # HYV4VLVisionPatchMerger.before_rms (modeling_hy_v4_vl.py:846,849); the
+  # checkpoint stores it as `vit.perceive.norm.weight` (weight only -> rmsnorm).
+  vit.perceive.norm:               { op: rmsnorm, in: vit.layers, dim: d_vis_model, weight_axes: [{ replicated: true }] }
+  vit.perceive.spatial_merge:      { op: spatial_merge, in: vit.perceive.norm, dims: { n_spatial_merge: n_spatial_merge } }
+  # proj_conv: Conv2d(d_vis_model -> d_vis_model * merge^2, k=merge, s=merge), biased (:832-837).
+  vit.perceive.proj.0:             { op: linear, in: vit.perceive.spatial_merge, dims: { in: "n_spatial_merge * n_spatial_merge * d_vis_model", out: "n_spatial_merge * n_spatial_merge * d_vis_model", bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  # proj_act = ACT2FN[vision_config.hidden_act] = gelu (:838).
+  vit.perceive.proj.act:           { op: gelu, in: vit.perceive.proj.0, dim: "n_spatial_merge * n_spatial_merge * d_vis_model" }
+  # proj_out: Conv2d(4*d_vis_model -> out_hidden_size = d_model, k=1), biased
+  # (:841-843) — projects directly to the text width.
+  vit.perceive.proj.2:             { op: linear, in: vit.perceive.proj.act, dims: { in: "n_spatial_merge * n_spatial_merge * d_vis_model", out: d_model, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  vit.perceive.image_newline:      { op: parameter_vector, dim: d_model, weight_axes: [{ replicated: true }] }
+  # modeling_hy_v4_vl.py:857-865 — image_newline expanded to one column per
+  # merged-grid row, then concatenated on the width axis; after flattening
+  # (h/2)*(w/2) tokens become (h/2)*(w/2 + 1) tokens. The newline count is the
+  # merged-grid row count: the image's processed height over
+  # patch_size * spatial_merge_size, one per image (`B * n_img` segments).
+  vit.perceive.newline_row:        { op: broadcast, in: vit.perceive.image_newline, axis: 0, dims: { width: "img_h // (s_patch * n_spatial_merge)" }, formula: "nl[R, C] = image_newline.reshape(1, C).expand(R, C)   (C = d_model; R = img_h / (patch_size * spatial_merge) = merged rows)" }
+  vit.perceive.newline_expand:     { op: broadcast, in: vit.perceive.newline_row, axis: 0, dims: { width: "B * n_img" }, formula: "nl[N, R, C] = nl.expand(N, R, C)   (N = B * n_img images; source: expand(B, C, h/2, 1) — one column per merged row)" }
+  vit.perceive.newline_concat:     { op: concat, in: [vit.perceive.proj.2, vit.perceive.newline_expand], axis: 1, formula: "y = cat([x.view(B, C, h/2, w/2), nl.expand(B, C, h/2, 1)], dim=-1).flatten(2).T   (one newline token appended after each merged row, sequence axis)" }
+outputs: [vit.perceive.newline_concat]

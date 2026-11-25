@@ -1679,3 +1679,19 @@ symbols:
       same launch (`SituAndMul(beta, linear_beta)`). Optional in vLLM: unset
       forwards the up branch.
     config: activation_situ_linear_beta
+  n_dfly_layers:
+    kind: whole
+    group: mtp_speculative
+    meaning: Number of DFly2 drafter layers (auxiliary speculative stack; vLLM models/hy_v4/nvidia/dfly.py:235-246
+      builds config.num_hidden_layers of them from the dfly-derived config).
+    config: dfly_num_hidden_layers
+    used_by: Hy4
+  d_fuse_in:
+    kind: whole
+    group: mtp_speculative
+    meaning: 'Concatenated input width of the DFly2 mtp_fusion eh_proj and hidden_correction
+      gate/up projections: two d_model-wide normed streams joined (vLLM models/hy_v4/nvidia/dfly.py:96-98,
+      :114-120 MergedColumnParallelLinear(2*d, [I, I]); checkpoint model.dfly_layers.mtp_fusion.eh_proj.weight
+      [6144, 12288]).'
+    derived: 2 * d_model
+    used_by: Hy4

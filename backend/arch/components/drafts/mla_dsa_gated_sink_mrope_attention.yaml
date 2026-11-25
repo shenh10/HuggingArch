@@ -1,0 +1,137 @@
+# MLA + DSA sparse indexer + per-head learnable sinks + sigmoid per-channel
+# output gate — the Hy4-VL full-indexer attention layer, with multimodal RoPE.
+#
+# Library `mla_dsa_gated_sink_attention` with exactly one change: the text
+# rope of hy_v4_vl is multimodal — rope_parameters carries mrope_section
+# [12, 10, 10] (HYV4VLRotaryEmbedding.forward / recomposition_frequencies,
+# modeling_hy_v4_vl.py:1112-1133; 3-D position ids from get_rope_index,
+# :1298-1399), so every rotation is `op: mrope` (3 position streams) instead
+# of `op: rope` / `op: rope_emb`. The library component hardcodes `rope` and
+# declares no `params: { rope: ... }` slot (unlike
+# gqa_qknorm_partial_rope_sigmoid_gated_attention), so it cannot be bound to
+# mrope from the spec — this draft exists for that difference alone. The
+# decode-time absorbed form stays the library's
+# (mla_dsa_gated_sink_attention_absorbed).
+#
+# Original header (structure unchanged):
+#
+# Extends library `mla_dsa_attention` (DSv3.2 / GLM-MoE-DSA) in three ways,
+# all from modeling_hy_v4.py:
+#
+#   1. Output gate (gated_mla=true): `attn_output * sigmoid(gate_proj(x))`
+#      before o_proj (Attention.forward:435,505). The checkpoint names the
+#      projection `self_attn.linear_gate` (the module tree calls it
+#      `gate_proj`), hence the node name.
+#   2. Per-head learnable sinks (learnable_sink=true): eager_attention_forward
+#      (:300-308) appends one learnable logit per head to the (sparse) score
+#      row, softmaxes, and drops the sink column — a sparse-keys
+#      softmax_with_sink. Stored as `self_attn.learnable_sink_param [n_heads]`.
+#   3. Indexer RoPE on the LAST qk_rope_head_dim channels of each indexer
+#      head/key ("Flipped RoPE position", Indexer.forward:234-245): split
+#      [nope, rope], rotate the tail, concat back in original order.
+#
+# Cache (REFERENCE DISAGREEMENT). HF's Attention.forward:455-457 caches the
+# EXPANDED per-head K/V ("Sparse-attention models cache the expanded K/V, not
+# the compressed latents"): n_heads · (d_qk + d_v_head) values per token per
+# layer. Serving caches the d_kv_lora MLA latent and the shared RoPE key:
+# sglang `models/hunyuan_v4.py` HYV4Attention subclasses
+# DeepseekV2AttentionMLA and forces the sparse MLA path (:527-535, "HYV4
+# requires the sparse MLA attention path"), absorbing kv_b_proj into q/o at
+# decode. This component follows the serving stacks, the same resolution
+# `mla_dsa_attention` takes for DSv3.2 / GLM-5.x: the cache is the latent
+# (`kv_a_layernorm`) + `k_pe_rope`, and the prefill graph expands it through
+# kv_b_proj; decode reads it absorbed (`decode_variant`). The attention
+# output is identical either way; HF's expanded write is an eager-path
+# materialization, not the deployed KV law.
+# Indexer.forward:247-248 caches the rotated indexer key via
+# `update_indexer`, in the model dtype.
+#
+# Produces the DSA top-K selection; "shared" layers
+# (mla_dsa_gated_sink_mrope_attention_shared) reuse it via the `dsa_topk`
+# stream — HYV4VLTextModel.forward:1208-1219 threads `prev_topk_indices`
+# layer to layer.
+#
+# Required dims: d_model, n_heads, d_qk_nope, d_qk_rope, d_v_head, d_kv_lora, d_q_lora,
+#                n_topk_keys (index_topk), n_indexer_heads (index_n_heads), d_indexer_head (index_head_dim)
+
+role: attention
+description: "MLA + DSA indexer (tail-RoPE) + learnable per-head sinks + sigmoid output gate; MLA latent KV cache; multimodal (mrope) rotations. Hy4-VL full-indexer layers."
+attn_variant: DSA
+cache:
+  family: MLA
+  entries:
+    - { node: kv_a_layernorm, kind: latent }
+    - { node: k_pe_rope, kind: rope_key }
+    - { node: indexer.key_concat, kind: index_key }
+decode_variant: mla_dsa_gated_sink_attention_absorbed
+# A query reads its top-k rows of the cached latent, so serving prefills
+# it absorbed too, through the sparse MLA kernel decode uses.
+variant_phases: [prefill, decode]
+stream_out: { dsa_topk: dsa_topk_mask }
+
+graph:
+  # --- sigmoid output gate (gated_mla), computed from the block input ---
+  linear_gate:          { op: linear, in: x, dims: { in: d_model, out: "n_heads * d_v_head" }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }
+  # --- MLA Q/KV path (identical to library mla_dsa_attention) ---
+  q_a_proj:             { op: linear, in: x, dims: { in: d_model, out: d_q_lora }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  q_a_layernorm:        { op: rmsnorm, in: q_a_proj, dim: d_q_lora, weight_axes: [{ replicated: true }] }
+  q_b_proj:             { op: linear, in: q_a_layernorm, dims: { in: d_q_lora, out: "n_heads * (d_qk_nope + d_qk_rope)" }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }
+  q_split_heads:        { op: head_split, in: q_b_proj, dims: { n_heads: n_heads, d_head: "d_qk_nope + d_qk_rope" } }
+  q_nope_slice:         { op: slice, in: q_split_heads, dims: { in: "d_qk_nope + d_qk_rope", out: d_qk_nope, start: "0" } }
+  q_pe_slice:           { op: slice, in: q_split_heads, dims: { in: "d_qk_nope + d_qk_rope", out: d_qk_rope, start: d_qk_nope } }
+  kv_a_proj_with_mqa:   { op: linear, in: x, dims: { in: d_model, out: "d_kv_lora + d_qk_rope" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  kv_latent_slice:      { op: slice, in: kv_a_proj_with_mqa, dims: { in: "d_kv_lora + d_qk_rope", out: d_kv_lora, start: "0" } }
+  k_pe_slice:           { op: slice, in: kv_a_proj_with_mqa, dims: { in: "d_kv_lora + d_qk_rope", out: d_qk_rope, start: d_kv_lora } }
+  kv_a_layernorm:       { op: rmsnorm, in: kv_latent_slice, dim: d_kv_lora, weight_axes: [{ replicated: true }] }
+  kv_b_proj:            { op: linear, in: kv_a_layernorm, dims: { in: d_kv_lora, out: "n_heads * (d_qk_nope + d_v_head)" }, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }, { replicated: true }] }
+  kv_split_heads:       { op: head_split, in: kv_b_proj, dims: { n_heads: n_heads, d_head: "d_qk_nope + d_v_head" } }
+  k_nope_slice:         { op: slice, in: kv_split_heads, dims: { in: "d_qk_nope + d_v_head", out: d_qk_nope, start: "0" } }
+  value_slice:          { op: slice, in: kv_split_heads, dims: { in: "d_qk_nope + d_v_head", out: d_v_head, start: d_qk_nope } }
+  # Multimodal rope: 3 position streams (t, h, w) with mrope_section
+  # [12, 10, 10] over the d_qk_rope=64-wide rotary slice
+  # (modeling_hy_v4_vl.py:1090, :1124-1133).
+  q_pe_rope:            { op: mrope, in: q_pe_slice, dim: d_qk_rope }
+  k_pe_rope:            { op: mrope, in: k_pe_slice, dim: d_qk_rope }
+  query_concat:         { op: concat, in: [q_nope_slice, q_pe_rope], dims: { in_a: d_qk_nope, in_b: d_qk_rope, out: "d_qk_nope + d_qk_rope" } }
+  # k_pe is single-head; fan it out to all heads before the concat.
+  k_pe_split:           { op: head_broadcast, in: k_pe_rope, dims: { n_heads: n_heads } }
+  k_split_heads:        { op: concat, in: [k_nope_slice, k_pe_split], dims: { in_a: d_qk_nope, in_b: d_qk_rope, out: "d_qk_nope + d_qk_rope" } }
+  # --- DSA indexer (HYV4VLIndexer, modeling_hy_v4_vl.py:105-208) ---
+  indexer.weights_proj: { op: linear, role: attention_indexer, in: x, dims: { in: d_model, out: n_indexer_heads }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  indexer.wk:           { op: linear, in: x, dims: { in: d_model, out: d_indexer_head }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  indexer.k_norm:       { op: layernorm, in: indexer.wk, dim: d_indexer_head, weight_axes: [{ replicated: true }] }
+  indexer.wq_b:         { op: linear, in: q_a_layernorm, dims: { in: d_q_lora, out: "n_indexer_heads * d_indexer_head" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  # Indexer RoPE rotates the LAST d_qk_rope channels (modeling_hy_v4_vl.py:173-184:
+  # split [d_indexer_head - d_qk_rope, d_qk_rope], rotate the tail, concat in
+  # original order) with the same multimodal positions. The key is cached
+  # after rotation.
+  indexer.q_split_heads: { op: head_split, in: indexer.wq_b, dims: { n_heads: n_indexer_heads, d_head: d_indexer_head } }
+  indexer.q_nope_slice: { op: slice, in: indexer.q_split_heads, dims: { in: d_indexer_head, out: "d_indexer_head - d_qk_rope", start: "0" } }
+  indexer.q_pe_slice:   { op: slice, in: indexer.q_split_heads, dims: { in: d_indexer_head, out: d_qk_rope, start: "d_indexer_head - d_qk_rope" } }
+  indexer.q_pe_rope:    { op: mrope, in: indexer.q_pe_slice, dim: d_qk_rope }
+  indexer.query_concat: { op: concat, in: [indexer.q_nope_slice, indexer.q_pe_rope], dims: { in_a: "d_indexer_head - d_qk_rope", in_b: d_qk_rope, out: d_indexer_head } }
+  indexer.k_nope_slice: { op: slice, in: indexer.k_norm, dims: { in: d_indexer_head, out: "d_indexer_head - d_qk_rope", start: "0" } }
+  indexer.k_pe_slice:   { op: slice, in: indexer.k_norm, dims: { in: d_indexer_head, out: d_qk_rope, start: "d_indexer_head - d_qk_rope" } }
+  indexer.k_pe_rope:    { op: mrope, in: indexer.k_pe_slice, dim: d_qk_rope }
+  indexer.key_concat:   { op: concat, in: [indexer.k_nope_slice, indexer.k_pe_rope], dims: { in_a: "d_indexer_head - d_qk_rope", in_b: d_qk_rope, out: d_indexer_head } }
+  # Stage 1 — dense indexer logits: Σ_h weights·ReLU(q_h·k) with the
+  # n_indexer_heads^-0.5 · d_indexer_head^-0.5 scaling of
+  # modeling_hy_v4_vl.py:194-199 folded into the kernel (as in library
+  # mla_dsa_attention).
+  indexer_logits:       { op: indexer_logits, in: [indexer.query_concat, indexer.key_concat, indexer.weights_proj], dims: { n_indexer_heads: n_indexer_heads, d_indexer_head: d_indexer_head } }
+  # Stage 2 — sparse top-K int32 indices (index_topk = 2048).
+  dsa_topk_mask:        { op: dsa_topk_mask, in: indexer_logits, dims: { k: n_topk_keys } }
+  # --- sparse attention over K/V expanded from the cached latent ---
+  qk_score:             { op: dsa_attention_score, in: [query_concat, k_split_heads, dsa_topk_mask], dims: { n_heads: n_heads, d_head: "d_qk_nope + d_qk_rope", k: n_topk_keys } }
+  learnable_sink_param: { op: parameter_vector, dim: n_heads, weight_axes: [{ world: attention, parts: n_heads, fit: replica_cells }] }
+  # The sink logit is concatenated onto the (sparse) score row, softmaxed,
+  # and dropped (modeling_hy_v4_vl.py:240-249). The softmax runs over the
+  # n_topk_keys-sparse row, so `dsa_softmax` (sparse cost, k = n_topk_keys)
+  # takes the per-head sink as a second operand.
+  softmax:              { op: dsa_softmax, in: [qk_score, learnable_sink_param], dims: { n_heads: n_heads, k: n_topk_keys } }
+  attn_apply:           { op: dsa_attention_apply, in: [softmax, value_slice], dims: { n_heads: n_heads, d_head: d_v_head, k: n_topk_keys } }
+  o_merge_heads:        { op: head_merge, in: attn_apply, dims: { n_heads: n_heads, d_head: d_v_head } }
+  g_act:                { op: sigmoid, in: linear_gate, dim: "n_heads * d_v_head" }
+  o_gated:              { op: mul, in: [o_merge_heads, g_act], dim: "n_heads * d_v_head" }
+  o_proj:               { op: linear, in: o_gated, dims: { in: "n_heads * d_v_head", out: d_model }, weight_axes: [{ replicated: true }, { world: attention, parts: n_heads, fit: replica_cells }] }
+outputs: [o_proj]
