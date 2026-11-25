@@ -18,11 +18,16 @@ export type SpecJobResult = {
   errorKind?: string;
   engineGaps?: EngineGap[];
   record?: RecordResult;
+  /** What the verdict judged: the checks it ran, and the ones it had no
+   *  checkpoint for (`validate`'s `checks`). */
+  checks?: VerdictChecks;
   /** The run could not go on without a signed-in session: the session
    *  lapsed mid-poll, or the deployment serves generation to signed-in
    *  users only (start `status: "disabled"`). */
   signInRequired?: boolean;
 };
+
+export type VerdictChecks = { ran: string[]; skipped: string[]; crashed?: string[] };
 
 export type SpecStart = {
   /** `started` / `already_running` / `cached`, or why no job started
@@ -39,12 +44,16 @@ export type SpecStart = {
 export type SpecEvent = {
   type?: string;
   text?: string;
+  /** `agent` on a log line the agent itself wrote (its prose), absent on
+   *  tool calls and harness lines. */
+  author?: string;
   success?: boolean;
   message?: string;
   resumable?: boolean;
   error_kind?: string;
   engine_gaps?: EngineGap[];
   record?: RecordResult;
+  checks?: VerdictChecks;
   usage?: UsageDelta;
   input_tokens?: number;
   output_tokens?: number;
@@ -236,7 +245,7 @@ export async function pollSpecJob(
     kind?: SpecJobKind;
     /** Required when `kind` is `fix`: jobs are keyed by record, not model. */
     recordId?: string;
-    onLog?: (line: string) => void;
+    onLog?: (line: string, author?: string) => void;
     onUsage?: (acc: UsageAcc) => void;
     onAgent?: (cli?: string, model?: string) => void;
     stopped?: () => boolean;
@@ -255,7 +264,7 @@ export async function pollSpecJob(
   let success = false;
   let message = "";
   let resumable = false;
-  let terminal: Pick<SpecJobResult, "errorKind" | "engineGaps" | "record"> = {};
+  let terminal: Pick<SpecJobResult, "errorKind" | "engineGaps" | "record" | "checks"> = {};
   let usage = emptyUsage();
   let failures = 0;
   let interval = SPEC_POLL_INTERVAL_MS;
@@ -333,7 +342,7 @@ export async function pollSpecJob(
       return { success: false, message: "Unexpected job state: missing" };
     }
     for (const evt of data.events || []) {
-      if (evt.type === "log") opts.onLog?.(evt.text || "");
+      if (evt.type === "log") opts.onLog?.(evt.text || "", evt.author);
       else if (evt.type === "usage") {
         usage = addUsage(usage, evt);
         opts.onUsage?.(usage);
@@ -345,6 +354,7 @@ export async function pollSpecJob(
           errorKind: evt.error_kind || undefined,
           engineGaps: evt.engine_gaps || undefined,
           record: evt.record || undefined,
+          checks: evt.checks || undefined,
         };
         if (evt.usage) {
           usage = addUsage(usage, evt.usage);

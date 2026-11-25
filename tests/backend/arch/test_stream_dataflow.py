@@ -259,7 +259,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -324,7 +328,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -392,7 +400,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -455,7 +467,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -508,7 +524,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -566,7 +586,11 @@ blocks:
       kh: { op: head_split, in: raw, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -620,7 +644,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
   cons:
     graph:
       body: { op: inner_cons, in: x }
@@ -691,7 +719,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
   wrap_cons:
     params: { body: { kind: component } }
     graph:
@@ -766,7 +798,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
   wrap_cons:
     params: { body: { kind: component, default: inner_cons } }
     graph:
@@ -842,7 +878,11 @@ blocks:
       kh: { op: head_split, in: s, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      prob: { op: softmax, in: score, dims: { n_heads: n_heads } }
+      ctx: { op: attention_apply, in: [prob, kh],
+               dims: { n_heads: n_heads, d_head: d_head } }
+      o: { op: head_merge, in: ctx, dims: { n_heads: n_heads, d_head: d_head } }
+    outputs: [o]
   cons:
     graph:
       body: { op: inner_cons, in: x }
@@ -1343,7 +1383,8 @@ blocks:
       kh: { op: head_split, in: shared_kv, dims: { n_heads: n_heads, d_head: d_head } }
       score: { op: attention_score, in: [qh, kh],
                dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]
+      out: { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
+    outputs: [score, out]
 model_inputs:
   input_ids: { kind: tokens }
 model:
@@ -1422,10 +1463,6 @@ def _two_writer_spec() -> str:
     readers hand on a `[B, S, d_model]` hidden state, so both writers cache
     one shape."""
     return _yoco_spec().replace("_stream_kv_shared", "_stream_kv_two").replace(
-        '''               dims: { n_heads: n_heads, d_head: d_head } }
-    outputs: [score]''', '''               dims: { n_heads: n_heads, d_head: d_head } }
-      out: { op: rmsnorm, in: x, dim: d_model, weight_axes: [{ replicated: true }] }
-    outputs: [score, out]''').replace(
         '''  self_decoder:
     graph:''', '''  self_decoder_b:
     graph:

@@ -241,17 +241,25 @@ class _Checks:
     """Every check module's findings for one validate() run, in run order."""
 
     def __init__(self, model_id, resolved, config, model_result, hf_data):
+        #: Every check this run ran, and the ones it had nothing to read for
+        #: (a model stored without a checkpoint), by label — the verdict's
+        #: own account of what it judged (`checks` in the result).
+        self.ran: List[str] = []
+        self.skipped: List[str] = []
+        #: Checks that raised (a `check_crashed` finding): they ran and
+        #: judged nothing, whatever their bucket does with the finding.
+        self.crashed: List[str] = []
         # Structural: compare each block template's forward() source against
         # its spec block graph. Catches topology bugs that params alone miss
         # (missing residual adds, reordered norms, etc.). Purely best-effort
         # — quiet when forward source isn't available.
-        self.structural_warnings = _guarded(
+        self.structural_warnings = self._run(
             "structural check", _run_structural_checks, model_id, resolved)
         # Cache-write quantisation: a cache has no checkpoint bytes to diff,
         # so the forward's own writes are the witness — a write it quantises
         # first wants a cache slot stored at that format. Hints, never a
         # gate. See _cache_writes.py.
-        self.structural_warnings += _guarded(
+        self.structural_warnings += self._run(
             "cache write check", run_cache_write_check, model_id, resolved)
 
         # Shape consistency: for every primitive op in every used block
@@ -261,7 +269,7 @@ class _Checks:
         # (e.g. concat'ing tensors whose ranks disagree, view_split on a flat
         # dim that isn't n_heads·d_head, missing broadcast before a 4-D
         # concat).
-        self.shape_mismatches = _guarded(
+        self.shape_mismatches = self._run(
             "shape check", _run_shape_consistency_check, resolved,
             model_result.block_results)
 
@@ -273,40 +281,40 @@ class _Checks:
         # n_heads·d_head, or a node whose resolved input doesn't fit the op
         # (a mis-wired edge / missing reshape), surfaces here. Positional, so
         # a concretized head axis is checked the same. Best-effort.
-        self.shape_mismatches += _guarded(
+        self.shape_mismatches += self._run(
             "dim-map consistency check", run_dim_map_consistency_check, resolved,
             model_result.block_results)
 
         # Type contracts: declared KV/attention semantics (kv_label /
         # kv_cached / kv_window) are internally consistent — the non-weight
         # attributes the bytes diff is blind to.
-        self.type_contract_warnings = _guarded(
+        self.type_contract_warnings = self._run(
             "type-contract checks", run_type_contract_checks, model_id, resolved)
 
         # A score that reads through a selection (`select` operand) reads a
         # bounded number of positions; every cached tensor its keys come
         # from must say so in its read law. Graph-internal, FP-free over the
         # corpus; gates under the `axiom` lever. See _selection_reads.py.
-        self.selection_read_errors = _guarded(
+        self.selection_read_errors = self._run(
             "selection-read check", run_selection_read_check,
             model_result.analysis)
 
         # Drafts that restate one another or a library component: the
         # shared structure belongs in one component bound per call. Warns,
         # never gates. See _reuse.py.
-        self.reuse_warnings = _guarded("reuse check", run_reuse_check, resolved)
+        self.reuse_warnings = self._run("reuse check", run_reuse_check, resolved)
 
         # The analysis's parameter counts against the ones the model card
         # states: the checkpoint anchors cannot see how a token uses what is
         # stored. Warns, never gates. See _model_card.py.
-        self.model_card_warnings = _guarded(
+        self.model_card_warnings = self._run(
             "model-card check", run_model_card_check, model_id, model_result)
 
         # Module execution: run each block template through the engine at
         # basic configs (B=1/2, S) — does the spec actually COMPUTE? Catches
         # a broken module (crash / non-finite / non-batch-linear) before
         # publish, especially newly-authored ones the static checks can't vet.
-        self.module_exec_warnings = _guarded(
+        self.module_exec_warnings = self._run(
             "module-exec checks", run_module_exec_checks, resolved)
 
         # Soft-fidelity facts the numeric anchors are blind to (both WARN,
@@ -321,7 +329,7 @@ class _Checks:
             from ._activation import run_forward_source_completeness_check
             return run_forward_source_completeness_check(model_id, resolved)
 
-        self.activation_warnings = _guarded("activation check", _activation)
+        self.activation_warnings = self._run("activation check", _activation)
 
         # A param slot whose value the config names (`ParamSpec.config`, the
         # GDN norm gate's `output_gate_type`) is bound to that op. Grounded
@@ -331,7 +339,7 @@ class _Checks:
             from ._activation import run_param_config_check
             return run_param_config_check(resolved, config)
 
-        self.param_config_errors = _guarded(
+        self.param_config_errors = self._run(
             "param-config check", _param_config)
 
         # The text rotation against the section list the config's rope
@@ -341,17 +349,17 @@ class _Checks:
         def _rotary():
             return run_rotary_position_check(resolved, config)
 
-        self.rotary_position_errors = _guarded(
+        self.rotary_position_errors = self._run(
             "rotary-position check", _rotary)
         # The mask each attention declares (`is_causal` / `is_chunked`):
         # stated inside an encoder stack, one mask per attention, a
         # bidirectional band symmetric. See _attention_masks.py.
-        self.attention_mask_errors = _guarded(
+        self.attention_mask_errors = self._run(
             "attention-mask check", run_attention_mask_check, resolved)
         # Stream anchors no recorded source could check are reported here,
         # not gated: the spec cannot supply the missing source.
-        self.forward_source_warnings = _guarded(
-            "forward-source completeness check", _forward_source) + _guarded(
+        self.forward_source_warnings = self._run(
+            "forward-source completeness check", _forward_source) + self._run(
             "cross-layer anchor notes", cross_layer_anchor_notes,
             model_id, resolved)
 
@@ -359,7 +367,7 @@ class _Checks:
         # source-derived single-layer shape/compute/KV facts) must match the
         # engine's computed values in this model's dim context. A violation
         # means the spec drifted from the locked source fact.
-        self.axiom_warnings = _guarded(
+        self.axiom_warnings = self._run(
             "axiom checks", run_axiom_checks, model_id, resolved)
 
         # Per-layer schedule exhaustiveness: when a spec drives a per-layer
@@ -370,7 +378,7 @@ class _Checks:
         # removed (faithfulness to the model is the inspector agent's job,
         # grounded in forward() source, not a config field-name regex). See
         # _schedule_exhaustiveness.py.
-        self.coverage_errors = _guarded(
+        self.coverage_errors = self._run(
             "schedule-exhaustiveness check", run_layer_schedule_check, resolved)
 
         # Cross-layer streams: a declared inner stream (state threaded
@@ -379,7 +387,7 @@ class _Checks:
         # Source-derived → dropped with the `source` lever. Anchors with no
         # recorded source to check are noted with the forward-source warnings
         # above. See _cross_layer_channels.py.
-        self.cross_layer_warnings = _guarded(
+        self.cross_layer_warnings = self._run(
             "cross-layer stream check", run_cross_layer_checks, model_id, resolved)
 
         # Packing / quant-scheme consistency: decompose the byte product back
@@ -405,22 +413,24 @@ class _Checks:
             # `decode_variant` swap in their twin, reading the same tensors.
             decode = Deployment(Program.of(resolved)).at(
                 batch=1, input_tokens=1).during("decode").checkpoint()
-            return (run_packing_consistency_check(
-                        model_result.analysis, hf_data["header"])
+            against_file = self._skip("packing against the checkpoint") if hf_data is None else (
+                run_packing_consistency_check(
+                    model_result.analysis, hf_data["header"])
+                + run_quant_method_check(
+                    resolved.spec.quant_context,
+                    hf_data.get("quant_method_unknown")))
+            return (against_file
                     + run_quant_override_check(model_result.analysis)
                     + run_quant_role_check(model_result.analysis, decode)
-                    + run_phase_format_check(model_result.analysis, decode)
-                    + run_quant_method_check(
-                        resolved.spec.quant_context,
-                        hf_data.get("quant_method_unknown")))
+                    + run_phase_format_check(model_result.analysis, decode))
 
-        self.packing_errors = _guarded("packing-consistency check", _packing)
+        self.packing_errors = self._run("packing-consistency check", _packing)
 
         # The per-rank weight ledger every drawn page prices its nodes off
         # (`capacity.weights` over the layout): a stored weight with no
         # declared `weight_axes` cannot be placed, and the byte anchor above
         # never builds it. See _weight_ledger.py.
-        self.weight_ledger_errors = _guarded(
+        self.weight_ledger_errors = self._run(
             "weight-ledger check", run_weight_ledger_check,
             model_result.analysis)
 
@@ -428,7 +438,7 @@ class _Checks:
         # walk reaches has a layout transition rule, and the per-rank weight
         # join builds at one GPU. The deployment replay is an injected gate
         # (`downstream_gates`). See _analysable.py.
-        self.analysable_errors = _guarded(
+        self.analysable_errors = self._run(
             "analysability check", run_analysable_check,
             resolved, model_result.analysis,
             ledger_built=not self.weight_ledger_errors)
@@ -436,7 +446,7 @@ class _Checks:
         # A tie against the checkpoint's names: `tied_weight.checkpoint_copy`
         # is declared exactly when the file still ships the tied layer's own
         # tensor. See _tied_copy.py.
-        self.tied_copy_errors = _guarded(
+        self.tied_copy_errors = self._skip("tied-copy check") if hf_data is None else self._run(
             "tied-copy check", run_tied_copy_check,
             model_result.analysis, hf_data.get("header"))
 
@@ -446,16 +456,28 @@ class _Checks:
         # reads — the forward never does, or does in a step the graph does
         # not model — says so (`stored_without_graph_reader`, with its
         # kind), and is held to it. See _unread_parameters.py.
-        self.unread_parameter_errors = _guarded(
+        self.unread_parameter_errors = self._run(
             "unread-parameter check", run_unread_parameter_check,
             model_result.analysis)
 
         # Every tensor name the spec stores is a header name: the other
         # direction of the name join the coverage gate reads. See
         # _checkpoint_names.py.
-        self.checkpoint_name_errors = _guarded(
+        self.checkpoint_name_errors = self._skip("checkpoint-name check") if hf_data is None else self._run(
             "checkpoint-name check", run_checkpoint_name_check,
             model_result.analysis, hf_data.get("header"))
+
+    def _run(self, label, fn, *args, **kwargs):
+        self.ran.append(label)
+        found = _guarded(label, fn, *args, **kwargs)
+        if any(isinstance(f, Finding) and f.kind == "check_crashed"
+               for f in found or ()):
+            self.crashed.append(label)
+        return found
+
+    def _skip(self, label) -> list:
+        self.skipped.append(label)
+        return []
 
 
 def _format_unmatched_hf(unmatched_hf):
@@ -580,7 +602,7 @@ def _gating_errors(checks, hf_data, model_result, unmatched_hf_list,
         )
 
     # Secondary: totals as a checksum on that join.
-    if not off("weight"):
+    if not off("weight") and hf_data is not None:
         spec_storage_bytes = _spec_storage_bytes(model_result.analysis)
         actual_storage_bytes = hf_data["model_storage_bytes"]
         bytes_diff = actual_storage_bytes - spec_storage_bytes
@@ -768,8 +790,15 @@ def validate(model_id: str, spec_name: str | None = None,
 
     # 1. Checkpoint anchor, then config. Both are infrastructure: a down Hub
     # or an empty safetensors fetch is not a broken spec.
-    hf_data = _get_safetensors_data(model_id, overlay_dir)
-    if "model_storage_bytes" not in hf_data:
+    # A model stored without a checkpoint (`stored_without_checkpoint`: a
+    # custom model described in words, or registered without weights) has
+    # nothing to compare against — `hf_data` None, and every check that
+    # reads only the spec still gates. Any other model's missing checkpoint
+    # is a failed fetch.
+    from backend.hf.metadata import stored_without_checkpoint
+    hf_data = (None if stored_without_checkpoint(model_id)
+               else _get_safetensors_data(model_id, overlay_dir))
+    if hf_data is not None and "model_storage_bytes" not in hf_data:
         raise CheckpointUnavailable(
             f"Cannot read checkpoint metadata for {model_id}: "
             "safetensors fetch returned no model_storage_bytes"
@@ -833,17 +862,21 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
         whole_stream_pairings = _run_stage(
             "projection", spec, lambda: _whole_stream_pairings(resolved))
 
-        matched, unmatched_spec_nodes, unmatched_hf = _run_stage(
-            "coverage", spec,
-            lambda: _storage_coverage(model_result, hf_data),
-        )
-        unmatched_hf_list, unmatched_hf_total = _format_unmatched_hf(unmatched_hf)
-        param_mismatches = _format_param_mismatches(matched)
-
         checks = _run_stage(
             "checks", spec,
             lambda: _Checks(model_id, resolved, config, model_result, hf_data),
         )
+
+        if hf_data is not None:
+            matched, unmatched_spec_nodes, unmatched_hf = _run_stage(
+                "coverage", spec,
+                lambda: _storage_coverage(model_result, hf_data))
+        else:
+            matched, unmatched_spec_nodes, unmatched_hf = [], [], {}
+            checks._skip("checkpoint coverage")
+            checks._skip("checkpoint bytes")
+        unmatched_hf_list, unmatched_hf_total = _format_unmatched_hf(unmatched_hf)
+        param_mismatches = _format_param_mismatches(matched)
 
         errors = _gating_errors(checks, hf_data, model_result, unmatched_hf_list,
                                 param_mismatches, _off)
@@ -854,7 +887,9 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
                  param_mismatches),
                 _off))
         storage_block, params_block, metadata_block, all_block = _headline_blocks(
-            model_result, hf_data, _off)
+            model_result, hf_data, _off) if hf_data is not None else (
+            {"spec": _spec_storage_bytes(model_result.analysis)},
+            {"spec": model_result.total_params}, {}, {})
         replayed, analysis, replay_report = _downstream(
             errors, downstream_gates, resolved, config, model_result, spec,
             _off)
@@ -866,6 +901,15 @@ def _evaluate_spec(model_id, spec_name, config, overlay_dir, hf_data, _off,
         return {
             "valid": len(errors) == 0,
             "spec_name": resolved.spec.name,
+            # `compared`: judged against the model's checkpoint; `absent`: a
+            # custom model stored without one, so the checks against the
+            # file (coverage, bytes, names, packing, tied copies) had
+            # nothing to read and every other check gated alone.
+            "checkpoint": "compared" if hf_data is not None else "absent",
+            # What this verdict judged: the checks it ran, and the ones that
+            # compare against a checkpoint it did not have.
+            "checks": {"ran": checks.ran, "skipped": checks.skipped,
+                       "crashed": checks.crashed},
             "dims": resolved.dim_values,
             # Canonical headline diff — bytes-vs-bytes (mixed-precision safe).
             "model_storage_bytes": storage_block,

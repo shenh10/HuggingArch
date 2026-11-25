@@ -126,6 +126,11 @@ _LIMITS: Dict[str, int] = {
     "/api/playground/module-bench":      _int_env("ANALYZE_RPM",   60),
     "/api/playground/model-skeleton":    _int_env("INFERENCE_RPM", 120),
     "/api/playground/components":        _int_env("INFERENCE_RPM", 120),
+    # The same two on a model the caller keeps (a described custom model).
+    "/api/account/playground/compose-model":  _int_env("ANALYZE_RPM",   60),
+    "/api/account/playground/model-skeleton": _int_env("INFERENCE_RPM", 120),
+    # A hand edit of a described model runs one validate subprocess.
+    "/api/spec/describe/save":                _int_env("ANALYZE_RPM",   60),
     # The fired-fusion report loads the spec library and walks the model
     # in a compute worker.
     "/fusion/fired":                     _int_env("INFERENCE_RPM", 120),

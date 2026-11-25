@@ -768,7 +768,6 @@ def _service_analyze_payload(req: AnalyzeRequest, user_id: Optional[str]) -> dic
     """The `/api/spec/analyze` answer; runs in a compute worker."""
     from backend.analyzer import NoSpecMatch, analyze_model
     from backend.api.routes.analyze import build_response
-    from backend.service import spec_generations
     t0 = time.time()
     try:
         try:
@@ -786,35 +785,11 @@ def _service_analyze_payload(req: AnalyzeRequest, user_id: Optional[str]) -> dic
             miss = {"success": False, "message": str(public_miss),
                     **({"no_spec": True}
                        if isinstance(public_miss, NoSpecMatch) else {})}
-            if not (user_id and _peruser_active()):
+            ov, served, refusal = user_model_overlay(user_id, req.model_id)
+            if refusal is not None:
+                return refusal
+            if ov is None:
                 return miss
-            try:
-                row = spec_generations.serving_generation(
-                    user_id, req.model_id)
-            except spec_generations.SpecGenerationsUnavailable:
-                # Not knowing is not "no spec": nothing may generate.
-                return _records_unavailable()
-            if not (row and row.get("spec_yaml")):
-                return miss
-            served = _served_record(row)
-            if row.get("status") not in spec_generations.SERVED:
-                # The user's only record of the model needs repair or
-                # was rejected: not analysed, and not a missing spec.
-                return {"success": False, **served, "message": (
-                    "Your saved spec for this model needs repair before "
-                    "the Inspector can analyse it." if row.get("status")
-                    == GenerationStatus.NEEDS_REPAIR else
-                    "Your saved spec for this model was rejected.")}
-            try:
-                bundle = _normalize_record_bundle(
-                    req.model_id, row["spec_yaml"],
-                    row.get("new_component_yamls"))
-            except (SpecBundleError, SpecLoadError) as exc:
-                fail = _bundle_failure(exc, model_id=req.model_id)
-                fail.update(served)
-                return fail
-            ov = _overlay.materialize_user_spec(
-                user_id, req.model_id, bundle, row.get("snapshot_json"))
             try:
                 priv = analyze_model(
                     model_id=req.model_id, batch_size=req.batch_size,
@@ -850,6 +825,46 @@ def _service_analyze_payload(req: AnalyzeRequest, user_id: Optional[str]) -> dic
         # capability the engine lacks) is an outcome, same as public
         # `/analyze`.
         return _analysis_refusal(e)
+
+
+def user_model_overlay(user_id: Optional[str], model_id: str
+                       ) -> tuple[Optional[str], dict, Optional[dict]]:
+    """Where a signed-in caller's own stored spec of `model_id` is served
+    from: `(overlay, served, refusal)`. `overlay` is the serving overlay the
+    record is materialized into (its spec, drafts and snapshot), None when
+    the caller has no record of it; `served` says which record answered;
+    `refusal` is the answer when the record cannot be served (records
+    unreadable, needs repair, rejected, or no longer normalizes). Every
+    surface that serves a caller's own model — the Inspector's analyze, the
+    Playground — resolves it here."""
+    from backend.service import spec_generations
+    if not (user_id and _peruser_active()):
+        return None, {}, None
+    try:
+        row = spec_generations.serving_generation(user_id, model_id)
+    except spec_generations.SpecGenerationsUnavailable:
+        # Not knowing is not "no spec": nothing may generate.
+        return None, {}, _records_unavailable()
+    if not (row and row.get("spec_yaml")):
+        return None, {}, None
+    served = _served_record(row)
+    if row.get("status") not in spec_generations.SERVED:
+        # The user's only record of the model needs repair or was rejected:
+        # not analysed, and not a missing spec.
+        return None, served, {"success": False, **served, "message": (
+            "Your saved spec for this model needs repair before it can be "
+            "analysed." if row.get("status") == GenerationStatus.NEEDS_REPAIR
+            else "Your saved spec for this model was rejected.")}
+    try:
+        bundle = _normalize_record_bundle(
+            model_id, row["spec_yaml"], row.get("new_component_yamls"))
+    except (SpecBundleError, SpecLoadError) as exc:
+        fail = _bundle_failure(exc, model_id=model_id)
+        fail.update(served)
+        return None, served, fail
+    ov = _overlay.materialize_user_spec(
+        user_id, model_id, bundle, row.get("snapshot_json"))
+    return ov, served, None
 
 
 def _records_unavailable() -> dict:

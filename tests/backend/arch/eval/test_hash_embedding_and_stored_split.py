@@ -197,11 +197,11 @@ def test_stored_split_does_not_combine_with_an_expert_weight():
 def test_a_split_reordered_weight_is_cut_on_its_logical_axis_then_laid_out_in_file_order():
     """`stored_split.axis` is an axis of the op's logical `weight_shape`;
     `stored_axes` then orders each block's payload as the file stores it.
-    A logical (out=8, in=6) linear stored transposed (`stored_axes: [1, 0]`)
-    and cut in two along `out` is two file tensors of shape (in, out/2) =
-    (6, 4), not (4, 6)."""
+    A logical (out=8, in=d_model) linear stored transposed (`stored_axes:
+    [1, 0]`) and cut in two along `out` is two file tensors of shape
+    (in, out/2) = (d_model, 4), not (4, d_model)."""
     spec = _spec("[{ replicated: true }, { replicated: true }]", op="linear",
-                 dims='in: "6", out: "8"',
+                 dims='in: d_model, out: "8"',
                  split='{ axis: 0, parts: "2", segment: "part_{i}" }').replace(
         "inputs: [input_ids], dims:",
         "inputs: [embed_tokens], stored_axes: [1, 0], dims:")
@@ -209,10 +209,10 @@ def test_a_split_reordered_weight_is_cut_on_its_logical_axis_then_laid_out_in_fi
     held = [r for r in analysis.tensors() if r.name.startswith("ngram")]
     filed = [r for r in analysis.checkpoint_tensors() if r.name.startswith("ngram")]
     assert [(r.name, tuple(int(x) for x in r.shape)) for r in held] == [
-        ("ngram.weight", (8, 6))]
+        ("ngram.weight", (8, WIDTH))]
     assert [(r.name, tuple(int(x) for x in r.shape)) for r in filed] == [
-        ("ngram.part_0.weight", (6, 4)), ("ngram.part_1.weight", (6, 4))]
-    assert sum(int(r.storage_bytes) for r in filed) == int(held[0].storage_bytes) == 8 * 6 * BF16
+        ("ngram.part_0.weight", (WIDTH, 4)), ("ngram.part_1.weight", (WIDTH, 4))]
+    assert sum(int(r.storage_bytes) for r in filed) == int(held[0].storage_bytes) == 8 * WIDTH * BF16
 
 
 def test_a_token_activates_the_rows_it_gathers_not_the_table():

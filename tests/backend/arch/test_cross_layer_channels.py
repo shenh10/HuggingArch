@@ -219,7 +219,7 @@ dims: {{ d_model: config.hidden_size, n_layers: config.num_hidden_layers,
          n_vocab: config.vocab_size }}
 blocks:
   prod_a: {{ stream_out: {{ s: mk }}, graph: {{ mk: {{ op: rmsnorm, in: x, dim: d_model }} }}, outputs: [mk] }}
-  prod_b: {{ stream_out: {{ s: mk }}, graph: {{ mk: {{ op: linear, in: x, dims: {{ in: d_model, out: n_vocab }} }} }}, outputs: [mk] }}
+  prod_b: {{ stream_out: {{ s: mk }}, graph: {{ mk: {{ op: linear, in: x, dims: {{ in: d_model, out: n_vocab }} }}, h: {{ op: rmsnorm, in: x, dim: d_model }} }}, outputs: [h] }}
   cons: {{ reads: [s], graph: {{ u: {{ op: rmsnorm, in: x, dim: d_model }}, r: {{ op: identity, in: s }} }}, outputs: [u] }}
 model_inputs:
   input_ids: {{ kind: tokens }}

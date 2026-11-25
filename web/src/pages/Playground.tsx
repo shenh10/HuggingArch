@@ -21,6 +21,7 @@ import { GraphDiffView, GraphShell, type DiffRow, type GraphDiffData, type L1Dat
 import { JumpBar } from "./pg/JumpBar";
 import { LatencySection } from "./pg/LatencySweep";
 import { PicksBar } from "./pg/PicksBar";
+import { DescribeDrawer, DescribeForm, useMyModels } from "./pg/DescribeModel";
 import { Section } from "./pg/Section";
 import { SummaryTable, type MetricCol, type SummaryRow } from "./pg/SummaryTable";
 import type { ModuleFoldRow, OpTableTotal, PerOpRow } from "./ResultSummary";
@@ -2715,6 +2716,10 @@ type SkelGroup = {
 type ModelLevel = { embedding_params: number; lm_head_params: number; lm_head_flops: number; final_norm_and_other_params: number };
 type Skeleton = {
   success: boolean; message?: string; model_id?: string; n_layers?: number; groups?: SkelGroup[];
+  /** Stored as a config and a spec with no weights (a model described in words). */
+  stored_without_checkpoint?: boolean;
+  /** `user_generation` when the caller's own record answered (the account route). */
+  served_from?: string;
 };
 type EditorPhase = {
   flops: number;
@@ -3136,6 +3141,25 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
 }) {
   const [baseModel, setBaseModel] = useState("meta-llama/Llama-3.2-3B");
   const [skel, setSkel] = useState<Skeleton | null>(null);
+  // Where the model comes from: the library, a description in words (the
+  // agent writes it as the caller's own custom model), or one they keep.
+  const [source, setSource] = useState<"library" | "describe" | "mine">("library");
+  const [signedIn, setSignedIn] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [firstTurn, setFirstTurn] = useState<{ name: string; description: string; base?: string; seq: number } | null>(null);
+  const [myReload, setMyReload] = useState(0);
+  const myModels = useMyModels(signedIn, myReload);
+  // A signed-in caller's requests go to the account routes, which answer
+  // with the caller's own model where they keep one and as the library
+  // otherwise; refs, since the loaders are stable callbacks.
+  const playgroundRoute = useRef("/api/playground");
+  useEffect(() => {
+    void authContext().then((ctx) => {
+      const authed = ctx.authEnabled && ctx.loggedIn;
+      playgroundRoute.current = authed ? "/api/account/playground" : "/api/playground";
+      setSignedIn(authed);
+    });
+  }, []);
   // group_id → slot path → component
   const [swaps, setSwaps] = useState<Record<number, Record<string, string>>>({});
   // `${group_id}|${slot}` set when the swap applies to every group bound to the component
@@ -3167,7 +3191,7 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
     setRenderedSeq(0); setComposeState("idle");
     if (!keepEdits) { setSwaps({}); setScopeAll({}); setGroupDims({}); setOpenDims({}); }
     try {
-      const s = await fetchJson<Skeleton>(`/api/playground/model-skeleton?model_id=${encodeURIComponent(model)}`);
+      const s = await fetchJson<Skeleton>(`${playgroundRoute.current}/model-skeleton?model_id=${encodeURIComponent(model)}`);
       setSkel(s);
       setStatus(s.success ? "Loaded." : `Failed: ${s.message}`);
       setStatusKind(s.success ? "ok" : "err");
@@ -3282,7 +3306,7 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
     setComposeState("pending");
     setStatus("Composing…"); setStatusKind("idle");
     try {
-      const r = await fetchJson<ComposeResp>("/api/playground/compose-model", {
+      const r = await fetchJson<ComposeResp>(`${playgroundRoute.current}/compose-model`, {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: sentJson,
       });
@@ -3325,6 +3349,22 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
   }, [bodyJson, skel, runCompose]);
 
   const statusClass = statusKind === "ok" ? "text-sm text-green-600" : statusKind === "err" ? "text-sm text-red-500" : "text-sm text-gray-500";
+  // a model the caller keeps and the agent writes: their own record, stored
+  // without a checkpoint (a described model, not a generated Hub spec)
+  const ownLoaded = !!skel?.success && skel.served_from === "user_generation" && !!skel.stored_without_checkpoint;
+  // the editor's unsaved changes on a model the caller keeps, as words the
+  // next agent turn carries (writing them into the spec is the agent's)
+  const pendingEdits = [
+    ...requestGroups.map((g) => {
+      const label = byId.get(g.group_id)?.layers_label ?? `group ${g.group_id}`;
+      const parts = [
+        ...Object.entries(g.slots).map(([slot, comp]) => `${slot} → ${comp}`),
+        ...Object.entries(g.dims).map(([k, v]) => `${k} = ${v}`),
+      ];
+      return `layers ${label}: ${parts.join(", ")}`;
+    }),
+    ...(Object.keys(dims).length ? [`every layer: ${Object.entries(dims).map(([k, v]) => `${k} = ${v}`).join(", ")}`] : []),
+  ].join("; ");
   const errors = composeErrors.length ? composeErrors : (resp?.errors ?? []);
   const errorsOf = (id: number | null) => errors.filter((e) => e.group_id === id);
   const changesOf = (id: number) => resp?.groups?.find((g) => g.group_id === id)?.dim_changes;
@@ -3345,7 +3385,7 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
     <>
       <h1 className="text-2xl font-bold text-gray-900 mb-1">Playground — Model Editor</h1>
       <p className="text-sm text-gray-500 mb-4 max-w-3xl">
-        Import a model, swap the attention / FFN of any layer group and adjust dims, and see the
+        Import a model — from the library, or described in words — swap the attention / FFN of any layer group and adjust dims, and see the
         <span className="font-medium"> whole-model</span> cost — the same numbers the Inspector shows for that model.
         Hybrid stacks are edited group by group; an MTP layer is a group of its own.
       </p>
@@ -3356,16 +3396,50 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
         </div>
       )}
 
+      <div className={drawerOpen ? "grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_24rem] gap-5 items-start" : ""}>
+      <div className="min-w-0">
       <section className="card p-4 sm:p-6 mb-6">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Base model</label>
-          <input list="pg-models" value={baseModel} onChange={(e) => setBaseModel(e.target.value)}
-            className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 bg-white" />
-          <datalist id="pg-models">{models.map((m) => <option key={m} value={m} />)}</datalist>
+        <div id="pg-source" className="inline-flex rounded-lg border border-gray-300 p-0.5 text-sm mb-4">
+          {([["library", "From the library"], ["describe", "Describe in words"], ["mine", `My models (${myModels.length})`]] as const).map(([k, label]) => (
+            <button key={k} type="button" data-source={k} onClick={() => { setSource(k); if (k === "describe") setDrawerOpen(true); }}
+              className={`px-3 py-1 rounded-md ${source === k ? "bg-gray-800 text-white" : "text-gray-500 hover:text-gray-800"}`}>{label}</button>
+          ))}
         </div>
+        {source === "library" && (
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Base model</label>
+            <input list="pg-models" value={baseModel} onChange={(e) => setBaseModel(e.target.value)}
+              className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 bg-white" />
+          </div>
+        )}
+        {source === "mine" && (
+          myModels.length
+            ? <div className="flex flex-wrap gap-2">{myModels.map((m) => (
+                <button key={m} type="button" onClick={() => { setBaseModel(m); void loadSkeleton(m); }}
+                  className={`px-2.5 py-1 rounded-lg border text-sm font-mono ${loadedModelId === m ? "border-gray-800" : "border-gray-300 hover:border-gray-500"}`}>{m}</button>
+              ))}</div>
+            : <p className="text-sm text-gray-500">{signedIn ? "No models yet — describe one in words." : "Sign in to keep models of your own."}</p>
+        )}
+        {source === "describe" && (
+          <DescribeForm models={models} signedIn={signedIn} busy={false}
+            onStart={(name, description, base) => {
+              setDrawerOpen(true);
+              setFirstTurn({ name, description, base, seq: Date.now() });
+            }} />
+        )}
+        <datalist id="pg-models">{models.map((m) => <option key={m} value={m} />)}</datalist>
         <div className="mt-4 flex flex-wrap items-center gap-3">
-          <button id="pg-load" type="button" onClick={() => loadSkeleton(baseModel)} disabled={!baseModel.trim()}
-            className="px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-lg text-sm font-medium transition disabled:opacity-40 disabled:cursor-not-allowed">Load model</button>
+          {source === "library" && (
+            <button id="pg-load" type="button" onClick={() => loadSkeleton(baseModel)} disabled={!baseModel.trim()}
+              className="px-4 py-2 bg-gray-700 hover:bg-gray-800 text-white rounded-lg text-sm font-medium transition disabled:opacity-40 disabled:cursor-not-allowed">Load model</button>
+          )}
+          {ownLoaded && <span className="font-mono text-sm font-semibold">{loadedModelId}</span>}
+          {skel?.success && skel.stored_without_checkpoint && (
+              <span id="pg-hypothetical" className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200"
+                title="Written from a description: structure and costs come from the spec, but there is no checkpoint to check the weights against.">
+                Hypothetical · not checked against a checkpoint</span>
+          )}
+          {ownLoaded && !drawerOpen && <button type="button" onClick={() => setDrawerOpen(true)} className="text-xs text-gray-600 underline">Agent &amp; files</button>}
           <span className={statusClass}>{status}</span>
         </div>
       </section>
@@ -3488,6 +3562,14 @@ function ModelEditor({ models, components, gpuSku, gpus, onGpuSku, precision, pr
           )}
         </>
       )}
+      </div>
+      {drawerOpen && (
+        <DescribeDrawer modelId={ownLoaded ? loadedModelId : (firstTurn ? `custom:${firstTurn.name}` : null)}
+          firstTurn={firstTurn} pendingEdits={ownLoaded ? pendingEdits : ""}
+          onModel={(id) => { setBaseModel(id); setMyReload((n) => n + 1); void loadSkeleton(id); }}
+          onClose={() => setDrawerOpen(false)} />
+      )}
+      </div>
     </>
   );
 }

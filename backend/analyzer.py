@@ -18,7 +18,7 @@ from backend.arch.eval.projection.result import ModelReport, NodeReport
 from backend.arch.eval.projection.formulas import encoder_item_formulas
 from backend.arch.eval.transforms import CallSite
 from backend.custom_id import is_custom_id
-from backend.arch.loader import SpecLoader, overlay_kwargs, get_default_loader
+from backend.arch.loader import serving_loader
 from backend.hf.metadata import HUB_UNREACHABLE, fetch_config, fetch_metadata
 from backend.arch.snapshots import load_model_str as _load_snapshot_model_str
 from backend.hf.forward_source import model_info_cache_path
@@ -70,14 +70,10 @@ def analyze_model(model_id: str = "", batch_size: int = 1, seq_len: int = 2048,
     # to the named registered spec instead of falling into score-based
     # model_type matching (which can collide across agent-generated
     # custom specs sharing a model_type).
-    if overlay_dir:
-        loader = SpecLoader(**overlay_kwargs(overlay_dir))
-    else:
-        loader = get_default_loader()
     # The config, checkpoint and print(model) tree all come from the record
     # the spec is served from: the shared snapshot, else the overlay's (a
     # stored record carries the snapshot its spec was judged against).
-    overlay_dir = overlay_dir or loader.overlay_for(model_id)
+    loader, overlay_dir = serving_loader(model_id, overlay_dir)
     config = fetch_config(model_id, overlay_dir)
     if config is None:
         return {"success": False, "error": explain_config_fetch_failure(model_id)}

@@ -41,6 +41,7 @@ def test_fetch_metadata_raises_on_corrupt_custom_index(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "is_custom_id", lambda mid: True)
     monkeypatch.setattr(metadata, "strip_prefix", lambda mid: mid)
     monkeypatch.setattr(metadata, "model_path", lambda mid: tmp_path)
+    monkeypatch.setattr(metadata, "registered_on_host", lambda mid: True)
 
     with pytest.raises(ValueError, match="corrupt"):
         metadata.fetch_metadata("custom:whatever")
@@ -52,6 +53,7 @@ def test_fetch_metadata_absent_custom_index_is_quiet(tmp_path, monkeypatch):
     monkeypatch.setattr(metadata, "is_custom_id", lambda mid: True)
     monkeypatch.setattr(metadata, "strip_prefix", lambda mid: mid)
     monkeypatch.setattr(metadata, "model_path", lambda mid: tmp_path)  # no file
+    monkeypatch.setattr(metadata, "registered_on_host", lambda mid: True)
 
     out = metadata.fetch_metadata("custom:whatever")
     assert out == {}

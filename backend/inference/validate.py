@@ -3,7 +3,9 @@
 The arch validator (`backend.arch.validate`) plus its last gate, the replay
 of the analysis on the product's deployments (`analysable.replay_gate`).
 `valid: true` from this entry point means the spec matches its checkpoint and
-analyses on every deployment the product offers for it. Same arguments and
+analyses on every deployment the product offers for it — or, for a model
+stored without a checkpoint (`checkpoint: absent`), passes every check that
+reads the spec alone and analyses on every deployment. Same arguments and
 JSON as the arch CLI, which stays as the arch-only diagnostic.
 """
 from __future__ import annotations

@@ -1862,6 +1862,15 @@ class Evaluator:
                 fix=f"give `{node.op}` operands of the shapes it accepts, "
                     "or the op the forward source applies to these tensors",
                 node=node.display_path)
+        mismatch = op.weight_operand_violation(
+            bind_labels(op, in_shapes)[0], dims) if in_shapes else None
+        if mismatch is not None:
+            raise SpecRefusal(
+                f"{node.display_path} ({node.op}): {mismatch}",
+                declaration="in",
+                fix="bind the axis to the dim the input carries, or wire "
+                    "the input the op was meant to read",
+                node=node.display_path)
         # Shape inference consumes the live tensors.  FLOP signatures are
         # port-positional, so an absent earlier operand must remain an empty
         # slot rather than shifting every later tensor onto the wrong template.

@@ -95,7 +95,7 @@ from backend.arch.spec_parsing import (
     _parse_component_document,
     _extract_unresolved_note,
 )
-from backend.custom_id import CACHE_DIR, is_custom_id, model_path, strip_prefix
+from backend.custom_id import CACHE_DIR, is_custom_id, model_path, registered_on_host, strip_prefix
 from backend.arch.document import SpecDocument
 from backend.arch.schema import (
     ArchSpec,
@@ -734,6 +734,19 @@ _spec_miss_hook = None  # Optional[Callable[[str], Optional[str]]]
 def set_spec_miss_hook(fn) -> None:
     global _spec_miss_hook
     _spec_miss_hook = fn
+
+
+def serving_loader(model_id: str, overlay_dir: Optional[str] = None
+                   ) -> Tuple["SpecLoader", Optional[str]]:
+    """The loader `model_id` is served by and the overlay its config and
+    checkpoint record come from. `overlay_dir` (a caller's own serving
+    overlay, from the service layer) layers its specs over the shared tree;
+    None serves from the shared singleton, whose own overlay (a spec-miss
+    attach) is the record's. Every surface that resolves a model for display
+    — analyze, the Playground — picks its loader here."""
+    loader = (SpecLoader(**overlay_kwargs(overlay_dir)) if overlay_dir
+              else get_default_loader())
+    return loader, overlay_dir or loader.overlay_for(model_id)
 
 
 def overlay_kwargs(overlay_dir: Optional[str]) -> dict:
@@ -1922,8 +1935,13 @@ class SpecLoader:
     def _spec_by_model_id(self, model_id: str) -> Optional[ArchSpec]:
         """The spec a `custom:<dir>` pin or a registered `match.model_id`
         names, or None. A registered-but-broken id is refused loudly."""
-        if model_id.startswith("custom:"):
-            spec_name = self._custom_dir_to_spec.get(model_id[len("custom:"):])
+        if is_custom_id(model_id) and (registered_on_host(model_id)
+                                       or model_id not in self._id_index):
+            # A custom id registered on this host is the host's: its dir pins
+            # the spec, as it answers for the config (`hf.metadata`). Any
+            # other custom id is a model a user keeps, served from the
+            # overlay spec that claims it (`match.model_id`).
+            spec_name = self._custom_dir_to_spec.get(strip_prefix(model_id))
             return self._specs.get(spec_name) if spec_name else None
         if model_id in self._id_index:
             self._refuse_if_load_failed(model_id=model_id)

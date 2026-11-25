@@ -769,6 +769,99 @@ def prepare_custom_refine_prompt(
     }
 
 
+def _describe_base_section(base_model_id: str) -> str:
+    """The starting point a description names: the library spec that model
+    is served from, and its config, verbatim."""
+    import json
+    from pathlib import Path
+    from backend.arch.loader import get_default_loader
+    from backend.hf.metadata import fetch_config
+
+    spec = get_default_loader().spec_for_model_id(base_model_id)
+    config = fetch_config(base_model_id)
+    if spec is None or not spec.source_path or config is None:
+        raise RuntimeError(
+            f"{base_model_id} is not a model this server serves; describe "
+            f"the model without it, or pick one from the library.")
+    spec_text = Path(spec.source_path).read_text(encoding="utf-8")
+    return (
+        f"## Starting point: {base_model_id}\n\n"
+        f"The description builds on this model. Its spec (which may name a "
+        f"`base:` from `backend/arch/models/` that you can read) and its "
+        f"config follow. Start from them and change what the description "
+        f"asks for.\n\n```yaml\n{spec_text}\n```\n\n"
+        f"```json\n{json.dumps(config, indent=2)}\n```"
+    )
+
+
+def build_describe_prompt(custom_name: str, description: str, *,
+                          target_root: str,
+                          base_model_id: str | None = None) -> str:
+    """Prompt for writing a model from a description in words.
+
+    There is no checkpoint and no modeling source: the description is the
+    only ground truth. The agent writes the structure (the spec) and the
+    numbers (a config) as a custom model, and the validator judges it with
+    every check that reads the spec alone (`checkpoint: absent`)."""
+    from pathlib import Path
+    model_id = f"custom:{custom_name}"
+    spec_path = _custom_write_path(custom_name, target_root)
+    snapshot = Path(target_root) / "snapshots" / f"{model_id}.json"
+
+    sections = [
+        "## Ground Truth: the user's description\n\n"
+        "This is the only source. There is no checkpoint and no modeling "
+        "code: build exactly the model it describes.\n\n"
+        f"> {description.strip()}"
+    ]
+    if base_model_id:
+        sections.append(_describe_base_section(base_model_id))
+    task_body = (
+        f"# Task: write the model `{model_id}` from its description\n\n"
+        f"Write two files, and no others:\n\n"
+        f"1. `{snapshot}` — JSON of the form "
+        f"`{{\"model_id\": \"{model_id}\", \"config\": {{...}}}}`. "
+        f"`config` is the model's config.json: every number the spec reads "
+        f"(`config.<field>`), `model_type`, and `torch_dtype` (the dtype its "
+        f"weights are stored in). Use the field names transformers models "
+        f"use (`hidden_size`, `num_attention_heads`, …).\n"
+        f"2. `{spec_path}` — the spec. Compose it from library components "
+        f"wherever one fits (read `backend/arch/components/library/` and "
+        f"`backend/arch/models/` for bases you can name with `base:`); keep "
+        f"anything new inline under the file's top-level `blocks:`, with no "
+        f"draft files. Set `match: {{ model_id: [{model_id}] }}` and write no "
+        f"top-level `name:`. Weight precision other than `torch_dtype` (FP8 "
+        f"experts, …) goes in `quant_context`.\n\n"
+        f"The validator has no checkpoint to compare against, so it judges "
+        f"structure alone: every edge's shape, every op's input against its "
+        f"weight, caches, streams. "
+        f"{shell_rules(model_id)} Iterate until it reports PASS.\n\n"
+        f"When the description leaves a number open (vocab size, norm eps, "
+        f"head count, dtype, …), choose the value a model of this kind most "
+        f"commonly has. Finish with a short message in the user's language: "
+        f"what you built and from which components, then a list headed "
+        f"`Assumed:` with every value you chose that the description did not "
+        f"give, one `name: value` per line."
+    )
+    return assemble_task_prompt(
+        build_system_prompt(), "\n\n".join(sections), task_body)
+
+
+def prepare_describe_prompt(custom_name: str, description: str, *,
+                            target_root: str,
+                            base_model_id: str | None = None) -> dict:
+    """Prompt + prefetch logs for writing a model from a description."""
+    return {
+        "prompt": build_describe_prompt(
+            custom_name, description, target_root=target_root,
+            base_model_id=base_model_id),
+        "prefetch_logs": [
+            f"Writing custom:{custom_name} from its description"
+            + (f", starting from {base_model_id}" if base_model_id else "")],
+        "target_root": target_root,
+    }
+
+
 def prepare_generate_prompt(model_id: str, *, target_root: str | None = None) -> dict:
     """Build prompt plus user-visible prefetch logs for generation.
 

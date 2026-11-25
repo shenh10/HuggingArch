@@ -1809,9 +1809,9 @@
         "stacks": {
           "vision": {
             "act_peak_bytes_per_rank": 10340352,
-            "act_read_bytes": 14643552,
-            "act_write_bytes": 14212352,
-            "flops": 171896111296,
+            "act_read_bytes": 15095136,
+            "act_write_bytes": 14663936,
+            "flops": 171897917632,
             "handoff_rows": {
               "vision": [
                 49
@@ -1838,9 +1838,9 @@
         "stacks": {
           "vision": {
             "act_peak_bytes_per_rank": 23281664,
-            "act_read_bytes": 68408704,
-            "act_write_bytes": 66683904,
-            "flops": 707034619648,
+            "act_read_bytes": 70215040,
+            "act_write_bytes": 68490240,
+            "flops": 707041844992,
             "handoff_rows": {
               "vision": [
                 196
@@ -1869,9 +1869,9 @@
         "stacks": {
           "vision": {
             "act_peak_bytes_per_rank": 10340352,
-            "act_read_bytes": 14643552,
-            "act_write_bytes": 14212352,
-            "flops": 171896111296,
+            "act_read_bytes": 15095136,
+            "act_write_bytes": 14663936,
+            "flops": 171897917632,
             "handoff_rows": {
               "vision": [
                 49
@@ -1898,9 +1898,9 @@
         "stacks": {
           "vision": {
             "act_peak_bytes_per_rank": 13049856,
-            "act_read_bytes": 68408704,
-            "act_write_bytes": 66683904,
-            "flops": 707034619648,
+            "act_read_bytes": 70215040,
+            "act_write_bytes": 68490240,
+            "flops": 707041844992,
             "handoff_rows": {
               "vision": [
                 196

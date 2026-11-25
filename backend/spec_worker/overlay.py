@@ -857,6 +857,63 @@ def authored_yaml(target_root: str | Path | None) -> list[str]:
             for path in sorted(directory.glob("*.yaml")) if path.is_file()]
 
 
+def authored_files(target_root: str | Path | None) -> list[str]:
+    """`authored_yaml` plus the config a model written from a description
+    keeps in the leaf's snapshot (`snapshots/custom:*.json`, the one
+    snapshot an agent may write)."""
+    if not target_root:
+        return []
+    root = Path(target_root)
+    return [*authored_yaml(root),
+            *(path.relative_to(root).as_posix()
+              for path in sorted((root / "snapshots").glob("custom:*.json"))
+              if path.is_file())]
+
+
+def continue_from_record(user_id: str, model_id: str,
+                         bundle: NormalizedBundle,
+                         snapshot_json: dict | None) -> str:
+    """Re-open a user's generate leaf for the next turn on a model they keep:
+    the agent session stays (the turn re-enters it), and the authored files
+    are replaced by the stored record — which holds any edit the user made
+    by hand since, and outlives a leaf the GC reaped. Returns the leaf."""
+    leaf = generate_leaf(user_id, model_id)
+    ov = _prepare(leaf, agent_workspace=True, mode="resume")
+    for authored in (overlay_models_dir(ov), overlay_drafts_dir(ov),
+                     ov / "snapshots"):
+        shutil.rmtree(authored, ignore_errors=True)
+        authored.mkdir(parents=True, exist_ok=True)
+    _chown_to_agent(overlay_models_dir(ov), overlay_drafts_dir(ov),
+                    ov / "snapshots")
+    _write_spec_into(ov, bundle)
+    if snapshot_json:
+        store_snapshot(model_id, snapshot_json, str(ov))
+    # The turn edits these in place, as the agent user.
+    _chown_to_agent(*(path for authored in (overlay_models_dir(ov),
+                                            overlay_drafts_dir(ov),
+                                            ov / "snapshots")
+                      for path in authored.iterdir()))
+    with suppress(Exception):  # GC is best-effort; never break a run
+        gc_overlays(spec_runs_root())
+    return str(ov)
+
+
+def scratch_user_spec(user_id: str, model_id: str, bundle: NormalizedBundle,
+                      snapshot_json: dict | None) -> str:
+    """A throwaway overlay holding one candidate of a user's model — a hand
+    edit to validate before it is kept. Not the serving overlay
+    (`materialize_user_spec`), which readers are using: a candidate that
+    fails must never be what they read. The caller removes it."""
+    scratch = _under(user_specs_root(), "_scratch", _safe(user_id))
+    scratch.mkdir(parents=True, exist_ok=True)
+    ov = _prepare(Path(tempfile.mkdtemp(prefix=f"{_safe(model_id)}.",
+                                        dir=scratch)))
+    _write_spec_into(ov, bundle)
+    if snapshot_json:
+        store_snapshot(model_id, snapshot_json, str(ov))
+    return str(ov)
+
+
 def resolve_run_workspace(target_root: str | Path | None) -> str:
     """Validate and normalize the current run overlay as an agent workspace.
 

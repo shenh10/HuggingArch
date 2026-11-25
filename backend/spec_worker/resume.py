@@ -27,7 +27,7 @@ from backend.agents.base import AgentEnd
 
 from . import worker as _worker
 from ._prompts.tasks import _PY
-from .overlay import RunEnd, _safe, authored_yaml, overlay_models_dir
+from .overlay import RunEnd, _safe, authored_files, overlay_models_dir
 
 
 def resumable_session(end: Optional[RunEnd], agent_cli: str,
@@ -69,16 +69,33 @@ def _verdict(model_id: str, target_root: str) -> str:
 
 
 def continuation_prompt(model_id: str, target_root: str,
-                        end: Optional[RunEnd]) -> str:
+                        end: Optional[RunEnd],
+                        request: Optional[str] = None) -> str:
     """The turn that picks the draft up: how the last run ended, the files
-    it left, and the validator's verdict on them now."""
+    it left, and the validator's verdict on them now. `request` is a change
+    the user asks for on a model written from a description (a follow-up
+    turn): the turn then starts from the model as it stands, whatever the
+    last run's ending."""
+    files = "\n".join(f"- `{name}`" for name in authored_files(target_root))
+    if request is not None:
+        return (
+            f"# Change request for {model_id}\n\n"
+            f"The model as it stands — your last turn, with any edits the "
+            f"user made by hand since — is in this workspace:\n{files}\n\n"
+            f"{_verdict(model_id, target_root)}\n\n"
+            f"The user asks:\n\n> {request.strip()}\n\n"
+            "Edit the files in place to make that change. After each edit "
+            f"re-run `{_PY} -m backend.inference.validate {model_id}` and "
+            "iterate until it reports PASS. Finish with a short message in "
+            "the user's language: what you changed, then `Assumed:` with "
+            "any value you chose that the user did not give."
+        )
     if end is not None and end.timed_out:
         ended = "stopped when it reached its time budget"
     elif end is not None and end.message:
         ended = f"ended with: {end.message[:1000]}"
     else:
         ended = "stopped before it finished"
-    files = "\n".join(f"- `{name}`" for name in authored_yaml(target_root))
     return (
         f"# Continuation: your earlier draft of {model_id}\n\n"
         f"An earlier run of this task {ended}. Its files are in this "
@@ -92,7 +109,8 @@ def continuation_prompt(model_id: str, target_root: str,
 
 def prepare_resume(model_id: str, *, target_root: str, agent_cli: str,
                    base_prep: Callable[[], dict],
-                   end: Optional[RunEnd] = None) -> dict:
+                   end: Optional[RunEnd] = None,
+                   request: Optional[str] = None) -> dict:
     """Prep for a continued generation. `agent_cli` is the CLI this run
     spawns. `base_prep` is the original task's prep (prompt, snapshot, staged
     source); it runs only for a cold start, which needs the task prompt — a
@@ -104,12 +122,14 @@ def prepare_resume(model_id: str, *, target_root: str, agent_cli: str,
         end = RunEnd.read(target_root)
     session = resumable_session(end, agent_cli, target_root)
     if session:
-        prep = {"prompt": continuation_prompt(model_id, target_root, end),
+        prep = {"prompt": continuation_prompt(model_id, target_root, end,
+                                              request),
                 "target_root": target_root, "prefetch_logs": []}
         note = "Continuing the earlier draft in its agent session"
     else:
         prep = base_prep()
-        continuation = continuation_prompt(model_id, target_root, end)
+        continuation = continuation_prompt(model_id, target_root, end,
+                                           request)
         prep["prompt"] = (f"{(prep.get('prompt') or '').rstrip()}"
                           f"\n\n---\n\n{continuation}")
         note = "Continuing the earlier draft in a new agent session"

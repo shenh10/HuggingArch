@@ -31,3 +31,11 @@ def strip_prefix(model_id: str) -> str:
 
 def model_path(name: str) -> Path:
     return cache_dir() / strip_prefix(name)
+
+
+def registered_on_host(model_id: str) -> bool:
+    """Whether `custom:<name>` is a model registered on this host (its dir
+    exists). Such an id is the host's: its dir answers for its spec, config
+    and checkpoint, and no user's model takes the name. Every reader that
+    chooses between the host's dir and a caller's overlay asks here."""
+    return is_custom_id(model_id) and model_path(strip_prefix(model_id)).is_dir()

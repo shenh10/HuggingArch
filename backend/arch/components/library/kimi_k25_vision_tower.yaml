@@ -10,9 +10,10 @@
 #   x = x + vision_tower.patch_embed.pos_emb           # 2D learned PE
 #   for blk in vision_tower.encoder.blocks: x = blk(x) # n_vis_layers ViT blocks
 #   x = vision_tower.encoder.final_layernorm(x)
-#   x = mm_projector.pre_norm(x)                       # rmsnorm
+#   x = mm_projector.pre_norm(x)                       # layernorm at d_vis_model, before the merge
 #   x = patch_merger(x)                                # n_spatial_merge×n_spatial_merge pixel-shuffle to d_proj_in
 #   x = mm_projector.proj.0(x)                         # d_proj_in → d_proj_in
+#   x = gelu(x)                                        # PatchMergerMLP.proj = Linear, GELU, Linear
 #   x = mm_projector.proj.2(x)                         # d_proj_in → d_model
 #
 # Required dims: d_vis_model, n_vis_heads, d_vis_head, d_vis_ffn, n_vis_layers, n_vis_channels, s_patch, PeH, PeW, d_proj_hidden, d_proj_in, d_model.
@@ -30,9 +31,10 @@ graph:
     formula: "y[b, i, :] = x[b, i, :] + pos_emb[i, :]   (lookup by flattened patch index)"
   vision_tower.encoder.blocks:               { op: kimi_k25_vision_block, in: vision_tower.patch_embed.add_pe, chain: n_vis_layers, checkpoint: { index: local }, role: aux_block }
   vision_tower.encoder.final_layernorm:      { op: layernorm, in: vision_tower.encoder.blocks, dim: d_vis_model, weight_axes: [{ replicated: true }] }
-  mm_projector.spatial_merge:                { op: spatial_merge, in: vision_tower.encoder.final_layernorm, dims: { n_spatial_merge: n_spatial_merge } }
-  mm_projector.pre_norm:                     { op: layernorm, in: mm_projector.spatial_merge, dim: d_proj_hidden, weight_axes: [{ replicated: true }] }
-  mm_projector.proj.0:                       { op: linear, in: mm_projector.pre_norm, dims: { in: d_proj_in, out: d_proj_in, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
-  mm_projector.proj.2:                       { op: linear, in: mm_projector.proj.0, dims: { in: d_proj_in, out: d_model, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  mm_projector.pre_norm:                     { op: layernorm, in: vision_tower.encoder.final_layernorm, dim: d_proj_hidden, weight_axes: [{ replicated: true }] }
+  mm_projector.spatial_merge:                { op: spatial_merge, in: mm_projector.pre_norm, dims: { n_spatial_merge: n_spatial_merge } }
+  mm_projector.proj.0:                       { op: linear, in: mm_projector.spatial_merge, dims: { in: d_proj_in, out: d_proj_in, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
+  mm_projector.gelu:                         { op: gelu, in: mm_projector.proj.0, dim: d_proj_in }
+  mm_projector.proj.2:                       { op: linear, in: mm_projector.gelu, dims: { in: d_proj_in, out: d_model, bias: "1" }, weight_axes: [{ replicated: true }, { replicated: true }] }
 
 outputs: [mm_projector.proj.2]

@@ -35,6 +35,7 @@ from backend._agent_runner import scrub_paths, stream_agent_core
 from backend._agent_runner.runner import sse as _sse
 from backend.agents.base import AgentEnd
 from backend.custom_id import is_custom_id
+from backend.hf.metadata import stored_without_checkpoint
 from backend.spec_worker.overlay import (
     has_resumable_draft,
     is_anonymous_overlay,
@@ -548,6 +549,22 @@ def _run_snapshot_json(model_id: str, target_root: Optional[str]) -> dict:
     return snapshot_json
 
 
+def _record_snapshot(model_id: str, target_root: Optional[str],
+                     snapshot_fields: Optional[dict] = None) -> dict:
+    """The snapshot a run's record keeps: the one the run wrote, and what
+    its caller keeps beside it (`snapshot_fields`: a described model's
+    description, so a later turn reads it from the record, not the
+    browser). A model stored without a checkpoint (written from a
+    description) authored its snapshot in the agent's workspace: of it the
+    record keeps the config alone — everything else a snapshot holds is a
+    fact about a checkpoint or its source."""
+    snapshot_json = _run_snapshot_json(model_id, target_root)
+    if stored_without_checkpoint(model_id):
+        snapshot_json = {"model_id": model_id,
+                         "config": snapshot_json.get("config") or {}}
+    return {**snapshot_json, **(snapshot_fields or {})}
+
+
 def _record_bundle(model_id: str, target_root: Optional[str],
                    started_at: float, *,
                    seed_bundle: Optional[NormalizedBundle | BlockedBundle] = None,
@@ -606,7 +623,8 @@ def _record_blocked(model_id: str, log_file: IO, started_at: float,
         agent_cli = prep_result.get("agent_cli")
         outcome = records.record_pending(
             model_id=model_id, user_id=user_id, spec_yaml=spec_yaml,
-            snapshot_json=_run_snapshot_json(model_id, target_root),
+            snapshot_json=_record_snapshot(
+                model_id, target_root, prep_result.get("snapshot_fields")),
             new_component_yamls=files, agent_cli=agent_cli,
             agent_model=_run_agent_model(prep_result, agent_cli),
             engine_gaps=list(downgrade.engine_gaps),
@@ -775,6 +793,7 @@ def _publish_to_cache(
     code_revision: Optional[str] = None,
     run_started_at: Optional[str] = None,
     record_result: Optional[dict] = None,
+    snapshot_fields: Optional[dict] = None,
 ) -> Optional[Downgrade]:
     """Write-through to Supabase `cached_specs` so other VMs can skip
     the agent for this model_id.
@@ -878,7 +897,7 @@ def _publish_to_cache(
             log_file.flush()
             return
 
-        snapshot_json = _run_snapshot_json(model_id, target_root)
+        snapshot_json = _record_snapshot(model_id, target_root, snapshot_fields)
 
         try:
             # Self-register only after normalization: a failed bundle must
@@ -1108,6 +1127,10 @@ def _on_success(model_id: str, log_file: IO, started_at: float, prep_result: dic
             if record["outcome"] == RecordOutcome.FAILED.value:
                 return f"{downgrade.reason} {BLOCKED_NOT_SAVED}"
         return downgrade.reason
+    # What the verdict judged rides on the run's `done` (`checks`: the
+    # checks it ran and the ones it had no checkpoint for).
+    if (val_result or {}).get("checks"):
+        prep_result.setdefault("terminal", {})["checks"] = val_result["checks"]
     record: dict = {}
     publish_downgrade = _publish_to_cache(
         model_id, log_file, started_at, user_id=user_id, agent_cli=agent_cli,
@@ -1119,6 +1142,7 @@ def _on_success(model_id: str, log_file: IO, started_at: float, prep_result: dic
         code_revision=prep_result.get("code_revision"),
         run_started_at=prep_result.get("run_started_at"),
         record_result=record,
+        snapshot_fields=prep_result.get("snapshot_fields"),
     )
     if record:
         prep_result.setdefault("terminal", {})["record"] = record

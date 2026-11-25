@@ -132,10 +132,12 @@ def test_prompt_shell_description_is_the_sandbox_policy(tmp_path):
     assert "only read-only commands" in rules
     assert "inside this working directory run" in rules
     assert "reads outside this working directory, is denied" in rules
-    # Writes go through the file tools, only on the fix prompt's edit surface.
+    # Writes go through the file tools, only on the fix prompt's edit surface
+    # and the config of a custom model described in words (its snapshot).
     writable = {a[a.index("(") + 1:-1] for a in cmd
                 if a.startswith(("Write(", "Edit("))}
     root = "/" + str(Path(tmp_path).resolve())
-    assert writable == {f"{root}/models/**", f"{root}/components/drafts/**"}
+    assert writable == {f"{root}/models/**", f"{root}/components/drafts/**",
+                        f"{root}/snapshots/custom:*"}
     for body in (_review_body(), _fix_body()):
         assert rules in body

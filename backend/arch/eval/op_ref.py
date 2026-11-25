@@ -334,6 +334,37 @@ class OpRef:
         return self._spec.input_contract(
             [tuple(s) if s else () for s in shape_in], dims)
 
+    def weight_operand_violation(self, arriving: Mapping[str, Any],
+                                 dims: Mapping[str, Any]) -> Optional[str]:
+        """What the arriving tensors break of the op's own weight, or None.
+
+        A label the op's stored-weight declaration names (`weight_shape`, or
+        a `tensors` entry's shape) and its input template names too is one
+        axis seen twice: the extent the node binds it to sizes the weight,
+        and the extent `arriving` (`flops.bind_labels` over the tensors that
+        arrived) says the input carries must be the same one. A `linear`
+        whose `in` is bound to `d_ffn` while a `d_model`-wide tensor reaches
+        it walks to a clean output with a weight that cannot multiply what
+        it is fed; nothing downstream sees it but the checkpoint's bytes,
+        and a model with no checkpoint has none."""
+        declared = [*(self._spec.weight_shape or ()),
+                    *(label for decl in self._spec.tensors
+                      for label in decl.shape)]
+        for label in dict.fromkeys(x for x in declared if isinstance(x, str)):
+            if label not in arriving or label not in dims:
+                continue
+            fed, bound = arriving[label], dims[label]
+            message = (f"its weight takes {label}={value_of(bound)}, and the "
+                       f"input arrives {value_of(fed)} wide on that axis")
+            if varies(value_of(fed) - value_of(bound)):
+                require_equal(fed, bound, lambda _at: SpecRefusal(
+                    f"{self.name}: {message}", declaration="in",
+                    fix=f"bind {label} to the dim the input carries, or "
+                        "wire the input it was meant to read"))
+            elif not equal(fed, bound):
+                return message
+        return None
+
     def _batch_violation(self, shape_in: Sequence, lead: Sequence[Any]
                          ) -> Optional[str]:
         """`torch.matmul`'s batch rule for a weight with leading axes: the

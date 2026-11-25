@@ -29,10 +29,10 @@ import copy
 from dataclasses import dataclass, fields, replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.hf.metadata import fetch_config, fetch_metadata
+from backend.hf.metadata import fetch_config, fetch_metadata, stored_without_checkpoint
 from backend.arch import dims as dims_mod
 from backend.arch import roles as role_reg
-from backend.arch.loader import LayerSpanError, ResolvedSpec, get_default_loader
+from backend.arch.loader import LayerSpanError, ResolvedSpec, get_default_loader, serving_loader
 from backend.arch.schema.model import BlockAssignment
 from backend.inference.pipeline import NoPeakForDtype
 from backend.inference.step_eval import StepCells
@@ -64,9 +64,10 @@ _COSTS = KeyedCache("compose_cost", MemoryBackend(max_entries=32),
                     single_flight=True)
 
 
-def _base_resolved(model_id: str):
-    loader = get_default_loader()
-    overlay_dir = loader.overlay_for(model_id)
+def _base_resolved(model_id: str, overlay_dir: Optional[str] = None):
+    """The model as the Inspector serves it; `overlay_dir` is a caller's own
+    serving overlay (a model they keep, from the service layer)."""
+    loader, overlay_dir = serving_loader(model_id, overlay_dir)
     config = fetch_config(model_id, overlay_dir)
     if config is None:
         raise ValueError(f"could not fetch config for {model_id!r}")
@@ -75,7 +76,7 @@ def _base_resolved(model_id: str):
                             header=meta.get("header"))
     if not resolved:
         raise ValueError(f"no spec matches {model_id!r}")
-    return resolved, meta.get("header")
+    return resolved, meta.get("header"), loader
 
 
 _swappable_roles_cache: Optional[frozenset] = None
@@ -1358,13 +1359,18 @@ def _group_dto(composition: Composition, group: LayerGroup) -> Dict[str, Any]:
     return out
 
 
-def model_skeleton(model_id: str) -> Dict[str, Any]:
+def model_skeleton(model_id: str, overlay_dir: Optional[str] = None
+                   ) -> Dict[str, Any]:
     """The editor skeleton: every layer group (`groups[]`, see `_group_dto`)
     and the backbone layer count."""
-    resolved, header = _base_resolved(model_id)
-    composition = Composition(resolved, model_id=model_id, header=header)
+    resolved, header, loader = _base_resolved(model_id, overlay_dir)
+    composition = Composition(resolved, model_id=model_id, header=header,
+                              loader=loader)
     return {
         "model_id": model_id,
+        # Stored as a config and a spec with no weights (a model described
+        # in words): its costs are the spec's, unchecked against a file.
+        "stored_without_checkpoint": stored_without_checkpoint(model_id),
         "n_layers": sum(g.meta.stored_count for g in composition.groups()
                         if g.meta.aux_kind is None
                         and (g.editable or g.looped)),
@@ -1439,7 +1445,8 @@ def compose_groups(*, base_model_id: str, groups: List[Dict[str, Any]],
                    batch: int = 1, input_tokens: int = 2048,
                    precision: Any,
                    kv_cache_lens: Optional[List[int]] = None,
-                   gpu_sku: Optional[str] = None) -> Dict[str, Any]:
+                   gpu_sku: Optional[str] = None,
+                   overlay_dir: Optional[str] = None) -> Dict[str, Any]:
     """Whole-model cost of the base with per-group edits.
 
     `groups` holds one explicit entry per edited group: its `group_id`, the
@@ -1455,8 +1462,9 @@ def compose_groups(*, base_model_id: str, groups: List[Dict[str, Any]],
     contract, layer span …), a dim the edited groups need and nothing binds
     (`kind: missing_dims`), or an evaluation that still fails
     (`kind: evaluation`)."""
-    base, header = _base_resolved(base_model_id)
-    composition = Composition(base, model_id=base_model_id, header=header)
+    base, header, loader = _base_resolved(base_model_id, overlay_dir)
+    composition = Composition(base, model_id=base_model_id, header=header,
+                              loader=loader)
     dim_overrides = dict(dim_overrides or {})
     gpu_sku = (gpu_sku or "").strip() or None
     contract = {"batch": batch, "input_tokens": input_tokens,

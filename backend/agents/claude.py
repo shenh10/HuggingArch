@@ -41,6 +41,7 @@ class ClaudeBackend(AgentBackend):
 
         models = workspace / "models"
         drafts = workspace / "components" / "drafts"
+        snapshots = workspace / "snapshots"
         references = workspace / "backend" / "arch"
         # Match the exact interpreter path embedded in the generated prompt.
         # Resolving a venv symlink here would make the allow rule miss it.
@@ -57,6 +58,13 @@ class ClaudeBackend(AgentBackend):
             f"Edit({permission_path(models)}/**)",
             f"Write({permission_path(drafts)}/**)",
             f"Edit({permission_path(drafts)}/**)",
+            # A custom model described in words: its config is authored in
+            # the run's snapshot, which no other run may write (a Hub
+            # model's snapshot is its checkpoint record; a registered custom
+            # model's config and header live in its own dir, which wins).
+            f"Read({permission_path(snapshots)}/custom:*)",
+            f"Write({permission_path(snapshots)}/custom:*)",
+            f"Edit({permission_path(snapshots)}/custom:*)",
             f"Bash({python} -m backend.inference.validate *)",
             f"Bash({python} -m backend.arch.structure *)",
             # Which existing component already holds a graph the agent is

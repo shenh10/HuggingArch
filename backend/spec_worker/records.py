@@ -234,6 +234,20 @@ def serving_generation(user_id: str, model_id: str) -> Optional[dict]:
     return _read_leaf(_leaf(run_overlay_owner(user_id), model_id))
 
 
+def list_for_owner(user_id: str) -> list[dict]:
+    """The (owner)'s records, newest first, without their bundles. Hosted:
+    `spec_generations.list_for_user`; local: the owner's record files."""
+    hosted = _hosted()
+    if hosted is not None:
+        return hosted.list_for_user(user_id)
+    owner = run_overlay_owner(user_id)
+    rows = [{k: v for k, v in row.items()
+             if k not in ("spec_yaml", "new_component_yamls", "snapshot_json")}
+            for row in _iter_local()
+            if row.get("user_id") in (user_id, owner)]
+    return sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
+
+
 def update_spec(
     record_id: str,
     *,

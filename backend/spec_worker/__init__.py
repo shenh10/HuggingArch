@@ -47,6 +47,7 @@ from ._prompts.tasks import (
     prepare_generate_prompt,
     prepare_refine_prompt,
     prepare_custom_generate_prompt,
+    prepare_describe_prompt,
 )
 from .worker import frame_event, generation_job, stream_agent
 from .reviewer import prepare_review, stream_review
@@ -70,6 +71,7 @@ __all__ = [
     "get_agent_display_name",
     "job_status",
     "prepare_custom_generate_prompt",
+    "prepare_describe_prompt",
     "prepare_fix",
     "prepare_generate_prompt",
     "prepare_refine_prompt",

@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, Optional
 
 from huggingface_hub import errors as hf_errors
 
-from backend.custom_id import is_custom_id, model_path, strip_prefix
+from backend.custom_id import is_custom_id, model_path, registered_on_host, strip_prefix
 
 from ._cache import cache_load_raw, cache_store
 from .header import ReadTensors, SafetensorsHeader
@@ -225,6 +225,15 @@ def fetch_config(model_id: str, overlay_dir: Optional[str] = None
     to classify."""
     if is_custom_id(model_id):
         path = model_path(strip_prefix(model_id)) / "config.json"
+        if not registered_on_host(model_id):
+            # Not registered on this host: a custom model stored with a user
+            # (`spec_generations`), staged into its overlay as a snapshot.
+            # A registered dir wins, as a shared snapshot wins over an
+            # overlay's: the overlay is agent-writable.
+            from backend.arch.snapshots import load_snapshot
+            snap = load_snapshot(model_id, overlay_dir)
+            if snap is not None:
+                return snap.get("config")
         try:
             return json.loads(path.read_text())
         except FileNotFoundError:
@@ -250,6 +259,31 @@ def fetch_config(model_id: str, overlay_dir: Optional[str] = None
         return None
 
 
+def stored_without_checkpoint(model_id: str) -> bool:
+    """Whether `model_id` was stored with no checkpoint — a declared fact,
+    never inferred from a read that came back empty (that is a failed fetch,
+    `fetch_metadata`'s `{}`). Only a custom model can be: one registered on
+    this host without weights (its `meta.json` names no `source_hf_repo`
+    and it keeps no header), or one a user keeps — a model written from a
+    description, stored as a config and a spec, since a user stores no
+    weights. A `custom:<name>` registered on this host is the host's model
+    (its dir wins in `fetch_config` / `fetch_metadata`), so a user's model
+    never shares its name."""
+    if not is_custom_id(model_id):
+        return False
+    if not registered_on_host(model_id):
+        return True
+    root = model_path(strip_prefix(model_id))
+    if any((root / name).is_file()
+           for name in ("checkpoint_header.json", "tensor_patterns.json")):
+        return False
+    try:
+        meta = json.loads((root / "meta.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    return not meta.get("source_hf_repo")
+
+
 def fetch_metadata(model_id: str, overlay_dir: Optional[str] = None
                    ) -> Dict[str, Any]:
     """`model_id`'s checkpoint header and the totals it implies: a custom
@@ -262,6 +296,11 @@ def fetch_metadata(model_id: str, overlay_dir: Optional[str] = None
     # `header` + totals.
     if is_custom_id(model_id):
         root = model_path(strip_prefix(model_id))
+        if not registered_on_host(model_id):
+            # Not registered here: a model a user keeps, which has no
+            # checkpoint (`stored_without_checkpoint`). Its overlay is
+            # agent-writable, so nothing in it is read as one.
+            return {}
         record_path = root / "checkpoint_header.json"
         if record_path.is_file():
             try:
