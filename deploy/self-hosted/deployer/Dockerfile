@@ -4,6 +4,6 @@
 # docker CLI image, which ships the compose and buildx plugins.
 FROM docker:29.10.0-cli
 RUN apk add --no-cache git python3 bash iptables iptables-legacy
-COPY autodeploy.py /usr/local/bin/autodeploy
+COPY --chmod=0755 autodeploy.py /usr/local/bin/autodeploy
 ENTRYPOINT ["python3", "/usr/local/bin/autodeploy"]
 CMD ["run"]

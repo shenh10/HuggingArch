@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Pull-based deploys of the self-hosted host, from inside its Docker VM.
 
 At start, and again before every deploy, the egress rules: containers reach
