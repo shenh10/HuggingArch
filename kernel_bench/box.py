@@ -79,6 +79,11 @@ class BoxProfile:
     #: mounted. A literal path here put one allocated machine's name in the
     #: repository and went stale the first time the box was reallocated.
     work_dir: Optional[str] = None
+    #: How many cards the box has (`devices = 2`). A run drives the ones
+    #: it is shown (`CUDA_VISIBLE_DEVICES`), never more than these
+    #: (`BoxEnvs.devices`); a collective cell's group is judged against that
+    #: (`Env.devices`). A box that states none has one.
+    devices: int = 1
 
 
 def _optional_string(data: Mapping[str, object], key: str) -> Optional[str]:
@@ -143,7 +148,8 @@ def load_box_profile(path: str | os.PathLike[str]) -> BoxProfile:
         raise BoxProfileError(f"invalid box profile {profile_path}: {exc}") from exc
 
     allowed = {"name", "python", "constraints", "command_prefix", "env",
-               "providers", "env_requirements", "library_env", "work_dir"}
+               "providers", "env_requirements", "library_env", "work_dir",
+               "devices"}
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise BoxProfileError(f"unknown box profile field(s): {unknown}")
@@ -152,6 +158,10 @@ def load_box_profile(path: str | os.PathLike[str]) -> BoxProfile:
     if (not isinstance(raw_prefix, list)
             or any(not isinstance(item, str) or not item for item in raw_prefix)):
         raise BoxProfileError("command_prefix must be an array of non-empty strings")
+    devices = data.get("devices", 1)
+    if isinstance(devices, bool) or not isinstance(devices, int) or devices < 1:
+        raise BoxProfileError(
+            f"devices must be a positive integer, got {devices!r}")
 
     return BoxProfile(
         path=profile_path,
@@ -164,6 +174,7 @@ def load_box_profile(path: str | os.PathLike[str]) -> BoxProfile:
         env_requirements=_string_table(data, "env_requirements"),
         library_env=_nested_string_table(data, "library_env"),
         work_dir=_optional_string(data, "work_dir"),
+        devices=devices,
     )
 
 
@@ -374,6 +385,11 @@ class BoxEnvs:
         import hashlib
         import json
         facts: Dict[str, object] = {"gpu": self.gpu}
+        if self.devices != 1:
+            # Stated only when it is not one card, so a plan judged before
+            # this fact existed (every one of them, on one card) keeps the
+            # digest it carries and is not judged again for nothing.
+            facts["devices"] = self.devices
         for lib, info in sorted(manifest.items()):
             if info["source_build"]:
                 facts[lib] = bool(self.python_for(lib))
@@ -424,8 +440,31 @@ class BoxEnvs:
                 torch_version=pins.get("torch"), cuda_available=True,
                 device_name=None, gpu_sku=self.gpu, peak_bw_gbps=None, sm=sm,
                 libs={name: pinned(name) for name in info["import_names"]},
-                library=lib)
+                library=lib, devices=self.devices)
         return out
+
+    @property
+    def devices(self) -> int:
+        """The cards a run started from here can drive together: the ones it
+        will be shown (`CUDA_VISIBLE_DEVICES`, when set), never more than the
+        box has (`BoxProfile.devices`). The same answer the run's own process
+        gives (`Env.devices`, its visible device count), so a plan and the run
+        judge a collective cell on one fact: a single-card queue's plan puts
+        a pair's cells in its gaps, with the reason, instead of queueing what
+        its run would decline."""
+        have = self.profile.devices if self.profile is not None else 1
+        shown = self.environ.get("CUDA_VISIBLE_DEVICES")
+        if shown is None:
+            return have
+        # CUDA reads the list up to its first invalid entry (`-1` hides
+        # every card).
+        n = 0
+        for entry in shown.split(","):
+            entry = entry.strip()
+            if not entry or entry.startswith("-"):
+                break
+            n += 1
+        return min(have, n)
 
 
 def require_work_dir(profile: Optional[BoxProfile],

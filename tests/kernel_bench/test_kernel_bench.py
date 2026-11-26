@@ -6833,7 +6833,7 @@ class TestSweepReportsWhatItCannotPlan:
         from kernel_bench.providers import all_providers
         from kernel_bench.invocation import Invocation
         from backend.inference.parallel_config import ParallelConfig
-        env = Env(None, False, None, "H100-SXM", None)
+        env = Env(None, False, None, "H100-SXM", None, devices=1)
         jobs, _ = build_jobs(avg_output_tokens=0, model_id="openai/gpt-oss-20b", batch_size=2,
                              seq_len=1024, phase="prefill",
                              parallel=ParallelConfig(tp_attention=2,
@@ -6847,12 +6847,12 @@ class TestSweepReportsWhatItCannotPlan:
             runnable = [p for p in same if p.accepts(inv, env)]
             if declared and not runnable:
                 named.add(inv.signature)
-        # The collective floor is the case: `serves` admits its cell, and
-        # the run refuses it (`disabled_reason` — one process cannot time an
-        # all-reduce), so the gap list has to name it. gpt-oss's MXFP4
-        # expert GEMM was this case too, until the Marlin MXFP4 kernel
-        # landed and made that cell runnable.
-        assert "allreduce_fused_rmsnorm" in named, named
+        # A collective is the case: `serves` admits its cell, and a run that
+        # can drive one card refuses it (a group of 2 needs 2 cards), so the
+        # gap list has to name it. gpt-oss's MXFP4 expert GEMM was this case
+        # too, until the Marlin MXFP4 kernel landed and made that cell
+        # runnable.
+        assert "all_reduce" in named, named
 
     def test_a_collective_cell_carries_the_group_it_reduces_over(self):
         # The physical key dropped the deployment, which is right for a local
@@ -6882,14 +6882,14 @@ class TestSweepReportsWhatItCannotPlan:
         assert shape(cells[2][0]) == shape(cells[8][0])
         assert cells[2][0]["dims"] != cells[8][0]["dims"]
 
-    def test_the_single_process_all_reduce_floor_declines(self):
-        # On one process the all-reduce is the identity: the provider timed
-        # residual+RMSNorm and wrote it as a collective, and the reference
-        # omitted the collective too, so the cross-check agreed. Disabled
-        # rather than deleted, so the cells read as a gap.
+    def test_a_one_card_env_declines_a_group_cell(self):
+        # On one process an all-reduce is the identity: the old floor timed
+        # residual+RMSNorm and wrote it as an 8-rank collective, and its
+        # reference omitted the collective too, so the check agreed. A group
+        # cell is measured over one process per card (`comm`), and an env
+        # with fewer cards than the group declines it, saying so.
         from kernel_bench.providers import all_providers
         from kernel_bench.invocation import Invocation
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
         inv = Invocation(op="allreduce_fused_rmsnorm",
                          signature="allreduce_fused_rmsnorm", phase="prefill",
                          dims={"B": 2, "s_query": 4, "d_model": 512,
@@ -6897,9 +6897,15 @@ class TestSweepReportsWhatItCannotPlan:
                          dtype_env={"activation": "bf16"}, tp=1)
         ps = [p for p in all_providers()
               if p.signature == "allreduce_fused_rmsnorm"]
-        assert ps, "the provider is still registered, as a named gap"
-        assert not any(p.accepts(inv, env) for p in ps)
-        assert all("process" in p.disabled_reason for p in ps)
+        assert ps
+        one = Env("2.11", True, None, "H100-SXM", None, libs={"torch": "2.11"},
+                  devices=1)
+        assert not any(p.accepts(inv, one) for p in ps)
+        assert all(any("needs 8 cards; this env has 1" in r
+                       for r in p.refusals(inv, one)) for p in ps)
+        eight = Env("2.11", True, None, "H100-SXM", None, libs={"torch": "2.11"},
+                    devices=8)
+        assert any(p.accepts(inv, eight) for p in ps)
 
     def test_the_inverse_rope_span_is_measurable(self):
         # A fusion boundary the cost model draws has to be measurable, or

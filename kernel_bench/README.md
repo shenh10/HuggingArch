@@ -264,8 +264,7 @@ Cross-check references are wired for gemm / rmsnorm / fused_add_rmsnorm /
 silu_and_mul / gqa_attention / rope / fused_qk_norm_rope / indexer_logits.
 Measured-only (no numeric gate, discrete/recurrent output): moe_gate,
 linear-attention/SSM (FLA). Not yet covered (staged): embedding,
-mla_attention reference + FlashMLA body, and the multi-GPU
-allreduce+RMSNorm collective (needs a distributed harness).
+mla_attention reference + FlashMLA body.
 
 ### How an estimate reads the corpus
 
@@ -277,7 +276,13 @@ version (`prefer_measured=True`). The framework selection instead takes the
 estimate's framework's own kernel at the latest release the corpus has it at
 (one `kernel_impl`, or none is quoted), labelled with that release.
 
-### Not covered yet
+### Collectives
 
-Communication/collective ops (all-reduce, all-to-all) need a multi-rank
-launcher (torchrun) — a separate sub-harness, not this single-kernel path.
+`all_reduce`, `all_gather`, `reduce_scatter`, `all_to_all` and the
+all-reduce + RMSNorm seam are measured through NCCL over a group of
+processes, one per card, on the same `run` path as everything else
+(`comm.py`; ARCHITECTURE.md, "How a collective is measured"). A box states
+its cards (`devices = 2` in its profile) and a run drives the ones it is
+shown (`CUDA_VISIBLE_DEVICES=0,1`), which it then locks; a cell whose group
+needs more is a gap the plan names. Not covered: groups larger than the box,
+the routed MoE exchange (`routed_all_to_all`), and `send_recv`.

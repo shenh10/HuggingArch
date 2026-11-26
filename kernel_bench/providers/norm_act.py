@@ -802,27 +802,6 @@ _register_q_kv_rmsnorm_quant("torch", "torch_fused_q_kv_rmsnorm_quant",
                              gains=TORCH_FLOAT)  # the reference widens any gain
 
 
-register(Provider(
-    library="torch", signature="allreduce_fused_rmsnorm",
-    kernel_impl="torch_allreduce_fused_rmsnorm",
-    import_name="torch",
-    serves=KernelSignature(signature="allreduce_fused_rmsnorm",
-                           activation=TORCH_FLOAT),
-    build=_torch_fused_add_rmsnorm_build,
-    # DISABLED, not deleted: its cells stay a visible gap rather than a
-    # measurement nobody can check. On one process the all-reduce is the
-    # identity, so this timed residual+RMSNorm and nothing else — and the
-    # reference omitted the collective too, so the cross-check agreed. The
-    # rows then said a `n_comm_ranks=8` all-reduce costs what a local norm
-    # costs; with the group now in the shape they would still be the fastest
-    # candidate of their own cell. Measuring it needs a process per rank.
-    disabled_reason=(
-        "one process: the all-reduce is the identity, so this times "
-        "residual+RMSNorm and records it as a collective — a group of "
-        "n_comm_ranks needs that many processes"),
-))
-
-
 _register_unary("silu", "torch_silu", lambda torch, F: F.silu)
 _register_unary("gelu", "torch_gelu", lambda torch, F: F.gelu)
 _register_unary("gelu_tanh", "torch_gelu_tanh",

@@ -276,17 +276,38 @@ def _cmd_run(argv: List[str]) -> int:
     # the file, so what is on disk is always usable as-is.
     # One sweep per physical card. Taken BEFORE the output file is opened so a
     # refused run doesn't truncate a file it will never write.
+    #
+    # EVERY card this run can see, not only the first: a collective cell
+    # runs a rank on each of them (`kernel_bench.comm`), and a run on any of
+    # them would be in its number. A one-card queue sees one card.
+    #
+    # All or none, in UUID order, so two runs that see the same cards in a
+    # different order cannot each hold one and wait for the other; waiting
+    # (`--wait-for-gpu`) lets go of everything between tries rather than
+    # holding one card idle while the other is busy.
+    import time
+
     from .gpulock import GpuBusy, GpuLock
-    lock = GpuLock(wait=args.wait_for_gpu, enabled=not args.no_gpu_lock)
-    try:
-        lock.acquire()
-    except GpuBusy as e:
-        print(f"\nREFUSED: {e}")
-        return 2
-    if lock.active:
-        print(f"gpu lock: held ({lock.path})")
-    if lock.preflight_warning:
-        print(f"WARNING: {lock.preflight_warning}")
+    locks = sorted((GpuLock(device=i, enabled=not args.no_gpu_lock)
+                    for i in range(max(1, env.devices or 0))),
+                   key=lambda lock: lock.path or "")
+    while True:
+        try:
+            for lock in locks:
+                lock.acquire()
+            break
+        except GpuBusy as e:
+            for lock in locks:
+                lock.release()
+            if not args.wait_for_gpu:
+                print(f"\nREFUSED: {e}")
+                return 2
+            time.sleep(10)
+    for lock in locks:
+        if lock.active:
+            print(f"gpu lock: held ({lock.path})")
+        if lock.preflight_warning:
+            print(f"WARNING: {lock.preflight_warning}")
 
     bad: list = []
     append, measured_keys = resume_from_output(
@@ -377,7 +398,12 @@ def _cmd_run(argv: List[str]) -> int:
         return 1
     finally:
         writer.close()
-        lock.release()
+        # The group's ranks leave their cards before the cards are unlocked:
+        # the next run's lock would otherwise find them there.
+        from .comm import Group
+        Group.release()
+        for lock in locks:
+            lock.release()
 
     from collections import Counter
     outcomes = Counter(_benchmarks.outcome_of(r) for r in res.rows)

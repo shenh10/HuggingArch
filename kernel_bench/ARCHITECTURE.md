@@ -437,6 +437,78 @@ sample = A − B + C
 `perf_counter` appears twice and never in a row: to size the hold, and as the
 clock on a box with no GPU.
 
+## How a collective is measured
+
+A collective cell (`all_reduce`, `all_gather`, `reduce_scatter`,
+`all_to_all`, and the fused `allreduce_fused_rmsnorm`) is a launch over a
+GROUP: its key carries `n_comm_ranks`, and on one process every one of these
+ops is the identity. So the harness needs as many processes, on as many
+cards, as the cell's group, and everything below follows from who owns
+which fact.
+
+* **What a cell needs is the signature's.** `n_comm_ranks` and
+  `n_comm_stride` are declared structural axes of these signatures; a cell
+  with `n_comm_ranks = N` needs N processes on N cards. Nothing lists the
+  collective signatures again: the gate reads the axis.
+* **How many cards a run can drive has one answer.** `Env.devices` is the
+  measuring process's visible device count; a plan asks the same question
+  of the run it will start (`BoxEnvs.devices`: the cards the run will be
+  shown, `CUDA_VISIBLE_DEVICES`, never more than the profile's `devices`).
+  A single-card queue's plan therefore puts a pair's cells in its gaps, and
+  the queue that is shown both cards queues them.
+* **Whether a group fits the box is the cost model's placement.** One gate
+  in `Provider.refusals` declines a group larger than the cards, or one the
+  card's own sheet places across nodes (`comm_cost.members_per_node`, the
+  number the estimate prices the group's fabric by) — a box is one node.
+  Inside a node the group's spacing does not change its fabric, so ranks
+  sit on adjacent cards. A refused cell stays a gap in the coverage total,
+  with its reason: missing, not exempt.
+* **One path.** A collective is measured by the same `run` -> driver ->
+  `build` -> cross-check -> clock -> row as every other cell. A provider's
+  `build` is one rank's launch. The driver process is rank 0 on card 0;
+  `comm.Group` spawns ranks 1..N-1 on the next cards the first time a cell
+  of that group size comes up (process-death signal tied to the driver;
+  NCCL for the data; numbered commands through the group's `TCPStore`, which
+  no launch trace sees) and each peer builds the same provider, found by
+  its `kernel_impl`. A one-card cell releases the group first: its NCCL
+  buffers would otherwise sit on card 0 under a cell near the card's limit.
+* **Every rank calls the same thing the same number of times**, or NCCL
+  deadlocks. The case's `run` (the untimed calls: the cross-check, the
+  launch trace, the kernel symbol) tells the peers to make the same call
+  and waits for their answers. The clock is `time_callable` and nothing
+  else: the driver times a group case as `with case.group.timed() as
+  launch: time_callable(launch, group=case.group)`, where `timed` brings the
+  peers into the same clock. Its sizing (warmup and sample counts) is made
+  from the MAX of every rank's probe, and an allocation one rank cannot make
+  stops every rank at the same point, so no rank waits in a collective the
+  others never join. A peer that dies or fails marks the group broken, and
+  the next collective cell starts a fresh one.
+* **A sample is the slowest rank's.** Before each timed window a 1-element
+  all-reduce aligns the ranks on the GPU, outside the window; after the
+  loop each sample is the max over ranks. A collective has finished when
+  its last rank has, and that is what a step waits for.
+* **The oracle is a second route, and it is the signature's.** The inputs
+  each rank holds its own copy of are declared on the signature's oracle
+  (`RefSpec.per_rank`: the payload; for the fused seam `x`, not the
+  replicated residual). Rank r's copy is rank 0's rotated by a
+  rank-dependent offset (`comm.rank_tensor`), so the ranks hold different
+  data and no two send the same shard, and rank 0 can rebuild all of them.
+  The oracle computes the exchange from those copies in fp32 (the sum, the
+  concatenation, the slice); the check compares it with what came over the
+  fabric. A launch that skipped the exchange no longer agrees.
+* **Both cards, exclusively.** A collective is timed with both cards' memory
+  and copy engines; another run on either card would be in the number. A
+  `run` locks every card it can see — all or none, in UUID order — and a
+  box runs its collective cells as their own queue with every card visible,
+  while the single-card queues stand aside.
+
+What this does not measure: a group larger than the box (the 4090 box has
+two cards; a plan's groups reach 512), the routed exchange
+(`routed_all_to_all`, DeepEP), the pipeline hop (`send_recv`), and any
+framework's custom all-reduce that needs peer-to-peer access the card does
+not have (GeForce cards have none, so on them the serving path is NCCL's
+own, which is what is measured).
+
 ## What a sweep records when it does not measure
 
 Every cell × implementation a run attempts leaves a row in the same table as

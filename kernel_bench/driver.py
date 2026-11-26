@@ -93,6 +93,10 @@ def _reference_footprint_bytes(inv, inputs) -> int:
     # knows, and a new attention oracle states it where it is written.
     if ref is not None and ref.materializes_scores:
         return _score_elements(inv) * 4 + 2 * live
+    if ref is not None and ref.per_rank:
+        # A group's oracle rebuilds every rank's copy of its inputs on this
+        # rank (`RefSpec.per_rank`) and holds each in fp32 too.
+        return 3 * live * max(1, int(inv.dims.get("n_comm_ranks", 1)))
     return 3 * live                      # fp32 copies of the inputs and output
 
 
@@ -177,6 +181,23 @@ COVERAGE_BATCH = 2000
 #: failing used to turn the skip off for the whole run.
 COVERAGE_ATTEMPTS = 3
 COVERAGE_BACKOFF_S = 5.0
+
+
+def _build_case(p, inv, env, inputs):
+    """`p`'s case for `inv`. A cell over a group (`n_comm_ranks` > 1) is
+    built on every rank of that group, rank 0 being this process
+    (`comm.Group.case`); any other cell is built here."""
+    if _is_group_cell(inv):
+        from .comm import Group
+        return Group.of(inv.dims["n_comm_ranks"]).case(p, inv, env, inputs)
+    return p.build(inv, env, inputs)
+
+
+def _is_group_cell(inv) -> bool:
+    """A launch over a group of cards: the cell states a group of more than
+    one (`n_comm_ranks`, a declared axis)."""
+    ranks = inv.dims.get("n_comm_ranks")
+    return isinstance(ranks, int) and ranks > 1
 
 
 def _kernel_bench_coverage(jobs: List[Dict], env: Env, result: "RunResult",
@@ -458,6 +479,12 @@ def run_jobs(
         from .cell_check import complaints as cell_complaints
         from .refs import get_ref, input_generator
         device = "cuda" if env.cuda_available else "cpu"
+        if not _is_group_cell(inv):
+            # A group left open by a collective cell keeps its NCCL buffers
+            # on card 0, and this cell's inputs and oracle are where an
+            # out-of-memory is recorded: let it go before anything is built.
+            from .comm import Group
+            Group.release()
         def refuse_inputs(detail: str) -> None:
             # The card cannot hold this cell's INPUTS, so no provider of it
             # can run — one recorded refusal per implementation that was
@@ -674,7 +701,7 @@ def run_jobs(
                             f"({type(e).__name__}: {e}); job skipped")
                         log(f"FAIL provider-oracle {label}: {e}")
                         continue
-                case = p.build(inv, env, p_inputs)
+                case = _build_case(p, inv, env, p_inputs)
                 case.to_canonical = p.wrap_output(inv, case.to_canonical)
                 # One label per reason, resolved where the reason is known.
                 xrel = xcos = xtyp = xwor = None
@@ -708,7 +735,7 @@ def run_jobs(
                             # call may have written its buffers).
                             log(f"untraced {label}: {e}")
                             trace = recorded.trace
-                            case = p.build(inv, env, p_inputs)
+                            case = _build_case(p, inv, env, p_inputs)
                             case.to_canonical = p.wrap_output(
                                 inv, case.to_canonical)
                             err, xrel, xcos, xtyp, xwor = _cross_check(
@@ -777,7 +804,11 @@ def run_jobs(
                             f"rel_err={xrel:.3g} cos={xcos:.5f}")
                         continue
                 try:
-                    stats = time_callable(case.run)
+                    if case.group is not None:
+                        with case.group.timed() as launch:
+                            stats = time_callable(launch, group=case.group)
+                    else:
+                        stats = time_callable(case.run)
                 except TooSlowToMeasure as e:
                     # A `timeout`: one launch costs more than the whole timing
                     # budget, so this implementation cannot be sampled here.

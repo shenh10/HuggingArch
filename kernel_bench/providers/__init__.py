@@ -240,6 +240,12 @@ class BenchCase:
     """
     run: Callable[[], Any]
     to_canonical: Optional[Callable[[Any], Any]] = None
+    #: The group of processes this case is one rank of (`comm.Group`), for
+    #: a launch over several cards: the driver times it as
+    #: `with group.timed() as launch: time_callable(launch, group=group)`,
+    #: the same clock with every rank inside it. None for every one-process
+    #: kernel.
+    group: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -320,6 +326,29 @@ class Library:
 #: must not add it here: audit each kernel first, then widen this list as its
 #: own decision.
 TORCH_FLOAT: Tuple[str, ...] = ("bf16", "fp16", "fp32")
+
+
+def _group_refusals(ranks: int, stride: Any, env: Env):
+    """Why a group of `ranks` cannot be measured in `env`: more ranks than
+    cards, or a group the card's own sheet places across nodes — which node
+    a member is in is `comm_cost.members_per_node`'s answer, the one the
+    estimate prices the group's fabric by, and a box is one node."""
+    if ranks > env.devices:
+        yield (f"a group of {ranks} ranks needs {ranks} cards; this env has "
+               f"{env.devices}")
+        return
+    from backend.inference.comm_cost import members_per_node
+    from backend.inference.gpu_specs import get_gpu, gpus_per_node
+    card = get_gpu(env.gpu_sku) if env.gpu_sku else None
+    if card is None:
+        yield (f"the card ({env.gpu_sku or 'unknown'}) is not on the sheet, so "
+               f"whether a group of {ranks} stays in one node is unknown")
+        return
+    per_node = members_per_node(ranks, gpus_per_node(card), stride)
+    if per_node < ranks:
+        yield (f"a group of {ranks} ranks at stride {stride} spans "
+               f"{-(-ranks // per_node)} nodes of {env.gpu_sku}; one box is "
+               f"one node")
 
 
 def _not_served(field: str, value: str, served: Tuple[Any, ...],
@@ -989,6 +1018,13 @@ class Provider:
         if self.disabled_reason:
             yield "disabled"
             return                 # a disabled kernel's scope is not the point
+        # A launch over a group needs a process per rank, each on its own
+        # card, all in one node: the cell states its group (`n_comm_ranks`,
+        # and how it sits on the mesh, `n_comm_stride` — declared axes of the
+        # collective signatures), the env how many cards it can drive.
+        ranks = inv.dims.get("n_comm_ranks")
+        if isinstance(ranks, int) and ranks > 1 and env.devices is not None:
+            yield from _group_refusals(ranks, inv.dims.get("n_comm_stride"), env)
         cell = inv.weight_granularity
         if cell is not None and cell not in self.weight_granularities:
             yield _not_served("weight_granularity", cell,
@@ -1573,6 +1609,7 @@ def discover() -> None:
     from . import quantise     # noqa: F401  (the activation cast, both ways)
     from . import compress_store  # noqa: F401  (the KV compressors' spans)
     from . import deepinfer  # noqa: F401  (DeepSeek's V4.1 runtime stack)
+    from . import collective  # noqa: F401  (NCCL over a group of cards)
     _DISCOVERED = True
 
 

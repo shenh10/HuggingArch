@@ -3,9 +3,27 @@
 CPU so CPU-runnable ops (e.g. the torch GEMM baseline) can be measured too."""
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, List, Optional, Protocol
 
 from .providers import LatencyStats
+
+
+class RankGroup(Protocol):
+    """What the clock needs from a group of processes timing one collective
+    together (`kernel_bench.comm`): every rank runs this clock at the same
+    moment, and these three calls are where they meet."""
+
+    def agree(self, value: float) -> float:
+        """The max of `value` over the ranks — the sizing decisions are made
+        from it, so every rank makes the same number of calls."""
+
+    def align(self) -> None:
+        """Queue a meeting point on the GPU (a 1-element all-reduce): what
+        follows starts on every rank at once."""
+
+    def slowest(self, samples: List[float]) -> List[float]:
+        """Each sample's max over the ranks: a collective has finished when
+        its last rank has."""
 
 
 # Wall-clock a single (provider, shape) measurement may take. `iters` samples
@@ -28,6 +46,7 @@ def time_callable(
     iters: int = 60,
     flush_l2: bool = True,
     budget_s: float = TIME_BUDGET_S,
+    group: Optional[RankGroup] = None,
 ) -> LatencyStats:
     """Time `call`, reducing per-launch samples to p50/p95/mean microseconds.
     One sample per iteration so p95 surfaces tail / clock-throttle, not just a
@@ -63,7 +82,12 @@ def time_callable(
 
     p95 now also carries the spread of the two sweeps (a stalled host thread
     inside either window moves the difference, both ways), not only the
-    launch's own tail."""
+    launch's own tail.
+
+    `group` (GPU only): this call is one rank of a collective, and every rank
+    of it is in this same function now. The sizing reads the slowest rank's
+    probe, each window opens after an on-GPU meeting point, and each sample
+    is the slowest rank's (`RankGroup`). Without it, nothing changes."""
     import torch
     if not torch.cuda.is_available():
         import time
@@ -92,6 +116,8 @@ def time_callable(
     call()
     torch.cuda.synchronize()
     per_call = max(_time.perf_counter() - _t0, 1e-9)
+    if group is not None:
+        per_call = group.agree(per_call)
 
     remaining = max(1, warmup - 2)
     if per_call * (remaining + iters) > budget_s:
@@ -112,6 +138,8 @@ def time_callable(
         call()
         host_s = max(host_s, _time.perf_counter() - _h0)
     torch.cuda.synchronize()
+    if group is not None:
+        host_s = group.agree(host_s)
 
     sweep = None
     if flush_l2:
@@ -121,9 +149,20 @@ def time_callable(
         props = torch.cuda.get_device_properties(0)
         l2_bytes = (getattr(props, "L2_cache_size", 0)
                     or getattr(props, "l2_cache_size", 0) or (128 << 20))
-        scratch = torch.zeros(2 * int(l2_bytes) // 4, dtype=torch.float32,
-                              device="cuda")
-        sink = torch.empty((), dtype=torch.float32, device="cuda")
+        failed = None
+        try:
+            scratch = torch.zeros(2 * int(l2_bytes) // 4, dtype=torch.float32,
+                                  device="cuda")
+            sink = torch.empty((), dtype=torch.float32, device="cuda")
+        except Exception as e:
+            failed = e
+        # In a group, one rank that cannot allocate must not leave the others
+        # waiting in a collective it will never join: they all stop here.
+        if group is not None and group.agree(1.0 if failed else 0.0) > 0:
+            raise failed or RuntimeError(
+                "another rank of the group could not allocate its L2 sweep")
+        if failed is not None:
+            raise failed
 
         def sweep():
             # A read of every line, at ~0.9 of DRAM peak (a reduction over
@@ -154,6 +193,8 @@ def time_callable(
         if cold and sweep is not None:
             sweep()
         torch.cuda._sleep(hold_cycles)
+        if group is not None:
+            group.align()
         start.record()
         body()
         end.record()
@@ -187,7 +228,10 @@ def time_callable(
         launch, alone, empty = (elapsed_us(w) for w in windows)
         return launch - alone + empty
 
-    us = sorted(latency_us(w) for w in samples)
+    us = [latency_us(w) for w in samples]
+    if group is not None:
+        us = group.slowest(us)
+    us = sorted(us)
     n = len(us)
     p50 = us[n // 2]
     p95 = us[min(n - 1, round(0.95 * (n - 1)))]

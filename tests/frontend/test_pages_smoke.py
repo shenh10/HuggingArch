@@ -2014,7 +2014,7 @@ def test_fusion_provider_link_carries_kernel_context(browser_base):
     s = Session(browser, base)
     s.goto("/fusion.html")
     s.page.wait_for_selector("#fusion-plan-detail", timeout=15000)
-    link = s.page.get_by_role("link", name="torch_allreduce_fused_rmsnorm")
+    link = s.page.get_by_role("link", name="torch_nccl_allreduce_rmsnorm")
     assert s.wait_for(lambda: link.count() > 0)
     link.first.click()
     s.page.wait_for_selector("#f-source", timeout=15000)
@@ -2022,9 +2022,9 @@ def test_fusion_provider_link_carries_kernel_context(browser_base):
     assert h.get("view") == ["envelope"]
     assert h.get("signature") == ["allreduce_fused_rmsnorm"]
     assert h.get("framework") == ["torch"]
-    assert h.get("kernel") == ["torch_allreduce_fused_rmsnorm"]
+    assert h.get("kernel") == ["torch_nccl_allreduce_rmsnorm"]
     assert s.page.locator("#f-framework").input_value() == "torch"
-    assert s.page.locator("#f-kernel-clear").inner_text().startswith("torch_allreduce_fused_rmsnorm")
+    assert s.page.locator("#f-kernel-clear").inner_text().startswith("torch_nccl_allreduce_rmsnorm")
     s.assert_clean()
 
 

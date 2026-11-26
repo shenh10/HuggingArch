@@ -42,6 +42,13 @@ class RefSpec:
     #: (`driver._reference_footprint_bytes`) asks the oracle here, rather
     #: than keeping its own list of the signatures whose reference does it.
     materializes_scores: bool = False
+    #: For a launch over a group (`n_comm_ranks`): the inputs every rank
+    #: holds its OWN copy of — the contributions an exchange moves — as
+    #: opposed to the ones every rank holds alike (a replicated residual, a
+    #: weight). Rank r's copy is rank 0's turned by `comm.rank_tensor`, so a
+    #: reference that reads only rank 0's inputs can rebuild every rank's and
+    #: compute what the exchange must produce. Empty for a one-process cell.
+    per_rank: Tuple[str, ...] = ()
 
 
 def input_generator(inv: Invocation, device: str) -> Any:
@@ -1583,13 +1590,20 @@ def _allreduce_fused_rmsnorm_inputs(inv: Invocation, device: str, gen: Any) -> D
     return out
 
 
+def _allreduce_fused_rmsnorm_reference(inputs: Dict[str, Any]) -> Any:
+    """Rank 0's output: the norm of the residual plus every rank's `x`
+    summed. Every rank's `x` is rebuilt from rank 0's (`RefSpec.per_rank`),
+    so a launch that never reduced across the group — the one-process floor
+    that once cross-checked green — does not agree with this."""
+    from .comm import rank_tensor
+    world = int(inputs["n_comm_ranks"])
+    x = sum(rank_tensor(inputs["x"], r, world).float() for r in range(world))
+    return _fused_add_rmsnorm_reference({**inputs, "x": x})
+
+
 register_ref("allreduce_fused_rmsnorm",
-             # No reference: on one process the all-reduce is the identity,
-             # so a residual+norm oracle would agree with a provider that
-             # also omitted the collective — which is how a kernel that
-             # never communicated cross-checked green. A provider that runs
-             # `n_comm_ranks` processes brings its own.
-             RefSpec(_allreduce_fused_rmsnorm_inputs, None))
+             RefSpec(_allreduce_fused_rmsnorm_inputs,
+                     _allreduce_fused_rmsnorm_reference, per_rank=("x",)))
 
 
 # ---------------------------------------------------------------------------
@@ -5323,11 +5337,11 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     for whichever of them the signature's cell declares, so the flat
     exchange's inputs do not change.
 
-    No oracle. On one process every one of these collectives is the
-    identity, so an oracle here would agree with a provider that never
-    communicated — which is exactly how a fused all-reduce once
-    cross-checked green without a fabric. A provider that brings
-    `n_comm_ranks` processes brings its own comparison.
+    The payload is each rank's own (`RefSpec.per_rank`): rank r holds rank
+    0's turned by `comm.rank_tensor`, which is what lets the oracle below
+    compute the exchange from rank 0's copy alone — and what keeps a launch
+    that never communicated (on one process every collective is the
+    identity) from agreeing with it.
     """
     import torch
     dims = _dims(inv)
@@ -5349,13 +5363,56 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     return out
 
 
-# Which signatures those are is the catalog's own declaration — the
-# signatures whose cell IS a collective launch (`shape_projection`), asked
-# rather than restated as a list of collective names here.
+def _ranks_payload(inputs: Dict[str, Any]) -> Tuple[int, int, list]:
+    """(ranks, an equal share, every rank's flattened payload in fp32)."""
+    from .comm import rank_tensor
+    world, p = int(inputs["n_comm_ranks"]), inputs["payload"]
+    return world, p.numel() // world, [
+        rank_tensor(p, r, world).reshape(-1).float() for r in range(world)]
+
+
+def _all_reduce_reference(inputs: Dict[str, Any]) -> Any:
+    """Rank 0 ends with the sum of every rank's payload."""
+    _, _, flat = _ranks_payload(inputs)
+    return sum(flat)
+
+
+def _all_gather_reference(inputs: Dict[str, Any]) -> Any:
+    """Rank 0 ends with every rank's own shard (rank r's r-th), in order."""
+    import torch
+    world, k, flat = _ranks_payload(inputs)
+    return torch.cat([flat[r][r * k:(r + 1) * k] for r in range(world)])
+
+
+def _reduce_scatter_reference(inputs: Dict[str, Any]) -> Any:
+    """Rank 0 ends with slice 0 of the sum."""
+    _, k, flat = _ranks_payload(inputs)
+    return sum(f[:k] for f in flat)
+
+
+def _all_to_all_reference(inputs: Dict[str, Any]) -> Any:
+    """Rank 0 ends with slice 0 of every rank's payload, in rank order."""
+    import torch
+    _, k, flat = _ranks_payload(inputs)
+    return torch.cat([f[:k] for f in flat])
+
+
+for _name, _reference in (("all_reduce", _all_reduce_reference),
+                          ("all_gather", _all_gather_reference),
+                          ("reduce_scatter", _reduce_scatter_reference),
+                          ("all_to_all", _all_to_all_reference)):
+    register_ref(_name, RefSpec(_collective_inputs, _reference,
+                                per_rank=("payload",)))
+
+# Every other collective (the routed exchange, the pipeline hop) gets its
+# inputs and no oracle yet: no provider measures it. Which signatures are
+# collectives is the catalog's own declaration — the cell IS a collective
+# launch (`shape_projection`) — asked rather than restated here.
 for _sig in all_signatures():
-    if _sig.shape_projection == "collective":
-        register_ref(_sig.name, RefSpec(_collective_inputs, None))
-del _sig
+    if _sig.shape_projection == "collective" and get_ref(_sig.name) is None:
+        register_ref(_sig.name, RefSpec(_collective_inputs, None,
+                                        per_rank=("payload",)))
+del _sig, _name, _reference
 
 
 # ---------------------------------------------------------------------------

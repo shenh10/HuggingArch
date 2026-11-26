@@ -64,6 +64,13 @@ class Env:
     #: `dependency_manifest` groups an env's `# Providers:` line by) and no
     #: others.
     library: Optional[str] = None
+    #: How many cards this process can drive together: its visible device
+    #: count at run time; the same count, read off the box and the
+    #: environment a run will get, when a plan judges ahead of time
+    #: (`BoxEnvs.devices`). A collective cell needs one card per rank of its
+    #: group (`n_comm_ranks`), and this is the other half of that question
+    #: (`Provider.refusals`). None when nobody said, which judges nothing.
+    devices: Optional[int] = None
 
     def peak_tflops(self, dtype: str) -> Optional[float]:
         """The card's peak (TFLOPs) at the MMA family `dtype` runs on —
@@ -206,11 +213,13 @@ def detect_env() -> Env:
     device_name = None
     peak_bw_gbps = None
     sm = None
+    devices = 0
     try:
         import torch
         torch_version = torch.__version__
         cuda_available = bool(torch.cuda.is_available())
         if cuda_available:
+            devices = int(torch.cuda.device_count())
             device_name = torch.cuda.get_device_name(0)
             gpu_sku, peak_bw_gbps = _resolve_peaks(device_name)
             try:
@@ -250,6 +259,7 @@ def detect_env() -> Env:
         kmd_version=kernel_mode_driver(_read_text(_NVRM_PROC)),
         umd_version=loaded_user_mode_driver(_read_text(_SELF_MAPS)),
         libs=libs,
+        devices=devices,
     )
 
 

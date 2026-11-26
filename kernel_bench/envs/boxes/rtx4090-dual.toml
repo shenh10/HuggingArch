@@ -1,5 +1,9 @@
 name = "dual-rtx4090-cu130"
 python = "3.12"
+# Two cards: a collective cell with a group of 2 is measurable by a run that
+# is shown both (`CUDA_VISIBLE_DEVICES=0,1`); a larger group is a gap this box
+# cannot close.
+devices = 2
 
 # The CUDA toolkit is not on the default path here (no /usr/local/cuda), so
 # `CUDA_HOME` and `PATH` name it below — 13.0, the release this box's torch

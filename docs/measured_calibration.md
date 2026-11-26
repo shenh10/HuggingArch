@@ -301,15 +301,17 @@ The remaining 35 signatures are measured by torch only: `add`,
 `sigmoid`, `signed_sqrt`, `silu`, `situ`, `softmax_act`, `softplus`,
 `sqrt`, `step3p5_headwise_gate`, `sum_reduce`, `tanh`, `topk`.
 
-Ten providers are registered disabled, each with its reason:
+Nine providers are registered disabled, each with its reason:
 `deepinfer_flashmla_mega_attention` and `deepinfer_mega_moe` (they need
 state the serving engine creates at load time), `deepgemm_fp8_fp4_mega_moe`
 and `deepgemm_fp8_paged_mqa_logits` (no runnable body yet),
 `deepgemm_fp8_fp4_m_grouped_contiguous`, `marlin_gptq_int4_w4a16`,
-`vllm_causal_conv1d_update`, `vllm_scaled_fp4_quant` and
-`sglang_flashinfer_fp4_quantize` (packed FP4 outputs the cross-check cannot
-yet map back), and `torch_allreduce_fused_rmsnorm`: collectives need a
-multi-rank launcher that the single-kernel harness does not have.
+`vllm_causal_conv1d_update`, `vllm_scaled_fp4_quant`
+and `sglang_flashinfer_fp4_quantize` (packed FP4 outputs the cross-check
+cannot yet map back). Collectives are measured over a group of processes,
+one per card (`kernel_bench/comm.py`; `kernel_bench/ARCHITECTURE.md`, "How a
+collective is measured"): a cell whose group is larger than the box is a gap
+the plan names.
 
 ### 3.6 Adding a kernel or an op class
 
