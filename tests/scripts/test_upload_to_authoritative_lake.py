@@ -15,54 +15,64 @@ def _csv(run_ids: list[str]) -> str:
     return to_csv([row(run_id=run_id) for run_id in run_ids])
 
 
-def test_the_uploader_uses_the_public_review_flow(monkeypatch, tmp_path):
-    calls: list[tuple[str, dict]] = []
-
-    class Lake:
-        def __init__(self, base, token):
-            assert base == "https://example.invalid"
-            assert token == "hapat_ok"
-
+def _fake_lake(calls: list, row_count: int, private: set):
+    """The real client with only its HTTP replaced: `private` is the runs the
+    server holds private batches of (contribute 404s on any other)."""
+    class Lake(uploader.AuthoritativeLake):
         def post(self, path, payload):
             calls.append((path, payload))
             if path == "/api/bench/upload":
                 return {"upload_id": "22222222-2222-4222-8222-222222222222",
-                        "row_count": 1}
+                        "row_count": row_count}
+            if path.endswith("/contribute?within_peak=true"):
+                run = path.split("/")[4]
+                if run not in private:
+                    raise RuntimeError("HTTP 404 from contribute: no private batch")
+                private.discard(run)
+                return {"batches": 1}
             if path == "/api/bench/promote":
                 return {"promoted": [{"batches": 1}]}
-            if path.startswith("/api/bench/"):
-                return {}
+            raise AssertionError(path)
+    return Lake
 
-        def upload(self, text, label):
-            return self.post("/api/bench/upload",
-                             {"csv_text": text, "label": label})
 
-        def share_within_peak(self, owner, upload_id):
-            self.post(f"/api/bench/{upload_id}/contribute?within_peak=true", {})
-            return self.post("/api/bench/promote", {"sets": [
-                {"owner": owner, "kind": "upload", "id": upload_id}]})
-
+def _run(monkeypatch, tmp_path, lake, run_ids, *extra):
     path = tmp_path / "results.csv"
-    path.write_text(_csv(["run-a", "run-b"]), encoding="utf-8")
+    path.write_text(_csv(run_ids), encoding="utf-8")
     monkeypatch.setattr(uploader, "check_paths", lambda _: _Report())
     monkeypatch.setattr(uploader, "format_report", lambda _: "checked")
-    monkeypatch.setattr(uploader, "AuthoritativeLake", Lake)
-    rc = uploader.main([
+    monkeypatch.setattr(uploader, "AuthoritativeLake", lake)
+    return uploader.main([
         "gpu", str(path), "--host", "https://example.invalid", "--token", "hapat_ok",
-        "--owner", "11111111-1111-4111-8111-111111111111"])
+        "--owner", "11111111-1111-4111-8111-111111111111", *extra])
 
+
+def test_a_run_whose_resend_adds_nothing_is_still_shared(monkeypatch, tmp_path):
+    # The first send stored the rows and the process stopped before the
+    # promote; the resend is deduplicated to 0 rows. The run's private batch
+    # must still be nominated and promoted, or it stays private for good.
+    calls: list = []
+    rc = _run(monkeypatch, tmp_path, _fake_lake(calls, 0, {"run-a"}), ["run-a"])
     assert rc == 0
-    assert [path for path, _ in calls] == [
+    assert [p for p, _ in calls] == [
         "/api/bench/upload",
-        "/api/bench/22222222-2222-4222-8222-222222222222/contribute?within_peak=true",
-        "/api/bench/promote",
-        "/api/bench/upload",
-        "/api/bench/22222222-2222-4222-8222-222222222222/contribute?within_peak=true",
+        "/api/bench/run/run-a/contribute?within_peak=true",
         "/api/bench/promote",
     ]
-    promote = [body for path, body in calls if path == "/api/bench/promote"]
-    assert all(body["sets"][0]["owner"] == "11111111-1111-4111-8111-111111111111"
-               for body in promote)
+    assert calls[-1][1] == {"sets": [{
+        "owner": "11111111-1111-4111-8111-111111111111", "kind": "run", "id": "run-a"}]}
+
+
+def test_each_run_is_shared_once_after_all_its_parts(monkeypatch, tmp_path):
+    calls: list = []
+    rc = _run(monkeypatch, tmp_path, _fake_lake(calls, 1, {"run-a", "run-b"}),
+              ["run-a", "run-a", "run-a", "run-b"], "--chunk-rows", "2")
+    assert rc == 0
+    assert [p for p, _ in calls] == [
+        "/api/bench/upload", "/api/bench/upload", "/api/bench/upload",
+        "/api/bench/run/run-a/contribute?within_peak=true", "/api/bench/promote",
+        "/api/bench/run/run-b/contribute?within_peak=true", "/api/bench/promote",
+    ]
 
 
 def test_the_local_service_is_not_accepted_as_authoritative(monkeypatch):

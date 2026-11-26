@@ -24,7 +24,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -73,10 +73,27 @@ class AuthoritativeLake:
         return self.post("/api/bench/upload", {
             "csv_text": text, "label": label, "make_public": False})
 
-    def share_within_peak(self, owner: str, upload_id: str) -> dict[str, Any]:
-        self.post(f"/api/bench/{upload_id}/contribute?within_peak=true", {})
-        return self.post("/api/bench/promote", {"sets": [
-            {"owner": owner, "kind": "upload", "id": upload_id}]})
+    def share_within_peak(self, owner: str, run_id: str) -> int:
+        """Nominate and promote every private batch of the RUN, within peak;
+        the number of batches promoted. By run, not by upload: an upload
+        whose promote never ran (the process stopped between the two
+        calls) is deduplicated to 0 rows when sent again, so promoting
+        only what this call uploaded would leave that batch private for
+        good. A 404 is the run having nothing in that state any more."""
+        try:
+            self.post(f"/api/bench/run/{quote(run_id, safe='')}/contribute"
+                      "?within_peak=true", {})
+        except RuntimeError as e:
+            if not str(e).startswith("HTTP 404"):
+                raise
+        try:
+            answer = self.post("/api/bench/promote", {"sets": [
+                {"owner": owner, "kind": "run", "id": run_id}]})
+        except RuntimeError as e:
+            if str(e).startswith("HTTP 404"):
+                return 0
+            raise
+        return sum(p["batches"] for p in answer["promoted"])
 
 
 def _plan_for(path: Path) -> Path:
@@ -163,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("sharing needs --owner or HUGGINGARCH_BENCH_OWNER")
     lake = AuthoritativeLake(_not_local(args.host), _token(args))
     rc = 0
+    runs: list[str] = []
     for path in args.csv:
         for (model, run_id), part, rows, text in _prepared(path, args.chunk_rows):
             label = (f"{args.label_prefix}-{model.replace('/', '_')}-"
@@ -173,16 +191,26 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             try:
                 answer = lake.upload(text, label)
-                said = f"{answer.get('row_count')} rows, id={answer.get('upload_id')}"
-                if not args.private and answer.get("row_count"):
-                    promoted = lake.share_within_peak(owner, str(answer["upload_id"]))
-                    said += (", shared within peak ("
-                             f"{promoted['promoted'][0]['batches']} batches)")
-            except (RuntimeError, KeyError, TypeError) as e:
+            except RuntimeError as e:
                 print(f"✗ {label}: {e}", file=sys.stderr)
                 rc = 1
                 continue
-            print(f"{label}: {len(rows)} rows → {said}", flush=True)
+            if run_id not in runs:
+                runs.append(run_id)
+            print(f"{label}: {len(rows)} rows → {answer.get('row_count')} rows, "
+                  f"id={answer.get('upload_id')}", flush=True)
+    if args.private:
+        return rc
+    # Shared once per run, after all of its parts are up, whatever each part
+    # added: what is shared is the run's state on the server, not this call's.
+    for run_id in runs:
+        try:
+            n = lake.share_within_peak(owner, run_id)
+        except (RuntimeError, KeyError, TypeError) as e:
+            print(f"✗ share {run_id}: {e}", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"shared within peak: run {run_id} ({n} batches)", flush=True)
     return rc
 
 
