@@ -70,3 +70,31 @@ def test_the_local_service_is_not_accepted_as_authoritative(monkeypatch):
     with pytest.raises(ValueError, match=r"not 127\.0\.0\.1:8100"):
         uploader.main(["gpu", "x.csv", "--host", "http://127.0.0.1:8100",
                        "--private"])
+
+
+def test_a_large_run_goes_up_in_parts_no_request_over_the_limit(monkeypatch, tmp_path):
+    # The public API's edge proxy cuts a request at 100 s (HTTP 524); one
+    # 8k-row upload already exceeded it. Every row must still go up, each
+    # request within --chunk-rows, the parts sharing the run_id.
+    sent: list[str] = []
+
+    class Lake:
+        def __init__(self, base, token):
+            pass
+
+        def upload(self, text, label):
+            sent.append(text)
+            return {"upload_id": "u", "row_count": 0}
+
+    path = tmp_path / "results.csv"
+    path.write_text(_csv(["run-a"] * 5), encoding="utf-8")
+    monkeypatch.setattr(uploader, "check_paths", lambda _: _Report())
+    monkeypatch.setattr(uploader, "format_report", lambda _: "checked")
+    monkeypatch.setattr(uploader, "AuthoritativeLake", Lake)
+    rc = uploader.main(["gpu", str(path), "--host", "https://example.invalid",
+                        "--token", "hapat_ok", "--private", "--chunk-rows", "2"])
+
+    assert rc == 0
+    bodies = [text.splitlines()[1:] for text in sent]
+    assert [len(b) for b in bodies] == [2, 2, 1]
+    assert all("run-a" in line for b in bodies for line in b)

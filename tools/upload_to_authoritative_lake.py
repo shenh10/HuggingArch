@@ -94,8 +94,10 @@ def _not_local(base: str) -> str:
     return base
 
 
-def _prepared(path: Path) -> list[tuple[tuple[str, str], list[dict[str, str]], str]]:
-    """One CSV as `(model, run_id)` sets, restamped from the queue's plan."""
+def _prepared(path: Path, chunk_rows: int
+              ) -> list[tuple[tuple[str, str], int, list[dict[str, str]], str]]:
+    """One CSV as `(model, run_id)` sets, restamped from the queue's plan,
+    each in numbered parts of at most `chunk_rows` rows."""
     with path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
         header = reader.fieldnames
@@ -113,11 +115,17 @@ def _prepared(path: Path) -> list[tuple[tuple[str, str], list[dict[str, str]], s
                       f"{plan.name} ({missed} not in the plan)", flush=True)
     out = []
     for key, rows in sorted(by_set.items()):
-        buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=header, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(rows)
-        out.append((key, rows, buf.getvalue()))
+        # A run goes up in parts of at most `chunk_rows`: the public API sits
+        # behind an edge proxy that cuts a request at 100 s (HTTP 524), and an
+        # 8k-row set already took longer. A run may span several uploads —
+        # each is its own upload_id, batches share the run_id.
+        for start in range(0, len(rows), chunk_rows):
+            part = rows[start:start + chunk_rows]
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=header, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(part)
+            out.append((key, start // chunk_rows, part, buf.getvalue()))
     return out
 
 
@@ -145,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
                         default=os.environ.get("HUGGINGARCH_TOKEN_FILE"))
     parser.add_argument("--owner", default=os.environ.get("HUGGINGARCH_BENCH_OWNER"),
                         help="contributor user id (required unless --private)")
+    parser.add_argument("--chunk-rows", type=int, default=2000,
+                        help="rows per upload request (default 2000)")
     parser.add_argument("--private", action="store_true",
                         help="upload only; do not nominate or promote")
     args = parser.parse_args(argv)
@@ -154,9 +164,9 @@ def main(argv: list[str] | None = None) -> int:
     lake = AuthoritativeLake(_not_local(args.host), _token(args))
     rc = 0
     for path in args.csv:
-        for (model, run_id), rows, text in _prepared(path):
+        for (model, run_id), part, rows, text in _prepared(path, args.chunk_rows):
             label = (f"{args.label_prefix}-{model.replace('/', '_')}-"
-                     f"{path.stem}-{run_id}")
+                     f"{path.stem}-{run_id}" + (f"-part{part}" if part else ""))
             if not _checked(text, label):
                 print(f"✗ {label}: check failed", file=sys.stderr)
                 rc = 1
