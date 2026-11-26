@@ -153,7 +153,24 @@ def supervise_process(
     mtime_ns: Callable[[str], Optional[int]] = _mtime_ns,
     stop_process: Callable[[object], None] = _stop_process_group,
 ) -> SupervisedResult:
-    """Wait for a process while enforcing wall-clock and file-progress limits."""
+    """Wait for a process while enforcing wall-clock and file-progress limits.
+    Whatever stops the wait — a limit, or this process being stopped — stops
+    the process too: it runs in its own session, so nothing else reaches it."""
+    try:
+        return _supervise(process, output_path=output_path, budget_s=budget_s,
+                          stall_timeout_s=stall_timeout_s,
+                          poll_interval_s=poll_interval_s, clock=clock,
+                          sleep=sleep, mtime_ns=mtime_ns,
+                          stop_process=stop_process)
+    except BaseException:
+        if process.poll() is None:
+            stop_process(process)
+        raise
+
+
+def _supervise(process, *, output_path, budget_s, stall_timeout_s,
+               poll_interval_s, clock, sleep, mtime_ns, stop_process
+               ) -> SupervisedResult:
     started = clock()
     last_progress = started
     last_mtime = mtime_ns(output_path)

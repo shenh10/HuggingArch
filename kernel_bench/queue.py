@@ -193,9 +193,13 @@ def _spawn(cmd: List[str]) -> int:
     child = subprocess.Popen(cmd)
     try:
         return child.wait()
-    except KeyboardInterrupt:
+    except BaseException:
+        # A stop of any kind — Ctrl-C, or the SIGTERM `serve` turns into
+        # `Stopped` — goes to the child, which passes it to its env. Only
+        # `KeyboardInterrupt` used to, so a SIGTERM'd queue left its run
+        # measuring on the card with nobody watching it.
         child.terminate()
-        child.wait(timeout=30)
+        child.wait(timeout=60)
         raise
 
 

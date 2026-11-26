@@ -524,6 +524,16 @@ def _cmd_run_all(argv: List[str]) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="print the per-env commands without running them")
     args = ap.parse_args(argv)
+    # A stop (the queue passing its SIGTERM on, an operator's kill) must stop
+    # the env this run is supervising too: each runs in its own session, so
+    # nothing reaches it unless the supervisor is unwound and stops it
+    # (`supervisor.supervise_process`). Python's default for SIGTERM exits
+    # without unwinding; this makes it an exit that does.
+    import signal
+
+    def _stop(signum, _frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, _stop)
 
     import os
     import pathlib
