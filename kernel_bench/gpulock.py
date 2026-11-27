@@ -89,18 +89,49 @@ def _query_compute_apps(uuid: str) -> Tuple[List[ComputeProcess], Optional[str]]
 
 
 def gpu_uuid(device: int = 0) -> Optional[str]:
-    """Stable identity of the physical device CUDA index `device` maps to.
+    """Stable identity of the physical device index `device` maps to.
 
-    None when there is no CUDA device (CPU-only env — nothing to lock)."""
+    None when the box exposes no device identity (CPU-only — nothing to
+    lock).
+
+    CUDA first, then NPU. The NPU arm exists because this function returned
+    None on an Ascend box, and `GpuLock.acquire` treats None as "nothing to
+    lock" — so every 910C run was unprotected. Two sweeps on one die would
+    both have measured, both recorded, and neither row would say the other
+    was there, which is the exact contamination this module exists to
+    prevent. Found while scoping multi-process collective measurement:
+    that work makes several processes share a box by design, and it would
+    have made this silent gap load-bearing.
+
+    `torch.npu.get_device_properties(n).uuid` is a device UUID of the same
+    shape as CUDA's (`00cc0800-d001-0000-0000-f89a252b6ce2`), so it keys
+    the same way. Prefixed `NPU-` rather than `GPU-` so one box that
+    somehow exposed both could not collide.
+    """
     try:
         import torch
-        if not torch.cuda.is_available():
+    except Exception:
+        return None
+    try:
+        if torch.cuda.is_available():
+            uid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+            if not uid:
+                return None
+            value = str(uid)
+            return value if value.startswith("GPU-") else f"GPU-{value}"
+    except Exception:
+        pass
+    # Imported here, not at module scope: a CUDA-only box has no torch_npu
+    # and must not pay an ImportError on every lock.
+    try:
+        import torch_npu  # noqa: F401  (registers the `npu` namespace)
+        if not torch.npu.is_available():
             return None
-        uid = getattr(torch.cuda.get_device_properties(device), "uuid", None)
+        uid = getattr(torch.npu.get_device_properties(device), "uuid", None)
         if not uid:
             return None
         value = str(uid)
-        return value if value.startswith("GPU-") else f"GPU-{value}"
+        return value if value.startswith("NPU-") else f"NPU-{value}"
     except Exception:
         return None
 
@@ -125,6 +156,14 @@ def lock_path_for(uuid: str) -> str:
 #: no CUDA context), and it yields to a held lock (`held`) within seconds.
 #: Without the wait, every env that started inside a burst was refused.
 FOREIGN_GRACE_S = 30.0
+
+#: What the preflight says on a device with no occupancy probe. A constant
+#: rather than a literal so a caller can test for it, and honest rather than
+#: silent: the flock still protects, but it only protects processes that
+#: take it.
+_NPU_NO_OCCUPANCY_PROBE = (
+    "no occupancy probe for this device: the flock protects only processes "
+    "that take it, so a foreign process on the same die is not detected")
 
 
 def held(uuid: str) -> bool:
@@ -155,19 +194,42 @@ def _holder_of(path: str) -> str:
 
 
 class GpuLock:
-    """flock-based exclusive lock on one physical GPU.
+    """flock-based exclusive lock on one physical GPU, or on several at once.
 
-    A no-op when there is no CUDA device, so CPU-only test runs and dry runs
-    are unaffected. `flock` is released by the kernel when the process exits —
-    including SIGKILL — so a crashed sweep never leaves the card locked.
+    A no-op when the box exposes no device identity, so CPU-only test runs
+    and dry runs are unaffected. `flock` is released by the kernel when the
+    process exits — including SIGKILL — so a crashed sweep never leaves the
+    card locked.
+
+    `devices` names several dies for a measurement that spans them (an
+    N-rank collective). They are acquired in ASCENDING IDENTITY
+    ORDER, never in the order given: two processes asking for {die 0, die 1}
+    and {die 1, die 0} would otherwise each take one and wait forever for
+    the other. One order globally is what makes multi-die locking
+    deadlock-free, and it has to live here — a caller that sorts its own
+    list is a second statement of the rule, and the second caller will not.
     """
 
-    def __init__(self, device: int = 0, *, wait: bool = False,
-                 enabled: bool = True):
+    def __init__(self, device: int = 0, *, devices: Optional[List[int]] = None,
+                 wait: bool = False, enabled: bool = True):
         self._wait = wait
         self._enabled = enabled
-        self._uuid = gpu_uuid(device) if enabled else None
-        self._path = lock_path_for(self._uuid) if self._uuid else None
+        self._devices = [device] if devices is None else list(devices)
+        # Ascending, and de-duplicated: the order is the deadlock-freedom
+        # argument, so it is imposed rather than trusted.
+        uuids: List[str] = []
+        if enabled:
+            for index in sorted(set(self._devices)):
+                uid = gpu_uuid(index)
+                if uid and uid not in uuids:
+                    uuids.append(uid)
+            uuids.sort()
+        self._uuids = uuids
+        self._paths = [lock_path_for(u) for u in uuids]
+        # The first device keeps the single-device accessors' meaning.
+        self._uuid = uuids[0] if uuids else None
+        self._path = self._paths[0] if self._paths else None
+        self._handles: List[Tuple[str, object]] = []
         self._fh = None
         self._preflight_warning = None
 
@@ -177,88 +239,124 @@ class GpuLock:
 
     @property
     def active(self) -> bool:
-        return self._fh is not None
+        return bool(self._handles)
+
+    @property
+    def uuids(self) -> List[str]:
+        """Every identity this lock holds, in the order it took them."""
+        return list(self._uuids)
 
     @property
     def preflight_warning(self) -> Optional[str]:
         return self._preflight_warning
 
     def acquire(self) -> "GpuLock":
-        if not self._path:
-            return self                       # no CUDA device → nothing to lock
+        if not self._paths:
+            return self                       # nothing to lock
         import fcntl
-        # The flock lives as long as this handle: release() closes it.
-        fh = open(self._path, "a+", encoding="utf-8")  # noqa: SIM115
-        flags = fcntl.LOCK_EX if self._wait else (fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
-            fcntl.flock(fh.fileno(), flags)
-        except OSError as e:
-            if e.errno in (errno.EACCES, errno.EAGAIN):
-                holder = _holder_of(self._path)
+        # One identity at a time, in the order `__init__` imposed. A partial
+        # acquisition is released before raising: holding die 0 while
+        # refusing die 1 would block every other process on a lock this run
+        # is not going to use.
+        # `strict`: the two are built together in `__init__`, so a length
+        # mismatch is a bug here rather than a die to skip silently.
+        for uuid, path in zip(self._uuids, self._paths, strict=True):
+            fh = open(path, "a+", encoding="utf-8")  # noqa: SIM115
+            flags = (fcntl.LOCK_EX if self._wait
+                     else (fcntl.LOCK_EX | fcntl.LOCK_NB))
+            try:
+                fcntl.flock(fh.fileno(), flags)
+            except OSError as e:
                 fh.close()
-                raise GpuBusy(
-                    f"GPU {self._uuid} is already being measured by: {holder}\n"
-                    f"  A second run on the same card makes BOTH sets of "
-                    f"latencies wrong, and nothing in the emitted rows would "
-                    f"record that it happened.\n"
-                    f"  Wait for it, pick another card "
-                    f"(CUDA_VISIBLE_DEVICES=…), or pass --wait-for-gpu to "
-                    f"queue behind it."
-                ) from e
-            fh.close()
-            raise
+                self._release_handles()
+                if e.errno in (errno.EACCES, errno.EAGAIN):
+                    holder = _holder_of(path)
+                    raise GpuBusy(
+                        f"GPU {uuid} is already being measured by: {holder}\n"
+                        f"  A second run on the same card makes BOTH sets of "
+                        f"latencies wrong, and nothing in the emitted rows "
+                        f"would record that it happened.\n"
+                        f"  Wait for it, pick another card "
+                        f"(CUDA_VISIBLE_DEVICES=…), or pass --wait-for-gpu "
+                        f"to queue behind it."
+                    ) from e
+                raise
+            self._handles.append((uuid, fh))
+        self._fh = self._handles[0][1] if self._handles else None
+
         # Holding the lock is the signal a yielding process (the keepalive)
         # watches for, so wait out its exit before calling the card busy.
-        waited = 0.0
-        while True:
-            processes, warning = _query_compute_apps(self._uuid)
-            foreign = [proc for proc in processes if proc.pid != os.getpid()]
-            if not foreign or waited >= FOREIGN_GRACE_S:
-                break
-            time.sleep(2.0)
-            waited += 2.0
-        self._preflight_warning = warning
+        # Asked of EVERY identity: one foreign process on the second die is
+        # as contaminating as one on the first.
+        warnings: List[str] = []
+        foreign: List[ComputeProcess] = []
+        for uuid, _fh in self._handles:
+            waited = 0.0
+            # The occupancy probe is nvidia-smi's. On an NPU it would answer
+            # "nvidia-smi not found", which reads as "could not check" and
+            # trains the operator to ignore the warning. Say what is true
+            # instead: there is no probe for this device, and the flock
+            # alone is the protection.
+            if uuid.startswith("NPU-"):
+                processes, warning = [], _NPU_NO_OCCUPANCY_PROBE
+            else:
+                processes, warning = _query_compute_apps(uuid)
+            while True:
+                here = [p for p in processes if p.pid != os.getpid()]
+                if not here or waited >= FOREIGN_GRACE_S:
+                    break
+                time.sleep(2.0)
+                waited += 2.0
+                if not uuid.startswith("NPU-"):
+                    processes, warning = _query_compute_apps(uuid)
+            if warning:
+                warnings.append(warning)
+            foreign.extend(here)
+        self._preflight_warning = "; ".join(warnings) or None
         if foreign:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            self._release_handles()
             details = "; ".join(
                 f"pid={proc.pid} cmd={proc.command}"
                 + (f" memory={proc.used_memory_mib} MiB"
                    if proc.used_memory_mib is not None else "")
                 for proc in foreign)
             raise GpuBusy(
-                f"GPU {self._uuid} already has compute process(es): {details}\n"
+                f"{' / '.join(self._uuids)} already has compute process(es): "
+                f"{details}\n"
                 f"  They did not acquire kernel_bench's lock, but they can "
                 f"still contaminate every measured latency. Stop them or "
                 f"select another card before running the sweep."
             )
         # Record who holds it, for the next process's error message.
-        fh.seek(0)
-        fh.truncate()
         try:
             with open("/proc/self/cmdline", "rb") as c:
                 cmd = c.read().replace(b"\0", b" ").decode(errors="replace").strip()
         except OSError:
             cmd = "?"
-        fh.write(f"pid={os.getpid()} cmd={cmd}\n")
-        fh.flush()
-        self._fh = fh
+        for _uuid, fh in self._handles:
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid={os.getpid()} cmd={cmd}\n")
+            fh.flush()
         return self
 
-    def release(self) -> None:
-        if self._fh is None:
-            return
+    def _release_handles(self) -> None:
         import fcntl
-        try:
-            self._fh.seek(0)
-            self._fh.truncate()
-            self._fh.flush()
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        finally:
-            self._fh.close()
-            self._fh = None
+        for _uuid, fh in self._handles:
+            try:
+                fh.seek(0)
+                fh.truncate()
+                fh.flush()
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                fh.close()
+        self._handles = []
+        self._fh = None
+
+    def release(self) -> None:
+        self._release_handles()
 
     def __enter__(self) -> "GpuLock":
         return self.acquire()

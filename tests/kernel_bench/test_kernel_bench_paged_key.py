@@ -120,7 +120,7 @@ class TestThePageIsInTheCell(unittest.TestCase):
             "actual_computes_at": lambda self, inv: {},
             "version": lambda self, env: "1.0",
             "impl_id": lambda self, inv: "k"})()
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90")
         for job in paged:
             inv = Invocation.from_job(job)
             row = build_row(inv, provider, LatencyStats(5.0, 5.0, 6.0, 100, "l2_drain"),
@@ -163,14 +163,23 @@ class TestThePageIsInTheCell(unittest.TestCase):
             sorted(tuple(j["physical_key"]) for j in at64 if j not in _paged(at64)))
 
     def test_the_plan_fans_a_paged_cell_out_over_the_pages_it_is_asked(self):
-        # 128 is asked too, and no backend of this kernel serves it (only
-        # Blackwell's CUTLASS MLA does): it is no page this cell runs at.
+        # Every page some backend of this kernel serves becomes its own cell,
+        # and a page none serves becomes none. 128 is vLLM-Ascend's
+        # (`providers.ascend`, the page its plugin allocates the cache in);
+        # 32 is served too but is not asked here, so it is absent for the
+        # other reason — the fan-out is over the pages ASKED, intersected
+        # with the pages served.
         jobs, _dropped = _jobs(kv_block_sizes=(16, 64, 128))
         paged = _paged(jobs)
         self.assertEqual(sorted(j["dims"][PAGE_AXIS] for j in paged),
-                         [16, 64])
-        self.assertEqual(len({tuple(j["physical_key"]) for j in paged}), 2,
+                         [16, 64, 128])
+        self.assertEqual(len({tuple(j["physical_key"]) for j in paged}), 3,
                          "two pages used to share one physical key")
+        # A page nobody serves is still dropped, which is what keeps the
+        # intersection meaningful rather than "whatever was asked".
+        unserved, _ = _jobs(kv_block_sizes=(16, 63))
+        self.assertEqual(sorted(j["dims"][PAGE_AXIS] for j in _paged(unserved)),
+                         [16])
         unpaged = [j for j in jobs if j not in paged]
         self.assertEqual(
             len(unpaged), len({(tuple(j["physical_key"]), j["node_spec_id"])

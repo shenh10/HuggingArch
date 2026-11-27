@@ -40,7 +40,7 @@ import logging
 import os
 import pathlib
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from backend.fingerprint import engine_version
 from backend.measure.cache import WRITE_BEHIND
@@ -69,7 +69,7 @@ from backend.measure import pool
 from backend.inference import gpu_specs
 from backend.inference.parallel_sweep import (
     ALL_MODES,
-    DEFAULT_SWEEP_GPUS,
+    default_sweep_gpus,
     class_cards,
 )
 from backend.inference.sweep_grid import (
@@ -97,8 +97,14 @@ def _gallery_gpus() -> list[str]:
 
 
 def _gpu_list(
-    *, gpus: list[str] | None, all_gpus: bool, default: list[str] | None = None,
+    *, gpus: list[str] | None, all_gpus: bool,
+    default: Callable[[], list[str]] | list[str] | None = None,
 ) -> list[str]:
+    """`default` may be a callable, because the fallback series is the one
+    the framework runs on (`default_sweep_gpus`) and asking for it reads the
+    spec sheet. `--all-gpus` is the whole sheet by definition and returns
+    before the question is put, so it must not be answered eagerly at the
+    call site."""
     if all_gpus:
         # Module import (not `from ... import load_gpu_specs`) so test_warm's
         # `monkeypatch.setattr("backend.inference.gpu_specs.load_gpu_specs", ...)`
@@ -113,7 +119,7 @@ def _gpu_list(
                 seen.add(sku)
         return out
     if default:
-        return list(default)
+        return list(default() if callable(default) else default)
     return [GALLERY_LANDING_GPU]
 
 
@@ -201,7 +207,7 @@ def scaling_jobs(
     (`DEFAULT_SWEEP_GPUS`); pass `--all-gpus` / `--gpu` to expand.
     """
     mids = _scaling_models(models)
-    sku = gpus or list(DEFAULT_SWEEP_GPUS)
+    sku = gpus or default_sweep_gpus()
     par = modes or list(ALL_MODES)
     deg = degrees or list(SCALING_DEGREES)
     jobs: list[tuple[str, str, object]] = []
@@ -225,7 +231,7 @@ async def ensureSharedWalks(models: list[str] | None,
     is absent. The anchor spans every Scaling context, so this is once per
     model and card class, not once per request matrix cell.
     """
-    series = list(gpus or DEFAULT_SWEEP_GPUS)
+    series = list(gpus or default_sweep_gpus())
     representatives: dict[str, str] = {}
     for gpu in series:
         cards = class_cards(gpu, series)
@@ -515,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
         if warmScaling:
             sweep_gpus = _gpu_list(
                 gpus=args.gpus, all_gpus=args.all_gpus,
-                default=list(DEFAULT_SWEEP_GPUS),
+                default=default_sweep_gpus,
             )
             if not asyncio.run(warm_sweeps(models=args.models, gpus=sweep_gpus)):
                 rc = 1

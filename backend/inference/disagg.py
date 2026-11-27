@@ -8,9 +8,64 @@ both answers are speed-of-light semantics over estimate outputs.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
+from backend.inference import gpu_specs
+from backend.inference.comm_cost import COMM_REACH_SCALEUP, comm_reach
 from backend.inference.gpu_specs import gbps_to_bytes_per_sec, inter_node_bw_gbps
+
+
+class HandoffLink(NamedTuple):
+    """The link a prefill -> decode KV handoff crosses: its name, its
+    per-direction bandwidth in the sheet's GB/s, and -- where there is no
+    bandwidth to divide by -- why not."""
+    name: str
+    bw_gbps: Optional[float]
+    unavailable_reason: str = ""
+
+    @classmethod
+    def between(cls, prefill_result: Dict[str, Any],
+                decode_result: Dict[str, Any]) -> "HandoffLink":
+        """The link the two clusters' own placement puts between them.
+
+        The two are separate machines, so the handoff always leaves the
+        chassis. Whether it also leaves the SCALE-UP fabric is the question
+        a collective group is asked (`comm_cost.comm_reach`), put to the
+        ranks the two clusters occupy together: each rounded up to whole
+        chassis, since a machine is not shared between them. They stay on
+        scale-up only on a card whose domain is wider than its chassis and
+        only while both fit inside one -- an Ascend supernode's 768 dies.
+        On every card that declares no such domain the answer is the NIC,
+        as it has always been: two 4-GPU clusters on 8-GPU NVLink nodes
+        are 8 ranks, and still two machines.
+
+        Clusters on different cards share no scale-up fabric."""
+        decode_gpu = decode_result.get("gpu") or {}
+        sku = decode_gpu.get("sku")
+        spec = gpu_specs.get_gpu(sku) if sku else None
+        sizes = (prefill_result.get("cluster_size"),
+                 decode_result.get("cluster_size"))
+        if (spec is not None and all(sizes)
+                and (prefill_result.get("gpu") or {}).get("sku") == sku):
+            host = gpu_specs.gpus_per_node(spec)
+            occupied = sum(-(-int(n) // host) * host for n in sizes)
+            if comm_reach(
+                    occupied, ranks_per_host=host,
+                    ranks_per_scaleup_domain=gpu_specs.ranks_per_scaleup_domain(
+                        spec)) == COMM_REACH_SCALEUP:
+                return cls(spec.scaleup_fabric or "", spec.scaleup_gbps or None,
+                           "" if spec.scaleup_gbps else cls._unstated(
+                               sku, "scaleup_gbps"))
+        bw = inter_node_bw_gbps(decode_gpu.get("rdma_gbps"))
+        return cls("RDMA", bw,
+                   "" if bw else cls._unstated(sku, "rdma_gbps"))
+
+    @staticmethod
+    def _unstated(sku: Optional[str], column: str) -> str:
+        return (f"{sku or 'The decode card'} states no bandwidth for the "
+                f"link this handoff crosses (gpu_specs.csv column "
+                f"`{column}`), so the transfer has no latency to report. "
+                f"Pass `kv_transfer_bw_gbps` to state the link.")
 
 
 def disagg_handoff(
@@ -25,11 +80,14 @@ def disagg_handoff(
     * KV handoff — the prefill deployment produces the prompt's KV and ships it
       to the decode deployment before decode starts. Latency ≈ per-rank KV
       bytes / per-rank link bandwidth (the transfer parallelizes across ranks,
-      so the decode receiver's per-rank shard bounds the wall-clock). Default
-      link = the decode GPU's RDMA NIC (the same `inter_node_bw_gbps` the
-      comm roofline reads; NVLink and PCIe are intra-node and never carry
-      a cross-node handoff). A SKU without an RDMA column has no handoff
-      latency to report. Override via `kv_transfer_bw_gbps`.
+      so the decode receiver's per-rank shard bounds the wall-clock). A
+      stated `kv_transfer_bw_gbps` is the link. Otherwise it is the one the
+      two clusters' placement puts between them (`HandoffLink.between`):
+      the decode GPU's RDMA NIC, or the card's scale-up fabric where both
+      clusters sit inside one scale-up domain wider than a chassis. A card
+      that states no bandwidth for that link has no handoff latency to
+      report, and says so (`unavailable_reason`) rather than reporting a
+      link of 0 GB/s.
     * Rate matching — the per-request WALL-TIME ratio (decode time per request)
       / (prefill time per request). A first-order sizing signal for how
       decode-heavy the pipeline is; the true balanced decode:prefill replica
@@ -38,10 +96,11 @@ def disagg_handoff(
       bound on the replica ratio, not the ratio itself."""
     dc_kv = decode_result.get("kv_cache", {}) or {}
     per_req_kv = float(dc_kv.get("per_request_kv_bytes", 0.0) or 0.0)
-    gpu = decode_result.get("gpu", {}) or {}
-    bw_gbps = kv_transfer_bw_gbps or inter_node_bw_gbps(gpu.get("rdma_gbps"))
-    bw_bytes = gbps_to_bytes_per_sec(bw_gbps) or 0.0
-    handoff_s = (per_req_kv / bw_bytes) if bw_bytes > 0 else None
+    link = (HandoffLink("stated", float(kv_transfer_bw_gbps))
+            if kv_transfer_bw_gbps and kv_transfer_bw_gbps > 0
+            else HandoffLink.between(prefill_result, decode_result))
+    bw_bytes = gbps_to_bytes_per_sec(link.bw_gbps)
+    handoff_s = (per_req_kv / bw_bytes) if bw_bytes else None
 
     # A phase may decline to publish a step time — `t_sol_s is None` under
     # pipeline parallelism, where the rows are one stage's and the model's step
@@ -65,8 +124,12 @@ def disagg_handoff(
     return {
         "kv_transfer": {
             "per_request_kv_bytes": per_req_kv,
-            "link_bw_gbps": float(bw_gbps or 0.0),
+            # Which link, and at what bandwidth: null with the reason
+            # beside it where the card states none, never 0 GB/s.
+            "link": link.name,
+            "link_bw_gbps": link.bw_gbps,
             "handoff_latency_s": handoff_s,
+            "unavailable_reason": link.unavailable_reason,
         },
         "rate_match": {
             "prefill_time_per_request_s": pf_t,

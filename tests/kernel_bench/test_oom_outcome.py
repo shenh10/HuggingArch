@@ -133,7 +133,7 @@ class TestWhatCountsAsTheCardRefusing(unittest.TestCase):
     def test_a_host_oom_on_a_cpu_box_is_not_a_card_refusing(self):
         from kernel_bench.driver import _is_out_of_memory
         from kernel_bench.env import Env
-        cpu = Env(torch_version="2.8.0", cuda_available=False,
+        cpu = Env(torch_version="2.8.0", device=None,
                   device_name="cpu", gpu_sku="", peak_bw_gbps=0.0)
         self.assertFalse(_is_out_of_memory(RuntimeError("out of memory"), cpu))
 
@@ -167,7 +167,7 @@ class TestTheReleaseIsJudgedAgainstWhatWasAsked(unittest.TestCase):
         import torch
         from kernel_bench.driver import _fits_after_release
         from kernel_bench.env import Env
-        gpu = Env(torch_version="2.8.0", cuda_available=True,
+        gpu = Env(torch_version="2.8.0", device="cuda",
                   device_name="H100", gpu_sku="H100-SXM", peak_bw_gbps=0.0)
         info = (int(free_gib * (1 << 30)), int(total_gib * (1 << 30)))
         with mock.patch.object(torch.cuda, "synchronize"), \
@@ -224,7 +224,7 @@ def _crowded_run(monkeypatch, fails):
     monkeypatch.setattr(driver, "_fits_after_release", lambda env, e: True)
     rows = []
     result = driver.run_jobs(
-        [_job(64)], env=Env("2.11", False, None, None, None,
+        [_job(64)], env=Env("2.11", None, None, None, None,
                             libs={"torch": "2.11"}),
         date="2026-10-26", contributor="@t", on_row=rows.append)
     return built, [bm.outcome_of(r) for r in rows], result
@@ -287,7 +287,7 @@ def _inputs_run(monkeypatch, fails):
     monkeypatch.setattr(driver, "_fits_after_release", lambda env, e: True)
     rows = []
     result = driver.run_jobs(
-        [_job(64)], env=Env("2.11", False, None, None, None,
+        [_job(64)], env=Env("2.11", None, None, None, None,
                             libs={"torch": "2.11"}),
         date="2026-10-29", contributor="@t", on_row=rows.append)
     return made, [bm.outcome_of(r) for r in rows], result

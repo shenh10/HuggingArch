@@ -455,9 +455,15 @@ def _build_jobs_over_points(
             "a deployed binding is card-aware, so its plan names that card "
             "(`gpu=`); an undeployed, card-free plan is shape inspection "
             "only and every job it emits says `plan_scope=cardless-shapes`")
+    # A card states "no compute capability" as an empty cell and a
+    # deployment states it as None (`ServingDeployment.at` maps one to the
+    # other), so the two spellings are compared through the deployment's.
+    # Compared raw, every non-CUDA card failed its own binding's identity
+    # check: `None != ''`, and the plan refused the pairing it was given.
+    card_capability = (card.compute_capability or None) if card else None
     if (card is not None and described.device is not None
             and (described.device != card.device
-                 or described.compute_capability != card.compute_capability)):
+                 or described.compute_capability != card_capability)):
         raise ValueError(
             f"the deployed binding describes {described.device or 'its card'} "
             f"at capability {described.compute_capability or '?'}, not "
@@ -816,6 +822,14 @@ def _build_jobs_over_points(
                                and "ssm_chunk_size" in _signature.cell_dims
                                and ar.analysis.program.scan_chunk_size(
                                    binding.ssm_chunk_size_from) is None) else
+                           f"{sig!r} rounds its Sinkhorn projection and the "
+                           f"checkpoint config states none of the fields "
+                           f"{binding.framework} reads the round count from "
+                           f"{list(binding.hc_sinkhorn_iters_from)}"
+                           if (_signature is not None
+                               and "sinkhorn_repeat" in _signature.cell_dims
+                               and ar.analysis.program.sinkhorn_iters(
+                                   binding.hc_sinkhorn_iters_from) is None) else
                            f"no shape projection for signature {sig!r} "
                            f"(shape_in={shp_in}) — would fabricate model-wide dims")
                     note = f"{op} [{point.aggregation_id or op}]: {why}"
@@ -990,7 +1004,7 @@ def _build_jobs_over_points(
                 # whose own backends serve it; the deployment's own page
                 # (no list asked) is the estimate's key and always kept.
                 if _paged and kv_block_sizes:
-                    served = served_kv_block_sizes(sig)
+                    served = served_kv_block_sizes(sig, gpu=gpu)
                     paged_points = [ap for ap, pg in zip(at_pages, _kv_block_sizes, strict=True)
                                     if pg in served]
                 else:

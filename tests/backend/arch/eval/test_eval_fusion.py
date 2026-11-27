@@ -2896,6 +2896,10 @@ class TestARegionIsNotSubtractedTwiceOrBackwards(unittest.TestCase):
 
         class _Fused:
             allocates_output = allocates
+            # A launch publishes its members' secondary outputs here;
+            # this double has none, and says so rather than leaving the
+            # reader to default it (`FusedNode.secondary_ports`).
+            secondary_ports: ClassVar[dict] = {}
             output_dtype: ClassVar[dict] = {}
 
         return _passed_through(

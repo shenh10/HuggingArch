@@ -8,7 +8,8 @@ layout math and the list of ops cannot grow into one file again.
 from __future__ import annotations
 
 from .fusion_plans import FUSION_SCHEMES
-from .op_signatures import OpSignature, TensorLayout, register_signature
+from .op_signatures import (COMM_DOMAIN_AXIS, OpSignature, TensorLayout,
+                            register_signature)
 
 
 register_signature(OpSignature(
@@ -1417,6 +1418,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-reduce: every rank ends up holding the sum over the group "
          "(`ncclAllReduce`, or a custom one-shot/two-shot kernel at small "
          "sizes). Grafted where a row-parallel GEMM's partial sums meet a "
@@ -1431,6 +1433,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-gather: each rank contributes its shard and ends up holding "
          "the concatenation (`ncclAllGather`). Grafted where a sharded "
          "tensor meets a consumer that needs it whole — the vocabulary "
@@ -1444,6 +1447,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("reduce-scatter: the group sums the payload and each rank keeps "
          "one slice of the result (`ncclReduceScatter`). Grafted where "
          "partial sums meet a consumer that wants them sharded — the "
@@ -1458,6 +1462,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("all-to-all: every rank sends a distinct slice to every other, "
          "swapping which axis the tensor is sharded on — torch's "
          "`all_to_all_single` with a flat `sendcount`. The EQUAL-slice form, "
@@ -1495,6 +1500,7 @@ register_signature(OpSignature(
     shape_projection="collective",
     inputs=(TensorLayout("payload", ("n_comm_elems",)),),
     structural_axes=("n_comm_ranks", "n_comm_stride"),
+    variant_dims=(COMM_DOMAIN_AXIS,),
     doc=("The pipeline hop: one point-to-point send/recv pair handing a "
          "tensor across a pipeline cut (`ncclSend` / `ncclRecv`). Not a "
          "collective over a group — the payload crosses once, whatever the "
@@ -3298,6 +3304,46 @@ register_signature(OpSignature(
          "sublayer's output spread back over the copies and the copies "
          "cross-mixed. vLLM `mhc_post_tilelang` / sglang `mhc_post`. "
          "Memory-bound: it reads and writes the whole multi-copy residual."),
+))
+
+register_signature(OpSignature(
+    name="mhc_pre",
+    binds_ops=('mhc_pre',),
+    # The seam's opening, whole: the multi-copy residual, the mix
+    # projection and the affine of the split. `pre` never leaves the
+    # launch — it weights the copies on the way out — so it is no operand
+    # and no port; `post` and `comb` are ports the post-mix reads.
+    inputs=(_HC_RESIDUAL, _HC_FN,
+            TensorLayout("scale", (3,), role="metadata"),
+            TensorLayout("base", (_HC_MIX,), role="metadata")),
+    # Named, not positional: the fusion's operands are its pattern's
+    # ports, and a position means a different tensor the day the
+    # pattern gains one (`op_signatures` refuses positions here).
+    engine_inputs=(("residual", _HC_RESIDUAL_ENGINE),
+                   ("mix_weight", _HC_FN)),
+    # The copy count is an axis no tensor of the SPLIT carries — the mix
+    # vector is one `n²+2n` row per token — and the Sinkhorn rounds are
+    # work: the kernel alternates a row and a column normalisation over
+    # the `n_hidden_copies²` block that many times. Measured on a 910C
+    # die at T=1024, 20 rounds against 100 is 119.2 us against 164.0, so
+    # two iteration counts are two measurements and the count is in the
+    # identity. The deployment's value is the checkpoint's, read at the
+    # fields the framework binding names
+    # (`FrameworkBinding.hc_sinkhorn_iters_from`).
+    structural_axes=("n_hidden_copies", "sinkhorn_repeat"),
+    dtype_slots=("activation",),
+    doc=("Hyper-connection PRE-mix, whole, as ONE launch: flatten the "
+         "copies, RMS-normalise the flat stream unscaled, project it onto "
+         "the mix vector, split that into the `pre` / `post` / `comb` "
+         "coefficients with the Sinkhorn projection on the cross-mix, and "
+         "reduce the copies under `pre`. Writes the sublayer's input plus "
+         "the two coefficient sets its closing post-mix will read. "
+         "vLLM-Ascend `torch.ops._C_ascend.npu_hc_pre_v2` (profiler "
+         "`HcPre`). The sublayer RMSNorm after it is NOT inside: the "
+         "plugin calls `npu_rms_norm` separately and the profiler shows "
+         "its own kernel. The GPU frameworks cut this span differently "
+         "— `mhc_pre_gemm` plus `mhc_pre_big_fuse`, with the split left "
+         "outside as a billed node."),
 ))
 
 register_signature(OpSignature(

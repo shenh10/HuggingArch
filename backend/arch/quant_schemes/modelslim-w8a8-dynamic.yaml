@@ -1,0 +1,60 @@
+# Ascend msModelSlim W8A8_DYNAMIC — the INT8 format vLLM-Ascend serves with
+# `--quantization ascend`: weights INT8 per output channel, activations
+# quantised to INT8 per token at run time, one INT8 x INT8 matmul.
+#
+# Read at vLLM-Ascend v0.30.0
+# (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py):
+#   weight        [out, in]  int8          :80-82
+#   weight_scale  [out, 1]   params_dtype  :84-91
+#   weight_offset [out, 1]   params_dtype  :84-91
+#   x -> npu_dynamic_quant(int8) -> npu_quant_matmul(x, weight, scale,
+#        pertoken_scale)                   :104-131
+# `params_dtype` is the model dtype; every 16-bit model dtype is two bytes,
+# so the sidecars are declared BF16 (same bytes for an F16 model).
+#
+# Deployment-only for now: an msModelSlim checkpoint names its quant type in
+# `quant_model_description.json`, not `config.json`, so a spec that reads one
+# (and the checkpoint byte gate) is a separate step.
+description: "msModelSlim W8A8_DYNAMIC — INT8 weights per channel (scale + offset), INT8 activations per token (Ascend)."
+
+num_bits:
+  fixed: 8
+badge: W8A8
+
+format_variants:
+  default:
+    packing_factor: 1
+    storage_dtype: I8
+    weight_storage_suffix: ".weight"
+
+# W8A8_DYNAMIC stores an offset per channel but quantises weights
+# symmetrically; the offset is billed as stored.
+numeric_format: [int_sym]
+numeric_format_resolver:
+  - { when: "true", format: int_sym }
+
+scale_strategy: [channel]
+
+metadata_siblings:
+  - suffix: ".weight_scale"
+    kind: scale
+    shape_per_strategy:
+      channel: ["out", "1"]
+    dtype: BF16
+  - suffix: ".weight_offset"
+    kind: zero_point
+    shape_per_strategy:
+      channel: ["out", "1"]
+    dtype: BF16
+
+valid_status: [compressed, frozen]
+
+# msModelSlim's own name for this layout (the value it writes per tensor in
+# quant_model_description.json); the one field a deployment completes.
+deployment_fields:
+  quant_type: W8A8_DYNAMIC
+
+# W8A8_DYNAMIC always quantises the activation (w8a8_dynamic.py:117); it has
+# no weight-only form.
+activation_options:
+  w8a8: int8_per_token

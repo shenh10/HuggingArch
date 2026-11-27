@@ -27,6 +27,7 @@ from backend.inference.fusion_plans import (
 )
 from backend.inference.framework_bindings import (
     FRAMEWORK_BINDINGS,
+    FrameworkNotOnDevice,
     AuditedAt,
     DispatchCondition,
     FrameworkBinding,
@@ -127,6 +128,7 @@ class TestShippedSchemesLoad(unittest.TestCase):
                 "mhc_mega_post_pre",
                 "mhc_post",
                 "mhc_post_combine_norm",
+                "mhc_pre",
                 "mhc_pre_big_fuse",
                 "mhc_pre_gemm",
                 "mhc_pre_gemm_stream",
@@ -258,7 +260,7 @@ class TestShippedBindingsLoad(unittest.TestCase):
 
     def test_one_binding_per_framework(self):
         self.assertEqual(sorted(FRAMEWORK_BINDINGS),
-                         ["deepinfer", "sglang", "vllm"])
+                         ["deepinfer", "sglang", "vllm", "vllm_ascend"])
         for name, binding in FRAMEWORK_BINDINGS.items():
             self.assertEqual(binding.framework, name)
             self.assertTrue(binding.audited_at.tag.startswith("v"), name)
@@ -385,7 +387,11 @@ class TestShippedBindingsLoad(unittest.TestCase):
                 "fused_inv_rope",
                 # The hyper-connection sublayer boundary, one plan per launch,
                 # plus DeepSeek-V4.1's spelling of the projection over the
-                # already-flattened stream.
+                # already-flattened stream. NOT `mhc_pre`: that plan takes
+                # the whole pre, Sinkhorn split included, which is the
+                # Ascend kernel's span and not one vLLM makes — it cuts the
+                # same boundary as `mhc_pre_gemm` + `mhc_pre_big_fuse` with
+                # the split left standing between them.
                 "mhc_post",
                 "mhc_pre_gemm",
                 "mhc_pre_gemm_stream",
@@ -801,8 +807,11 @@ class TestShippedBindingsLoad(unittest.TestCase):
             gpu_sku="H100-SXM", activation_dtype="BF16", server_flags=flag)))
         self.assertFalse(runs(ServingDeployment.at(
             gpu_sku="H100-SXM", activation_dtype="F32", server_flags=flag)))
-        self.assertFalse(runs(ServingDeployment.of(
-            server_flags=flag, activation_dtype="BF16", device="rocm")))
+        # On a device sglang does not run on, the deployment itself is
+        # refused (`FrameworkBinding.devices`), not just this kernel.
+        with self.assertRaises(FrameworkNotOnDevice):
+            runs(ServingDeployment.of(
+                server_flags=flag, activation_dtype="BF16", device="rocm"))
         # Without a described GPU the device is unknown: not claimed.
         self.assertFalse(runs(ServingDeployment.at(
             gpu_sku=None, activation_dtype="BF16", server_flags=flag)))
@@ -822,6 +831,8 @@ class TestShippedBindingsLoad(unittest.TestCase):
         framework owns the cache manager; it is a page size, not a wire.
         `ssm_chunk_size` likewise: where the framework reads the chunk
         length it hands the Mamba-2 scan kernel, a tile size, not a wire.
+        `devices` likewise: the platforms the framework runs on at all, a
+        fact of the framework and not of any card or price.
         `edge_dtypes` likewise: the width the kernel this framework
         dispatches to REQUIRES a declared role's output at, which is a fact
         of that kernel's interface and not a price of its own.
@@ -831,9 +842,10 @@ class TestShippedBindingsLoad(unittest.TestCase):
         """
         self.assertEqual(
             FrameworkBinding.KEYS,
-            {"framework", "audited_at", "op_implementations", "kv_block_size",
-             "ssm_chunk_size", "precision_launches",
-             "edge_dtypes", "kernel_dispatches", "architecture_served_as"})
+            {"framework", "audited_at", "devices", "op_implementations",
+             "kv_block_size", "ssm_chunk_size", "hc_sinkhorn_iters",
+             "precision_launches", "edge_dtypes", "kernel_dispatches",
+             "architecture_served_as"})
         for binding in FRAMEWORK_BINDINGS.values():
             self.assertFalse(hasattr(binding, "pipeline_wire"))
             self.assertFalse(hasattr(binding, "comm_cost"))
@@ -974,6 +986,11 @@ class TestLoaderNegativeCases(unittest.TestCase):
             content = content.replace("op_implementations:",
                                       "ssm_chunk_size: {from_config: [chunk_size]}\n"
                                       "op_implementations:")
+        # And the devices the framework runs on, required for the same
+        # reason (`FrameworkBinding.devices`); `cuda` is a sheet device.
+        if "devices:" not in content:
+            content = content.replace("op_implementations:",
+                                      "devices: [cuda]\nop_implementations:")
         (self.tmp / fname).write_text(content)
 
     def test_missing_naive_pattern_rejected(self):
@@ -1230,6 +1247,11 @@ class TestBindingLoaderNegativeCases(unittest.TestCase):
             content = content.replace("op_implementations:",
                                       "ssm_chunk_size: {from_config: [chunk_size]}\n"
                                       "op_implementations:")
+        # And the devices the framework runs on, required for the same
+        # reason (`FrameworkBinding.devices`); `cuda` is a sheet device.
+        if "devices:" not in content:
+            content = content.replace("op_implementations:",
+                                      "devices: [cuda]\nop_implementations:")
         (self.tmp / fname).write_text(content)
 
     def test_kernel_dispatches_are_explicit_and_do_not_enter_rewrite(self):
@@ -1569,7 +1591,7 @@ op_implementations:
     source_anchor: "src/stub.py:1"
     when:
       - { architectures: [A], phase: [decode] }
-      - { architectures: [B], device: [rocm] }
+      - { architectures: [B], activation_dtype: [f32] }
 """)
         binding = reload_framework_bindings(str(self.tmp))["good"]
         entry = binding.get("causal_conv1d")

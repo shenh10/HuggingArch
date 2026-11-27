@@ -1063,10 +1063,16 @@ class TestSuggestShapesCsvAlignment:
             class resolved_precision:
                 model_dtype = "bf16"
 
-            # A model with no Mamba-2 scan chunk in its config.
+            # A model with no Mamba-2 scan chunk in its config, and no
+            # Sinkhorn round count either: both are serving choices a key
+            # reads, and a config that states neither serves neither.
             class program:
                 @staticmethod
                 def scan_chunk_size(_fields):
+                    return None
+
+                @staticmethod
+                def sinkhorn_iters(_fields):
                     return None
 
             def dominant_weight_dtype(self):

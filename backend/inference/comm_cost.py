@@ -93,16 +93,79 @@ def comm_display_shape(op: str, base_shape: Optional[List[int]],
     return out
 
 
+#: The physical reaches a collective group can have, outermost last. The
+#: names are the domain's, not a vendor's: one chassis, the scale-up domain
+#: that chassis belongs to, and everything past it. On an Atlas A3 that
+#: reads 16 dies / a supernode over Lingqu (UB) / RoCE; on an NVL72 rack it
+#: reads one tray / the NVLink rack / InfiniBand. `docs/parallelism.md`
+#: registers the words.
+#: A TIER, not a size. The obvious encoding — how many ranks the domain
+#: holds — cannot be written down for `scaleout`, which has no fixed
+#: extent at all, and would split one fabric's measurements across
+#: several keys the day a 384-die and a 768-die supernode both exist.
+#: What a lookup needs to know is which fabric a group's traffic crossed,
+#: and that is an ordered three, so it is numbered: a corpus cell's
+#: values are positive integers (`benchmarks` refuses anything else), and
+#: a name would have to be spelled identically by every writer forever.
+COMM_REACH_HOST = 1
+COMM_REACH_SCALEUP = 2
+COMM_REACH_SCALEOUT = 3
+COMM_REACHES = (COMM_REACH_HOST, COMM_REACH_SCALEUP, COMM_REACH_SCALEOUT)
+
+#: What a person writes (`--comm-domain`) against what a cell carries.
+#: One mapping, read by the CLI that parses the flag and by anything
+#: rendering a row back: two spellings of this would drift the day a
+#: fourth tier appears.
+COMM_REACH_NAMES = {"host": COMM_REACH_HOST,
+                    "scaleup": COMM_REACH_SCALEUP,
+                    "scaleout": COMM_REACH_SCALEOUT}
+COMM_REACH_LABELS = {code: name for name, code in COMM_REACH_NAMES.items()}
+
+
+def comm_reach(world: int, *, base_stride: int = 1,
+               ranks_per_host: Optional[int],
+               ranks_per_scaleup_domain: Optional[int] = None) -> str:
+    """How far a collective group of `world` ranks physically stretches.
+
+    `host` when every member sits in one chassis, `scaleup` when it leaves
+    the chassis but stays inside the scale-up domain that chassis belongs
+    to, `scaleout` when it leaves that domain too. The three differ by an
+    order of magnitude of bandwidth each, which is why a measurement of one
+    must never answer for another.
+
+    `members_per_node` is the division this shares with the pricing
+    side, so a lookup and a roofline cannot disagree about where a
+    group sits.
+
+    `ranks_per_scaleup_domain` absent means the card declares no domain
+    wider than its chassis, and the answer is the two-valued one this
+    module has always given: a group either fits the node or does not.
+    That is every row on the sheet today, so nothing changes until a card
+    states a wider domain.
+    """
+    n = max(int(world or 1), 1)
+    if n <= 1:
+        return COMM_REACH_HOST
+    host = max(int(ranks_per_host or 1), 1)
+    if n <= members_per_node(n, host, base_stride):
+        return COMM_REACH_HOST
+    domain = max(int(ranks_per_scaleup_domain or host), host)
+    if domain > host and n <= members_per_node(n, domain, base_stride):
+        return COMM_REACH_SCALEUP
+    return COMM_REACH_SCALEOUT
+
+
 class Fabric(NamedTuple):
     """One card's interconnect, as `price_collective` reads it: its node
     size, each fabric's per-direction bandwidth (bytes/s) and label, one
     link traversal's latency (s, the request's `comm_latency_us`) and what
     a traversal across nodes waits on beyond it (`inter_latency`, the
-    card's `rdma_hop_latency_us`; `hop_latency`), and what its topology
-    admits of the all-reduces that need more than a link
-    (`gpu_specs.has_nvlink_domain`, `has_nvls`). A fabric built from
-    bandwidths alone admits none of them: NCCL's schedule prices every
-    collective, every hop at the one link latency."""
+    card's `rdma_hop_latency_us`; `hop_latency`), how far the scale-up
+    domain reaches when it is wider than the chassis (`scaleup_domain`),
+    and what its topology admits of the all-reduces that need more than
+    a link (`gpu_specs.has_scaleup_domain`, `has_nvls`). A fabric built
+    from bandwidths alone admits none of them: NCCL's schedule prices
+    every collective, every hop at the one link latency."""
     gpus_per_node: Optional[int]
     intra_bw: Optional[float]
     inter_bw: Optional[float]
@@ -112,16 +175,73 @@ class Fabric(NamedTuple):
     nvlink: bool = False
     nvls: bool = False
     inter_latency: float = 0.0
+    #: Ranks the SCALE-UP domain holds, when it is wider than the
+    #: chassis (`gpu_specs.ranks_per_scaleup_domain`). None reads as the
+    #: chassis, which is every card that declares no supernode. It is
+    #: this, not `gpus_per_node`, that splits a collective into intra
+    #: and inter phases: the question a split asks is whether the
+    #: traffic leaves the FAST FABRIC, and on a supernode 768 dies
+    #: answer that together across machines.
+    scaleup_domain: Optional[int] = None
+    #: The card this is the fabric of (`GPUSpec.sku`), stated with the rest
+    #: of its topology; empty for a fabric built with no card. It names the
+    #: card a refusal is about (`bandwidth`).
+    sku: str = ""
 
     @classmethod
     def of(cls, gpu: "gpu_specs.GPUSpec", step_latency: float = 0.0
            ) -> "Fabric":
-        """A card's fabric off its sheet row, at `step_latency`."""
+        """A card's fabric off its sheet row, at `step_latency`.
+
+        The topology fields are `topology()`'s to state -- including the
+        scale-up width, which this used to read a second time of its own.
+        Two readings of one row agreed only by inspection, and the field
+        was lost on the other construction site precisely because no single
+        place owned it."""
         return cls(gpu_specs.gpus_per_node(gpu),
                    gpu_specs.peak_intra_bw_bytes_per_sec(gpu),
                    gpu_specs.peak_inter_bw_bytes_per_sec(gpu),
                    gpu_specs.intra_bw_label(gpu), gpu_specs.inter_bw_label(gpu),
                    step_latency)._replace(**topology(gpu))
+
+    def scaleup_ranks(self) -> int:
+        """Ranks one scale-up domain holds: the width that splits a
+        collective into intra and inter phases. The question a split asks
+        is whether the group's traffic stays on the fast fabric, and on a
+        supernode 768 dies do that across machines; a card declaring no
+        supernode has this equal to its chassis. A phase's bytes and the
+        hops it waits on are both read off that one split, so the two
+        cannot disagree about which fabric a phase crossed."""
+        return int(self.scaleup_domain or self.gpus_per_node or 1)
+
+    def bandwidth(self, where: str) -> Optional[float]:
+        """The bandwidth (bytes/s) a phase on fabric `where` (`"intra"` /
+        `"inter"`) moves its bytes at, or None where no times were asked
+        for. A CARD that states none for a fabric a phase crosses is
+        refused here (`gpu_specs.NoFabricBandwidth`): this is where every
+        phase's bytes meet a bandwidth, so there is no path on which a
+        blank column divides into zero seconds.
+
+        "No times were asked for" is a fabric handed neither bandwidth: a
+        caller walking a step for its bytes and launches (a kernel plan, a
+        fusion walk, a single module's bench) passes the card for its
+        dispatch and no interconnect at all. That cannot be a card with
+        both cells blank -- every sheet row states the fabric inside its
+        node (`gpu_specs.check_node_fabric`) -- so one bandwidth present
+        and the other absent is the sheet not saying."""
+        bw = self.intra_bw if where == "intra" else self.inter_bw
+        if bw and bw > 0:
+            return bw
+        if not self.sku or not (self.intra_bw or self.inter_bw):
+            return None
+        domain = self.scaleup_ranks()
+        if where == "intra":
+            raise gpu_specs.NoFabricBandwidth(
+                self.sku, "scaleup_gbps",
+                f"inside its {domain}-rank scale-up domain")
+        raise gpu_specs.NoFabricBandwidth(
+            self.sku, "rdma_gbps",
+            f"between its {domain}-rank scale-up domains")
 
     def without_latency(self) -> "Fabric":
         """This fabric with free steps: what its bandwidth alone charges."""
@@ -182,12 +302,25 @@ if set(Fabric(None, None, None).offers()) != FABRIC_CAPABILITIES:
 
 def topology(gpu: Optional["gpu_specs.GPUSpec"]) -> Dict[str, Any]:
     """What a card's sheet row says of its fabrics beyond their bandwidths,
-    as `Fabric`'s fields: what its NVLink domain admits and what a
-    cross-node hop waits on. None of it without a card."""
+    as `Fabric`'s fields: what its NVLink domain admits, how WIDE that
+    domain is, and what a cross-node hop waits on. None of it without a
+    card.
+
+    The width belongs here rather than at each construction site because
+    there are two of them (`Fabric.of` and `phases`' own), and a field only
+    one of them passes is a field the other silently defaults. That is what
+    happened to `scaleup_domain`: the sheet knew the Ascend supernode holds
+    768 ranks, `Fabric.of` passed it, and the phase walk — the path an
+    estimate actually takes — built its fabric by hand without it. Every
+    group wider than one chassis was then split at `gpus_per_node` and its
+    middle phase priced as RDMA, which is the error the column was added to
+    remove."""
     if gpu is None:
         return {}
-    return {"nvlink": gpu_specs.has_nvlink_domain(gpu),
+    return {"sku": gpu.sku,
+            "nvlink": gpu_specs.has_scaleup_domain(gpu),
             "nvls": gpu_specs.has_nvls(gpu),
+            "scaleup_domain": gpu_specs.ranks_per_scaleup_domain(gpu),
             "inter_latency": gpu_specs.inter_hop_latency_s(gpu)}
 
 
@@ -588,7 +721,7 @@ def collective_latency(*, op: str, world: int, count_per_step: int,
     step. Independent of the payload once the algorithm is chosen."""
     phases = collective_phases(
         op=op, world=int(world), tensor_bytes=1.0,
-        gpus_per_node=int(fabric.gpus_per_node or 1),
+        gpus_per_node=fabric.scaleup_ranks(),
         base_stride=int(base_stride or 1), algorithm=algorithm, fanout=fanout)
     return sum(fabric.hop_latency(ph["fabric"]) * ph["hops"]
                for ph in phases) * int(count_per_step)
@@ -615,9 +748,12 @@ def price_collective(
     the same loop as the first rather than by a scalar ratio of link
     bandwidths applied to the first card's total.
     """
+    # Split at the scale-up domain, not the chassis (`Fabric.scaleup_ranks`).
+    # Cards declaring no supernode have the two equal, so their phases --
+    # and every number on the GPU baseline -- are unchanged.
     phases_list = collective_phases(
         op=op, world=int(world), tensor_bytes=float(tensor_bytes),
-        gpus_per_node=int(fabric.gpus_per_node or 1),
+        gpus_per_node=fabric.scaleup_ranks(),
         base_stride=int(base_stride or 1), algorithm=algorithm,
         fanout=fanout, t_sym=t_sym, t_sub=t_sub,
     )
@@ -625,14 +761,14 @@ def price_collective(
     rows: List[Dict[str, Any]] = []
     for ph in phases_list:
         where = ph["fabric"]
-        fabric_bw = fabric.intra_bw if where == "intra" else fabric.inter_bw
+        fabric_bw = fabric.bandwidth(where)
         fabric_label = (fabric.intra_label if where == "intra"
                         else fabric.inter_label)
         phase_bytes = float(ph["bytes_per_rank"]) * int(count_per_step)
         hop_latency = fabric.hop_latency(where)
         phase_latency = hop_latency * ph["hops"] * int(count_per_step)
-        phase_t = (phase_bytes / fabric_bw if fabric_bw and fabric_bw > 0
-                   else 0.0) + phase_latency
+        phase_t = (phase_bytes / fabric_bw if fabric_bw else 0.0
+                   ) + phase_latency
         t_comm += phase_t
         rows.append({
             "name": ph["name"],
@@ -741,6 +877,8 @@ def collective_phases(
     s = max(int(base_stride or 1), 1)
     # Group members that land inside one node, given the inner-inner_group
     # stride. base_stride=1 → min(n, g) (the legacy size-only rule).
+    # The one owner of this division; `comm_reach` reads it too, so
+    # the price and the lookup cannot disagree about where a group sits.
     m = members_per_node(n, g, s)
     T = float(tensor_bytes)
     # `T` token in the formula. When the caller passes the tensor's

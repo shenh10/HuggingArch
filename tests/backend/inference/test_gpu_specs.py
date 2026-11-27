@@ -87,11 +87,17 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
             self.assertGreaterEqual(gpus_per_node(gpu), 1, gpu.sku)
 
     def test_every_sku_declares_its_device(self):
-        """A framework's dispatch can be platform-gated (sglang's `_is_cuda`);
-        the SKU sheet says which platform each GPU is, not its arch name."""
+        """A framework's dispatch can be platform-gated (sglang's `_is_cuda`),
+        and a framework runs on the devices its binding declares; the SKU
+        sheet says which platform each card is, not its arch name, and every
+        card is a device some shipped framework runs on."""
+        from backend.inference.framework_bindings import FRAMEWORK_BINDINGS
         from backend.inference.gpu_specs import load_gpu_specs
+        served = {d for b in FRAMEWORK_BINDINGS.values() for d in b.devices}
         for gpu in load_gpu_specs():
-            self.assertEqual(gpu.device, "cuda", gpu.sku)
+            self.assertIn(gpu.device, served, gpu.sku)
+        self.assertEqual(get_gpu("H100-SXM").device, "cuda")
+        self.assertEqual(get_gpu("Ascend-910C-A3").device, "npu")
 
     def test_every_cuda_sku_states_its_compute_capability(self):
         """A framework selects some kernels by compute capability (vLLM's
@@ -100,6 +106,9 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
         states one, as `major.minor`."""
         from backend.inference.gpu_specs import load_gpu_specs
         for gpu in load_gpu_specs():
+            if gpu.device != "cuda":
+                self.assertEqual(gpu.compute_capability, "", gpu.sku)
+                continue
             major, _, minor = gpu.compute_capability.partition(".")
             self.assertTrue(major.isdigit() and minor.isdigit(), gpu.sku)
         self.assertEqual(get_gpu("H100-SXM").compute_capability, "9.0")
@@ -146,9 +155,10 @@ class TestGPUSpecsBandwidthLanes(unittest.TestCase):
             sku="x", arch="x", device="cuda", form_factor="x",
             fp32_tflops=None, tf32_tflops=None, bf16_tflops=None,
             fp16_tflops=None, int8_tops=None, fp8_tflops=None,
-            fp4_tflops=None, nvlink_gbps=None, nvls="no", pcie_gbps=None,
-            rdma_gbps=None, rdma_hop_latency_us=None, mem_gib=None,
-            mem_type="", mem_bw_gbps=None, tdp_w=None, gpus_per_node=None,
+            fp4_tflops=None, scaleup_gbps=None, scaleup_fabric="", nvls="no",
+            pcie_gbps=None, rdma_gbps=None, rdma_hop_latency_us=None,
+            mem_gib=None, mem_type="", mem_bw_gbps=None, tdp_w=None,
+            gpus_per_node=None,
         )
         self.assertEqual(intra_bw_label(empty), "")
         self.assertEqual(inter_bw_label(empty), "")
@@ -170,8 +180,9 @@ class TestPeakFlopsByName(unittest.TestCase):
             fp32_tflops=None, tf32_tflops=None,
             bf16_tflops=None, fp16_tflops=None,
             int8_tops=None, fp8_tflops=None, fp4_tflops=None,
-            nvlink_gbps=None, nvls="no", pcie_gbps=None, rdma_gbps=None,
-            rdma_hop_latency_us=None, mem_gib=None, mem_type="", mem_bw_gbps=None, tdp_w=None,
+            scaleup_gbps=None, scaleup_fabric="", nvls="no", pcie_gbps=None,
+            rdma_gbps=None, rdma_hop_latency_us=None, mem_gib=None,
+            mem_type="", mem_bw_gbps=None, tdp_w=None,
         )
         kwargs.update(peaks)
         return GPUSpec(**kwargs)
@@ -210,15 +221,87 @@ class TestGPUSpecsLoader(unittest.TestCase):
             # gpus_per_node should resolve to a positive int.
             self.assertGreater(gpus_per_node(g), 0)
 
-    def test_every_sku_declares_an_rdma_link(self):
-        # A cross-node collective or KV handoff is priced against the RDMA
-        # column and nothing else (PCIe is intra-node). A SKU added without
-        # it would report no cross-node bandwidth at all, so the column is
-        # required, and the number must be a positive per-direction GB/s.
+    def test_every_row_states_the_fabric_inside_its_node(self):
+        """What lets a fabric handed no bandwidth at all mean "no card's
+        fabric was read" (`comm_cost.Fabric.bandwidth`): no row can be that
+        fabric, because the loader refuses one that states neither a
+        scale-up link nor PCIe."""
+        from dataclasses import replace
+        from backend.inference.gpu_specs import (
+            NoFabricBandwidth, check_node_fabric, peak_intra_bw_bytes_per_sec)
+        for spec in load_gpu_specs():
+            check_node_fabric(spec)
+            self.assertGreater(peak_intra_bw_bytes_per_sec(spec), 0, spec.sku)
+        blank = replace(get_gpu("A100-40G-PCIe"), pcie_gbps=None)
+        with self.assertRaisesRegex(NoFabricBandwidth, "A100-40G-PCIe"):
+            check_node_fabric(blank)
+
+    def test_the_loader_refuses_a_row_that_states_no_fabric_at_all(self):
+        """A row with no bandwidth inside its node and none between nodes
+        is the one fabric `comm_cost.Fabric.bandwidth` reads as "no times
+        were asked for" -- so it must never be a card. Asked of the loader
+        itself, reading a sheet, not of the check alone: a check nobody
+        calls at load would leave the reading open.
+
+        The control rows load from the same file: the sheet as it is, and a
+        row that states its node's fabric and leaves the link between nodes
+        out, which a card may do."""
+        import csv
+        import io
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from backend.inference import gpu_specs as gs
+
+        with open(gs._CSV_PATH, encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f))
+            rows = list(csv.DictReader(io.StringIO(
+                ",".join(header) + "\n" + f.read())))
+        base = next(r for r in rows if r["sku"] == "A100-40G-PCIe")
+        node_only = {**base, "sku": "Node-Fabric-Only", "rdma_gbps": "",
+                     "rdma_hop_latency_us": ""}
+        no_fabric = {**node_only, "sku": "No-Fabric-At-All",
+                     "scaleup_gbps": "", "scaleup_fabric": "",
+                     "pcie_gbps": ""}
+
+        def load(extra):
+            with tempfile.TemporaryDirectory() as tmp:
+                sheet = Path(tmp) / "gpu_specs.csv"
+                with open(sheet, "w", encoding="utf-8", newline="") as out:
+                    w = csv.DictWriter(out, fieldnames=header)
+                    w.writeheader()
+                    w.writerows([*rows, *extra])
+                with mock.patch.object(gs, "_CSV_PATH", str(sheet)):
+                    return gs.load_gpu_specs.__wrapped__()
+
+        self.assertEqual(len(load([])), len(rows))
+        self.assertIn("Node-Fabric-Only",
+                      [g.sku for g in load([node_only])])
+        with self.assertRaises(gs.NoFabricBandwidth) as refused:
+            load([no_fabric])
+        self.assertIn("No-Fabric-At-All", str(refused.exception))
+        self.assertEqual(refused.exception.field, "scaleup_gbps")
+
+    def test_an_rdma_link_is_stated_whole_or_not_at_all(self):
+        # Traffic that leaves a card's scale-up domain is priced against
+        # the RDMA columns and nothing else (PCIe is intra-node). A row
+        # states a positive per-direction GB/s and the hop that goes with
+        # it, or leaves both empty -- and then whatever would cross that
+        # link is refused by name (`NoFabricBandwidth`), not priced. A rate
+        # without its hop, or a hop left behind by a removed rate, is
+        # neither.
+        unstated = []
         for g in load_gpu_specs():
             with self.subTest(sku=g.sku):
-                self.assertIsNotNone(g.rdma_gbps)
+                if g.rdma_gbps is None:
+                    self.assertIsNone(g.rdma_hop_latency_us)
+                    unstated.append(g.sku)
+                    continue
                 self.assertGreater(float(g.rdma_gbps), 0.0)
+                self.assertIsNotNone(g.rdma_hop_latency_us)
+        # The one row whose NIC has never been observed carrying traffic.
+        # A row joining it is a decision, not a blank someone forgot.
+        self.assertEqual(unstated, ["Ascend-910C-A3"])
 
     def test_no_sku_prices_bf16_and_fp16_differently(self):
         """The premise behind serving a float32 checkpoint at ONE dtype.

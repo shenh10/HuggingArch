@@ -201,7 +201,7 @@ Component yaml / inline `blocks:` 里**不能出现 quant sibling tensor 名**�
 
 ### 加 GPU SKU
 
-- `backend/inference/gpu_specs.csv` 加一行（HBM 容量、HBM 带宽、peak BF16/FP8 TFLOPs，`device`：框架 dispatch 判断的平台，如 `cuda`，framework binding 的 `when: device` 按它判定；以及 `compute_capability`：CUDA 计算能力，如 `9.0` / `10.0`，binding 的 `when: min_compute_capability`（阈值，如 `"10.0"`）按它判定框架选哪个 kernel（如只在 SM100 及以上启用的 kernel）；`arch` 是代际名，不代替二者）。无需改 Python。
+- `backend/inference/gpu_specs.csv` 加一行（HBM 容量、HBM 带宽、peak BF16/FP8 TFLOPs，scale-up 链路的单向带宽 `scaleup_gbps` 和它的名字 `scaleup_fabric`（`NVLink` / `HCCS` / `UB`，二者同有同无），`device`：框架 dispatch 判断的平台，如 `cuda`，framework binding 的 `when: device` 按它判定；以及 `compute_capability`：CUDA 计算能力，如 `9.0` / `10.0`，binding 的 `when: min_compute_capability`（阈值，如 `"10.0"`）按它判定框架选哪个 kernel（如只在 SM100 及以上启用的 kernel）；`arch` 是代际名，不代替二者；非 CUDA 设备（如 `npu`）留空 `compute_capability`，并确认有一个 framework binding 的 `devices:` 列出这个设备）。一行是一个 rank：多 die 封装（Ascend 910C）按 die 写。无需改 Python。
 
 ### 加 fusion plan / framework binding
 

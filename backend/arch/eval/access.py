@@ -513,8 +513,8 @@ def _writes_routed(graph: Any, node: Any, port: str = "") -> bool:
     if node is None:
         return False
     if isinstance(node, FusedNode):
-        member = next((graph.by_uid(uid) for uid, published
-                       in node.output_ports.items()
+        member = next((graph.by_uid(uid) for uid, _origin, published
+                       in node.publishers()
                        if main_port(published) == main_port(port)), None)
         return _writes_routed(graph, member)
     if node.provenance == "comm":

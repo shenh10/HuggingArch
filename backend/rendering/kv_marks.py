@@ -254,7 +254,7 @@ class KVMarks:
                   if self.program is not None else None)
         if isinstance(engine, FusedNode):
             ports = {}
-            for origin, port in engine.output_ports.items():
+            for origin, _origin_port, port in engine.publishers():
                 member = (self.pre_access.get(origin)
                           if self.pre_access is not None else None)
                 if member is not None and member.publishes:

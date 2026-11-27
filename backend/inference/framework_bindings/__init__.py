@@ -169,6 +169,12 @@ class ServingDeployment:
     #: The vocabulary-parallel tensor-parallel degree (the attention TP
     #: world), or None when the caller did not state a parallel deployment.
     tensor_parallel: Optional[int] = None
+    #: The expert-parallel degree (`ParallelConfig.ep_moe`, the `moe_copies`
+    #: world), or None when the caller did not state a parallel deployment.
+    #: A framework that picks a different MoE kernel once the experts are
+    #: spread across ranks reads this, not `tensor_parallel`: the two are
+    #: separate worlds and a MoE dispatch asks about the expert one.
+    expert_parallel: Optional[int] = None
     #: The MMA families the described card's SKU row lists peaks for
     #: (`gpu_specs.peak_families`). This is the capability half of a
     #: precision-launch choice: a default candidate needs every declared
@@ -185,6 +191,7 @@ class ServingDeployment:
            compute_capability: Optional[str] = None,
            kv_block_size: Optional[int] = None,
            tensor_parallel: Optional[int] = None,
+           expert_parallel: Optional[int] = None,
            peak_families: Tuple[str, ...] = ()) -> "ServingDeployment":
         flags = []
         for name, value in (server_flags or {}).items():
@@ -198,13 +205,14 @@ class ServingDeployment:
                     f"integer, not {value!r}")
         return cls(tuple(sorted(flags)), activation_dtype, device,
                    compute_capability, kv_block_size, tensor_parallel,
-                   tuple(peak_families))
+                   expert_parallel, tuple(peak_families))
 
     @classmethod
     def at(cls, *, gpu_sku: Optional[str], activation_dtype: Optional[str],
            server_flags: Optional[Mapping[str, ServerOption]] = None,
            kv_block_size: Optional[int] = None,
-           tensor_parallel: Optional[int] = None) -> "ServingDeployment":
+           tensor_parallel: Optional[int] = None,
+           expert_parallel: Optional[int] = None) -> "ServingDeployment":
         """The deployment an estimate request describes: its GPU SKU's
         `device` and `compute_capability` (`gpu_specs.csv`), its activation
         dtype, and the server options it set. A SKU or a dtype the tables do
@@ -221,6 +229,7 @@ class ServingDeployment:
                       if gpu is not None else None,
                       kv_block_size=kv_block_size,
                       tensor_parallel=tensor_parallel,
+                      expert_parallel=expert_parallel,
                       peak_families=(peak_families(gpu)
                                      if gpu is not None else ()))
 
@@ -267,7 +276,25 @@ class ResolvedLaunch:
         activation = env.get("activation")
         if not isinstance(activation, str):
             raise ValueError("a resolved launch states its activation dtype")
-        return cls(activation, env)
+        # Canonicalised, because the other side of the comparison is.
+        # `DispatchCondition.of` puts a condition's own values through
+        # `canonical(...).lower()`, so `activation_dtype: [int8]` is STORED
+        # as `i8` — while a key spells the same dtype `int8`, and `_among`
+        # compares the two strings. Of the twelve corpus tokens only five
+        # survive that round trip unchanged, `bf16` among them, which is
+        # why every bf16 condition worked and nothing else ever could.
+        #
+        # `ServingDeployment.at` already canonicalises its own activation
+        # dtype for exactly this reason; this is the launch-side half of
+        # the same fact, which had been read raw. An unknown spelling
+        # becomes None, as it does there: a fact nothing can name satisfies
+        # no condition that names one, which is what an unmatched spelling
+        # did anyway.
+        try:
+            dtype = canonical(activation).lower()
+        except UnknownDtype:
+            dtype = None
+        return cls(dtype, env)
 
     @property
     def unquantized_bf16(self) -> bool:
@@ -347,6 +374,25 @@ def _among(fact: Optional[str], allowed: Tuple[str, ...]) -> bool:
     return not allowed or (fact is not None and fact.lower() in allowed)
 
 
+def _canonical_dtype(fact: Optional[str]) -> Optional[str]:
+    """A dtype token as the conditions spell theirs.
+
+    `DispatchCondition.of` puts a condition's own values through
+    `canonical(...).lower()`, and `ResolvedLaunch` does the same to the
+    launch side (commit 0016). A slot read straight out of a
+    `dtype_env` — the output slot is one — is still in the corpus spelling,
+    so it has to take the same route or `int8` would be compared against
+    the stored `i8` and never match. That is the same defect 0016 fixed
+    for `activation_dtype`, one slot over.
+    """
+    if fact is None:
+        return None
+    try:
+        return canonical(fact).lower()
+    except UnknownDtype:
+        return None
+
+
 @dataclass(frozen=True)
 class DispatchCondition:
     """When a framework runs a bound kernel, as its source decides it.
@@ -369,6 +415,13 @@ class DispatchCondition:
     * `tensor_parallel: [<degree>, ...]` — the degree of the vocabulary/
       attention tensor-parallel world. It scopes a declaration audited only
       on an unsharded deployment; PP/EP alone do not change it.
+    * `expert_parallel: [<degree>, ...]` — the degree of the MoE
+      expert-parallel world (`ParallelConfig.ep_moe`). A framework whose MoE
+      dispatch/combine kernel changes once the experts are spread across
+      ranks states that here: vLLM-Ascend registers only the all-gather
+      path while the expert world is one rank, and selects among several
+      others above it (vllm_ascend/ascend_forward_context.py:397-398).
+      `tensor_parallel` is a different world and does not answer it.
     * `device: [...]` — the GPU SKU's `device` (`gpu_specs.csv`).
     * `min_compute_capability: "<major>.<minor>"` — the GPU SKU's CUDA
       compute capability (`gpu_specs.csv`) is at least this, the threshold a
@@ -396,15 +449,24 @@ class DispatchCondition:
     activation_dtype: Tuple[str, ...] = ()
     kv_block_size: Tuple[int, ...] = ()
     tensor_parallel: Tuple[int, ...] = ()
+    expert_parallel: Tuple[int, ...] = ()
     device: Tuple[str, ...] = ()
     min_compute_capability: Optional[Tuple[int, int]] = None
     below_compute_capability: Optional[Tuple[int, int]] = None
     unquantized_bf16_launch: Optional[bool] = None
+    #: The dtype a kernel WRITES, when that is what decides which kernel it
+    #: is. A quantise cell's activation slot is the WIDE input it reads
+    #: (`bf16`); `int8` is what it writes. `activation_dtype` names the
+    #: input, so a condition saying `activation_dtype: [int8]` for a
+    #: quantise kernel names the wrong slot and can never hold — which is
+    #: what kept the two measured `quantise_activation` rows unread.
+    output_dtype: Tuple[str, ...] = ()
     graph: GraphCondition = field(default_factory=GraphCondition)
     server_flag_value: ServerOption = True
 
-    KEYS = frozenset({"server_flag", "activation_dtype", "device",
-                      "kv_block_size", "tensor_parallel",
+    KEYS = frozenset({"server_flag", "activation_dtype", "output_dtype",
+                      "device",
+                      "kv_block_size", "tensor_parallel", "expert_parallel",
                       "min_compute_capability", "below_compute_capability",
                       "unquantized_bf16_launch",
                       "architectures",
@@ -431,13 +493,13 @@ class DispatchCondition:
     #: cards of one walk class answer them alike by construction.
     DEPLOYMENT_KEYS: ClassVar[FrozenSet[str]] = frozenset(
         {"server_flag", "activation_dtype", "kv_block_size",
-         "tensor_parallel"})
+         "tensor_parallel", "expert_parallel"})
     #: The keys the precision-resolved LAUNCH decides, supplied per row by
     #: `point_keys` after `precision_launches` has materialized the walk.
     #: They are neither card nor request facts and are never guessed from a
     #: checkpoint id.
     LAUNCH_KEYS: ClassVar[FrozenSet[str]] = frozenset(
-        {"unquantized_bf16_launch"})
+        {"unquantized_bf16_launch", "output_dtype"})
 
     def holds_for(self, deployment: ServingDeployment,
                   launch: Optional["ResolvedLaunch"] = None) -> bool:
@@ -447,11 +509,20 @@ class DispatchCondition:
         launch, not the request's model dtype."""
         activation = (deployment.activation_dtype if launch is None
                       else launch.activation_dtype)
+        # The output slot, read off the launch's own dtype environment. A
+        # deployment has no output dtype — it is a property of one launch —
+        # so a condition naming it is unsatisfiable without a launch, the
+        # same way `unquantized_bf16_launch` is. That is the intended
+        # answer: guessing it from the request would be the second
+        # derivation this module exists to avoid.
+        output = (None if launch is None
+                  else launch.dtype_env.get("output"))
         return (self.holds_for_card(deployment)
                 and (self.server_flag is None
                 or deployment.flag(*self.server_flag)
                     == self.server_flag_value)
                 and _among(activation, self.activation_dtype)
+                and _among(_canonical_dtype(output), self.output_dtype)
                 and (self.unquantized_bf16_launch is None
                      or (launch is not None
                          and launch.unquantized_bf16
@@ -462,7 +533,11 @@ class DispatchCondition:
                 and (not self.tensor_parallel
                      or (deployment.tensor_parallel is not None
                          and deployment.tensor_parallel
-                         in self.tensor_parallel)))
+                         in self.tensor_parallel))
+                and (not self.expert_parallel
+                     or (deployment.expert_parallel is not None
+                         and deployment.expert_parallel
+                         in self.expert_parallel)))
 
     def holds_for_card(self, deployment: ServingDeployment) -> bool:
         """Whether the CARD's facts satisfy this condition's card keys
@@ -493,8 +568,10 @@ class DispatchCondition:
                            ("head_dim", self.graph.head_dim),
                            ("phase", self.graph.phase),
                            ("activation_dtype", self.activation_dtype),
+                           ("output_dtype", self.output_dtype),
                            ("kv_block_size", self.kv_block_size),
                            ("tensor_parallel", self.tensor_parallel),
+                           ("expert_parallel", self.expert_parallel),
                            ("device", self.device)):
             if value:
                 out[key] = list(value)
@@ -577,7 +654,7 @@ class DispatchCondition:
                 raise ValueError(f"{where}: `when.{key}` is a list of integers")
             return tuple(value)
 
-        for key in ("kv_block_size", "tensor_parallel"):
+        for key in ("kv_block_size", "tensor_parallel", "expert_parallel"):
             if any(value <= 0 for value in integers(key)):
                 raise ValueError(
                     f"{where}: `when.{key}` is a list of positive integers")
@@ -664,8 +741,11 @@ class DispatchCondition:
             server_flag=flag,
             activation_dtype=tuple(canonical(n).lower()
                                    for n in names("activation_dtype")),
+            output_dtype=tuple(canonical(n).lower()
+                               for n in names("output_dtype")),
             kv_block_size=integers("kv_block_size"),
             tensor_parallel=integers("tensor_parallel"),
+            expert_parallel=integers("expert_parallel"),
             device=tuple(n.lower() for n in names("device")),
             min_compute_capability=minimum,
             below_compute_capability=below,
@@ -1205,6 +1285,22 @@ class EdgeDtype:
     KEYS = frozenset({"roles", "dtype", "when", "source_anchor"})
 
 
+class FrameworkNotOnDevice(ValueError):
+    """A request named a framework on a card whose device the framework
+    does not run on (`FrameworkBinding.devices`) — vLLM on an Ascend NPU,
+    vLLM-Ascend on an NVIDIA GPU. Refused rather than answered: the rows
+    would price the other platform's kernels. A ValueError, so the API
+    answers it 400 with this message."""
+
+    def __init__(self, framework: str, devices: Tuple[str, ...],
+                 device: str):
+        self.framework, self.devices, self.device = framework, devices, device
+        super().__init__(
+            f"{framework} runs on {', '.join(devices)}, not on a {device} "
+            f"card: pick a framework whose binding lists `{device}` in its "
+            f"`devices`, or a card it runs on.")
+
+
 @dataclass(frozen=True)
 class FrameworkBinding:
     """One framework's binding — a frozen, ordered list of fused_op entries
@@ -1259,6 +1355,15 @@ class FrameworkBinding:
     #: `RowIdentity`. Empty only on a binding built in code without one; a
     #: file must declare it.
     ssm_chunk_size_from: Tuple[str, ...] = ()
+    #: The checkpoint-config fields this framework reads the Sinkhorn round
+    #: count it hands its hyper-connection pre-mix kernel from, first present
+    #: wins. Like the scan chunk above it is a kernel ARGUMENT rather than a
+    #: graph fact — no `dims.yaml` symbol binds it — and it keys the
+    #: `mhc_pre` cell (`OpSignature.structural_axes`), because the launch
+    #: alternates a row and a column normalisation that many times.
+    #: OPTIONAL, unlike the scan chunk: a framework that runs no such kernel
+    #: states nothing, and then no cell of its is keyed on the count.
+    hc_sinkhorn_iters_from: Tuple[str, ...] = ()
     #: Launches this framework selects for a quantised matmul, in file order.
     precision_launches: Tuple[PrecisionLaunch, ...] = ()
     #: Roles whose output the kernel this framework dispatches to requires
@@ -1270,6 +1375,18 @@ class FrameworkBinding:
     #: order. Conditions here select AFTER precision/key derivation; they never
     #: restate weight dtype, quant scheme, activation format, or MMA dtype.
     kernel_dispatches: Tuple[KernelDispatch, ...] = ()
+    #: The devices this framework runs on at all (`gpu_specs.csv`
+    #: `device`): `cuda` for vLLM, sglang and DeepInfer, `npu` for
+    #: vLLM-Ascend. It is the framework's fact, so the framework's file
+    #: declares it, once, and a deployment on any other device is refused
+    #: where a binding meets a card (`deployed`). Without it a request for
+    #: a framework on a device it does not run on was answered: every entry
+    #: whose `when:` leaves the device unstated fired there, and the rows
+    #: priced a CUDA kernel set on a card that cannot launch one. A per-entry
+    #: `when: device` still narrows one kernel inside these devices; it may
+    #: not name a device outside them (checked at load). Empty only on a
+    #: binding built in code without one; a file must declare it.
+    devices: Tuple[str, ...] = ()
 
     #: The class this framework SERVES a checkpoint's declared architecture
     #: with, where the two differ: `{<declared class>: <serving class>}`.
@@ -1284,8 +1401,10 @@ class FrameworkBinding:
     architecture_served_as: Tuple[Tuple[str, str], ...] = ()
 
     #: The fields of a binding file.
-    KEYS = frozenset({"framework", "audited_at", "op_implementations",
+    KEYS = frozenset({"framework", "audited_at", "devices",
+                      "op_implementations",
                       "kv_block_size", "ssm_chunk_size",
+                      "hc_sinkhorn_iters",
                       "precision_launches", "edge_dtypes",
                       "kernel_dispatches", "architecture_served_as"})
 
@@ -1419,9 +1538,16 @@ class FrameworkBinding:
 
     def deployed(self, deployment: ServingDeployment) -> "FrameworkBinding":
         """This binding, answering its conditions against `deployment`. A
-        server flag no condition of it reads is refused: the framework has
-        no such switch here, and a flag nothing reads would be a deployment
-        that differs from another in name only."""
+        deployment on a device the framework does not run on is refused
+        (`devices`, `FrameworkNotOnDevice`): this is the one place a
+        framework meets a card, so the refusal is here rather than at each
+        caller. A server flag no condition of it reads is refused: the
+        framework has no such switch here, and a flag nothing reads would be
+        a deployment that differs from another in name only."""
+        if (self.devices and deployment.device is not None
+                and deployment.device not in self.devices):
+            raise FrameworkNotOnDevice(self.framework, self.devices,
+                                       deployment.device)
         known = self.server_flag_names()
         unknown = sorted({name for name, _value in deployment.server_flags}
                          - known)
@@ -1530,6 +1656,7 @@ def _conditions_can_overlap(left: DispatchCondition,
             (left.activation_dtype, right.activation_dtype),
             (left.kv_block_size, right.kv_block_size),
             (left.tensor_parallel, right.tensor_parallel),
+            (left.expert_parallel, right.expert_parallel),
             (left.device, right.device),
             (left.graph.phase, right.graph.phase),
             (left.graph.head_dim, right.graph.head_dim)):
@@ -2014,6 +2141,7 @@ def _load_framework_bindings_dir(
                 f"{framework!r} is `{framework}.yaml` — one binding per "
                 f"framework.")
         audited_at = _audited_at(data.get("audited_at"), fname)
+        devices = _devices(data.get("devices"), fname)
         if "kv_block_size" not in data:
             raise ValueError(
                 f"framework_bindings/{fname}: no `kv_block_size`. It is the "
@@ -2046,6 +2174,8 @@ def _load_framework_bindings_dir(
                 f"{ssm_chunk!r}.")
         served_as = _architecture_served_as(
             data.get("architecture_served_as"), fname)
+        hc_iters = data.get("hc_sinkhorn_iters")
+        hc_iters_from = _config_fields(hc_iters, "hc_sinkhorn_iters", fname)
         op_impls_raw = data.get("op_implementations") or {}
         if not isinstance(op_impls_raw, dict):
             raise ValueError(
@@ -2103,15 +2233,77 @@ def _load_framework_bindings_dir(
             op_implementations=tuple(impls),
             kv_block_size=(None if kv_block is None else int(kv_block)),
             ssm_chunk_size_from=tuple(ssm_from),
+            hc_sinkhorn_iters_from=hc_iters_from,
             precision_launches=precision_launches,
             edge_dtypes=edge_dtypes,
             kernel_dispatches=kernel_dispatches,
+            devices=devices,
         )
         # The one place a condition's architecture lists are read through
         # the framework's own resolution (`_resolved_architectures`).
         out[framework] = (_resolved_architectures(binding, served_as)
                           if served_as else binding)
+        _check_entry_devices(out[framework], fname)
     return out
+
+
+def _config_fields(raw: Any, key: str, fname: str) -> Tuple[str, ...]:
+    """A `{from_config: [<field>, ...]}` declaration: the checkpoint-config
+    fields a framework reads one kernel argument from, first present wins.
+    Absent is the empty tuple — the framework runs no such kernel — but a
+    malformed one is refused rather than silently ignored."""
+    if raw is None:
+        return ()
+    fields = (raw.get("from_config")
+              if isinstance(raw, dict) and set(raw) == {"from_config"}
+              else None)
+    if (not isinstance(fields, list) or not fields
+            or not all(isinstance(f, str) and f for f in fields)
+            or len(set(fields)) != len(fields)):
+        raise ValueError(
+            f"framework_bindings/{fname}: `{key}` is "
+            f"`{{from_config: [<field>, ...]}}`, the checkpoint-config "
+            f"fields this framework reads that kernel argument from, first "
+            f"present wins; got {raw!r}.")
+    return tuple(fields)
+
+
+def _devices(raw: Any, fname: str) -> Tuple[str, ...]:
+    """A file's `devices:`: the non-empty list of `gpu_specs.csv` devices the
+    framework runs on. Declared, not defaulted — a framework that left it out
+    would run everywhere — and each must be a device some card has, or the
+    binding could never deploy."""
+    if (not isinstance(raw, list) or not raw
+            or not all(isinstance(d, str) and d for d in raw)
+            or len(set(raw)) != len(raw)):
+        raise ValueError(
+            f"framework_bindings/{fname}: `devices` is the non-empty list of "
+            f"devices (`gpu_specs.csv` `device`) this framework runs on, "
+            f"declared once per file; got {raw!r}.")
+    known = {g.device for g in gpu_specs.load_gpu_specs()}
+    unknown = sorted(set(d.lower() for d in raw) - known)
+    if unknown:
+        raise ValueError(
+            f"framework_bindings/{fname}: `devices` names {unknown}, which no "
+            f"row of gpu_specs.csv has (devices there: {sorted(known)}).")
+    return tuple(d.lower() for d in raw)
+
+
+def _check_entry_devices(binding: FrameworkBinding, fname: str) -> None:
+    """An entry's `when: device` narrows a kernel inside the framework's
+    `devices`; naming a device outside them states a kernel the framework
+    can never be deployed to run, so it is refused at load."""
+    whens = [w for _op, impl in binding.op_implementations for w in impl.whens]
+    whens += [w for launch in binding.precision_launches for w in launch.whens]
+    whens += [w for d in binding.kernel_dispatches for w in d.whens]
+    whens += [w for e in binding.edge_dtypes for w in e.whens]
+    outside = sorted({d for w in whens for d in w.device}
+                     - set(binding.devices))
+    if outside:
+        raise ValueError(
+            f"framework_bindings/{fname}: an entry's `when: device` names "
+            f"{outside}, outside the framework's `devices` "
+            f"{list(binding.devices)}.")
 
 
 def _append_op_implementation(impls: list, op_name: str, impl_data: Any,

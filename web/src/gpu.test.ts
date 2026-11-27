@@ -15,8 +15,9 @@ describe("skuOf", () => {
 });
 
 describe("intraNodeLink", () => {
-  test("NVLink when the SKU has one, PCIe otherwise, a dash for neither", () => {
-    expect(intraNodeLink({ nvlink_gbps: 450, pcie_gbps: 64 })).toBe("NVLink 450 GB/s");
+  test("the scale-up link when the SKU has one, PCIe otherwise, a dash for neither", () => {
+    expect(intraNodeLink({ scaleup_gbps: 450, scaleup_fabric: "NVLink", pcie_gbps: 64 })).toBe("NVLink 450 GB/s");
+    expect(intraNodeLink({ scaleup_gbps: 196, scaleup_fabric: "HCCS", pcie_gbps: 64 })).toBe("HCCS 196 GB/s");
     expect(intraNodeLink({ pcie_gbps: 64 })).toBe("PCIe 64 GB/s");
     expect(intraNodeLink({})).toBe("—");
   });
@@ -30,7 +31,7 @@ describe("gpuSpecSummary", () => {
   });
 
   test("a spec the row does not carry is left out, not printed empty", () => {
-    expect(gpuSpecSummary({ bf16_tflops: 989, mem_gib: 80, mem_bw_gbps: 3350, nvlink_gbps: 450 }))
+    expect(gpuSpecSummary({ bf16_tflops: 989, mem_gib: 80, mem_bw_gbps: 3350, scaleup_gbps: 450, scaleup_fabric: "NVLink" }))
       .toBe("BF16 989 TFLOPS · 80 GiB · HBM 3.35 TB/s · NVLink 450 GB/s");
     expect(gpuSpecSummary({ mem_gib: 80 })).toBe("80 GiB · —");
   });

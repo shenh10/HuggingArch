@@ -33,7 +33,7 @@ from kernel_bench.driver import run_jobs
 from kernel_bench.env import Env
 from kernel_bench.providers import TORCH_FLOAT, BenchCase, KernelSignature, Provider
 
-ENV = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+ENV = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
 CANONICAL = {"sort_keys": True, "separators": (",", ":")}
 
 #: Plan order on purpose: the smallest cell is neither first nor last.

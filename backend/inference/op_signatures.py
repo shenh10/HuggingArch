@@ -530,6 +530,16 @@ def _factor_run(entry: Any, wanted: set) -> Tuple[str, ...]:
 #: it.
 PAGE_AXIS = "kv_block_size"
 
+#: How far a collective's group physically reaches, when it reaches past
+#: one chassis (`comm_cost.comm_reach`: `scaleup` / `scaleout`). A VARIANT
+#: axis on every collective signature, so it identifies by presence and a
+#: group inside one host — the default, and every row measured so far —
+#: keys exactly as it did before the axis existed. Like `PAGE_AXIS` it is
+#: no `dims.yaml` symbol: the deployment's placement states it, not the
+#: model. Its one derivation is `RowIdentity`, off the card's domain sizes
+#: and the group's own world and stride.
+COMM_DOMAIN_AXIS = "n_comm_domain"
+
 
 def _contract_axes(inputs: Tuple[TensorLayout, ...],
                    structural: Tuple[str, ...]) -> Tuple[str, ...]:

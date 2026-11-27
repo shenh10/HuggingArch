@@ -12,7 +12,8 @@ def _client():
 
 def test_the_presets_are_listed():
     ids = [p["id"] for p in _client().get("/precision/presets").json()["presets"]]
-    assert ids == ["as_shipped", "kv_fp8", "kv_nvfp4", "w_fp8_kv_fp8", "w_nvfp4_w4a4_kv_fp8"]
+    assert ids == ["as_shipped", "kv_fp8", "kv_nvfp4", "w_fp8_kv_fp8",
+                   "w_nvfp4_w4a4_kv_fp8", "w_int8_w8a8_ffn"]
 
 
 def test_canonicalize_returns_repairable_errors_not_a_failure():

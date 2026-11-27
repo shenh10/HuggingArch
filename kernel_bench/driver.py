@@ -17,7 +17,9 @@ ends and `run-all` records the implementation in flight as a `crash`.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterable, List, Mapping,
@@ -39,7 +41,8 @@ from .timing import TooSlowToMeasure, time_callable
 ComparedRecord = Union[str, "_quant.ActivationCast"]
 
 
-def physical_key_for(inv: Invocation, env: Env):
+def physical_key_for(inv: Invocation, env: Env,
+                     comm_domain: Any = None):
     """The calibration `PhysicalKey` this invocation measures — the same
     library-agnostic key an estimate looks a measurement up under — read off
     the invocation rather than assembled again.
@@ -61,11 +64,94 @@ def physical_key_for(inv: Invocation, env: Env):
     signature, shape_json, dtype_env_json, phase = inv.physical_key
     return PhysicalKey(
         signature=signature,
-        shape_json=shape_json,
+        shape_json=_with_comm_domain(shape_json, comm_domain),
         dtype_env_json=dtype_env_json,
         gpu=env.gpu_sku or (env.device_name or "unknown"),
         phase=phase,
     )
+
+
+
+def _reach_code(comm_domain) -> Optional[int]:
+    """The tier code a `--comm-domain` names, or None when it adds nothing.
+
+    None for intra-host and for anything unstated: an absent axis IS the
+    chassis, which is what leaves every row measured before this tier
+    existed byte-identical.
+    """
+    if comm_domain in (None, "", 0):
+        return None
+    from backend.inference.comm_cost import (COMM_REACH_HOST,
+                                             COMM_REACH_NAMES)
+    code = (COMM_REACH_NAMES.get(comm_domain)
+            if isinstance(comm_domain, str) else int(comm_domain))
+    if code is None or int(code) == COMM_REACH_HOST:
+        return None
+    return int(code)
+
+
+def _job_with_comm_domain(job: Dict[str, Any], comm_domain: str
+                          ) -> Dict[str, Any]:
+    """`job` with its collective cell stamped with where the ranks sat.
+
+    One place, before the Invocation exists, so every reader downstream
+    — the row's `shape_json`, the physical key, the coverage question —
+    sees one cell. `host` adds nothing: an absent axis IS intra-host, and
+    that is what keeps every row measured before this byte-identical.
+    """
+    code = _reach_code(comm_domain)
+    if code is None:
+        return job
+    dims = job.get("dims")
+    if isinstance(dims, str):
+        try:
+            dims = json.loads(dims)
+        except (TypeError, ValueError):
+            return job
+    # Only a collective has a group to place.
+    if not isinstance(dims, dict) or "n_comm_ranks" not in dims:
+        return job
+    # NOT into `dims`: `Invocation.from_job` coerces every value with
+    # `int()`, which is the contract — a dim is an extent. The reach is
+    # not an extent, so it rides on the job and `emit.build_row` joins it
+    # to the shape text the row is written with.
+    out = dict(job)
+    out["comm_domain"] = code
+    key = job.get("physical_key")
+    if isinstance(key, (list, tuple)) and len(key) >= 2:
+        key = list(key)
+        key[1] = _with_comm_domain(str(key[1]), comm_domain)
+        out["physical_key"] = key
+    return out
+
+
+def _with_comm_domain(shape_json: str, comm_domain: str) -> str:
+    """Stamp a collective cell with how far its group physically reached.
+
+    The plan cannot know this and does not claim to: it states the world
+    and the mesh spacing, which are the deployment's, while WHERE those
+    ranks sat is the operator's — the same run plans identically whether
+    its 16 ranks are one chassis or two halves of two. So the placement
+    joins the key here, from the flag that stated it, and `host` adds
+    nothing: an absent axis IS intra-host (`_collective_identity`), which
+    is what keeps every row measured before this byte-identical.
+    """
+    code = _reach_code(comm_domain)
+    if code is None or not shape_json:
+        return shape_json
+    from backend.inference.op_signatures import COMM_DOMAIN_AXIS
+    try:
+        dims = json.loads(shape_json)
+    except (TypeError, ValueError):
+        return shape_json
+    # Only a collective has a group to place. A non-collective cell has no
+    # `n_comm_ranks`, and stamping one would invent an axis its signature
+    # never declared — the projection drops it, but the stored shape would
+    # carry a fact nothing produced.
+    if not isinstance(dims, dict) or "n_comm_ranks" not in dims:
+        return shape_json
+    return json.dumps({**dims, COMM_DOMAIN_AXIS: code},
+                      separators=(",", ":"), sort_keys=True)
 
 
 # Leave this share of free VRAM unclaimed by the oracle. The kernel still has to
@@ -133,11 +219,14 @@ def _reference_will_not_fit(inv, inputs, env) -> Optional[str]:
     and every remaining job for that model died with the run timeout. A cell the
     kernel can serve must not be lost to the cost of checking it.
     """
-    if not env.cuda_available:
+    if not env.accelerated:
         return None
     try:
-        import torch
-        free, _total = torch.cuda.mem_get_info()
+        from .device import backend_named
+        free_total = backend_named(env.device).mem_get_info()
+        if free_total is None:
+            return None
+        free, _total = free_total
     except Exception:
         return None
     try:
@@ -256,11 +345,11 @@ class CudaContextLost(RuntimeError):
 def _context_lost(env: Env) -> bool:
     """Whether the CUDA context has latched an error (a synchronize raises).
     Asked after a provider raised, before anything else touches the device."""
-    if not env.cuda_available:
+    if not env.accelerated:
         return False
     try:
-        import torch
-        torch.cuda.synchronize()
+        from .device import backend_named
+        backend_named(env.device).synchronize()
     except Exception:
         return True
     return False
@@ -322,6 +411,20 @@ def run_jobs(
     measured_keys: Optional[Iterable[Any]] = None,
     on_attempt: Optional[Callable[[List[Dict[str, str]]], None]] = None,
     on_disable: Optional[Callable[[str, str], None]] = None,
+    in_group: bool = False,
+    align: Optional[Callable[[], None]] = None,
+    agree: Optional[Callable[[int, int], Any]] = None,
+    comm_stride: int = 1,
+    comm_origin: int = 0,
+    # A tier NAME as the CLI spells it, or its code; `_reach_code`
+    # is the one place the two meet. None/"host" adds no axis.
+    comm_domain: Any = None,
+    nnodes: int = 1,
+    node_rank: int = 0,
+    master_addr: str = "127.0.0.1",
+    master_port: Optional[int] = None,
+    group_timeout: float = 120.0,
+    take_lock: bool = True,
 ) -> RunResult:
     """`on_row` is called with each row as soon as it exists — a measurement
     or a recorded outcome — so a caller can persist it immediately. Rows are
@@ -344,6 +447,7 @@ def run_jobs(
     from .emit import build_refusal_row, build_row
 
     env = env or detect_env()
+    in_group = bool(in_group or os.environ.get("KERNEL_BENCH_IN_GROUP") == "1")
     result = RunResult()
 
     def record(row: Dict[str, str], run_key, label: str, note: List[str],
@@ -412,7 +516,7 @@ def run_jobs(
                 result.skipped.append(note)
                 log(line)
 
-        pk = physical_key_for(inv, env)
+        pk = physical_key_for(inv, env, comm_domain)
         todo = []
         for p in provs:
             # Resolve the deployment kernel parameters first: it decides the
@@ -445,10 +549,50 @@ def run_jobs(
             todo.append((p, impl_id, version, run_key, label))
         return todo
 
-    def attempt(inv, todo) -> None:
+    def attempt(inv, todo, job) -> None:
         """Attempt one cell with the given providers (`pending`'s entries):
         its inputs and oracle built once, then each provider built, checked
         and timed, every attempt ending in a row or a note."""
+        if (not in_group) and any(p.world for p, *_rest in todo):
+            from .group import GroupFailed, measure_job
+            try:
+                # The job the CHILDREN get, stamped here: a collective is
+                # measured by a second `run_jobs` inside each rank, and
+                # that one is given a job rather than this call's flags.
+                # Stamping only in the loop below reaches every row except
+                # the collectives — which are the only rows the reach
+                # applies to.
+                rows = measure_job(
+                    _job_with_comm_domain(job, comm_domain),
+                    env=env, stride=comm_stride, origin=comm_origin,
+                    take_lock=take_lock, date=date, contributor=contributor,
+                    run_id=run_id, box=box, timeout_s=group_timeout,
+                    master_addr=master_addr, master_port=master_port,
+                    nnodes=nnodes, node_rank=node_rank)
+            except GroupFailed as e:
+                result.failures.append(
+                    f"{inv.op} {inv.dims}: group failed ({e})")
+                log(f"FAIL group {inv.op}: {e}")
+                return
+            index = {impl_id: (run_key, label)
+                     for _p, impl_id, _v, run_key, label in todo}
+            for row in rows:
+                impl = row.get("kernel_impl") or ""
+                run_key, label = index.get(impl, (None, impl))
+                if run_key is not None:
+                    measured_here.add(run_key)
+                    verdicts[run_key] = row
+                result.rows.append(row)
+                if on_row is not None:
+                    try:
+                        on_row(row)
+                    except Exception as write_error:
+                        result.failures.append(
+                            f"{label}: measured but not persisted "
+                            f"({type(write_error).__name__}: {write_error})")
+                log(f"ok   {label} p50={row.get('p50_us')} "
+                    f"{row.get('_rank_spread') or ''}")
+            return
 
         # Canonical inputs + reference for this op — built ONCE, shared by
         # every provider so their outputs (and latencies) are comparable.
@@ -457,7 +601,11 @@ def run_jobs(
         # whole sweep — as the module docstring promises.
         from .cell_check import complaints as cell_complaints
         from .refs import get_ref, input_generator
-        device = "cuda" if env.cuda_available else "cpu"
+        # The device the env actually has, not "cuda or give up". Asking
+        # `cuda_available` here put every Ascend tensor on the CPU and the
+        # run still produced rows — the exact shape of defect this harness
+        # exists to refuse (ARCHITECTURE.md, "the failure this prevents").
+        device = env.device or "cpu"
         def refuse_inputs(detail: str) -> None:
             # The card cannot hold this cell's INPUTS, so no provider of it
             # can run — one recorded refusal per implementation that was
@@ -523,10 +671,7 @@ def run_jobs(
             # accumulates across every failing job and eventually takes the
             # context down — the failure then surfaces at some unrelated later
             # launch, pointing the stack at a kernel that never ran.
-            if env.cuda_available:
-                import torch
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+            _release_device(env)
             return
         # Is this the cell the row will be billed for? A shape or a dtype
         # the operands do not have is a measurement of something else, and
@@ -539,10 +684,7 @@ def run_jobs(
                     f"{inv.op} {inv.dims}: built cell disagrees with the row "
                     f"({'; '.join(wrong)}); job skipped")
                 log(f"FAIL cell {inv.op}: {'; '.join(wrong)}")
-                if env.cuda_available:
-                    import torch
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
+                _release_device(env)
                 return
         # Reference is built SEPARATELY from inputs: the fp32 eager oracle is
         # O(S²) for attention (materializes the full score matrix) and ~2× the
@@ -567,9 +709,7 @@ def run_jobs(
                 _stop_if_context_lost(env, e, f"{inv.op} {inv.dims}: the reference")
                 log(f"no-xcheck {inv.op} {inv.dims}: reference build failed "
                     f"({type(e).__name__}) — measuring without cross-check")
-                if env.cuda_available:
-                    import torch
-                    torch.cuda.empty_cache()
+                _release_device(env)
 
         # A kernel that quantizes the weight itself gets the canonical weight
         # placed on ITS grid first — see kernel_bench/quant.py. Both the kernel
@@ -726,10 +866,7 @@ def run_jobs(
                         # stop anyone measuring it again.
                         err = xrel = xcos = xtyp = xwor = None
                         xchk = "no_reference"
-                        if env.cuda_available:
-                            import torch
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
+                        _release_device(env)
                         log(f"no-xcheck {label}: the check itself ran out of "
                             f"memory — measuring without it")
                     if trace is None or not trace.observed:
@@ -777,7 +914,7 @@ def run_jobs(
                             f"rel_err={xrel:.3g} cos={xcos:.5f}")
                         continue
                 try:
-                    stats = time_callable(case.run)
+                    stats = time_callable(case.run, align=align, agree=agree)
                 except TooSlowToMeasure as e:
                     # A `timeout`: one launch costs more than the whole timing
                     # budget, so this implementation cannot be sampled here.
@@ -885,13 +1022,7 @@ def run_jobs(
                 # surfaces here rather than detonating at an unrelated call
                 # later (its traceback then names a kernel that never ran), and
                 # drop the partial allocation instead of carrying it forward.
-                if env.cuda_available:
-                    import torch
-                    try:
-                        torch.cuda.synchronize()
-                    except Exception:
-                        pass                              # already latched
-                    torch.cuda.empty_cache()
+                _release_device(env)
             finally:
                 # Except when the context is lost: the run stops HERE, and the
                 # supervisor reads this provider off the sidecar as the crash.
@@ -902,14 +1033,12 @@ def run_jobs(
         # caching allocator doesn't accumulate reserved-but-free blocks across a
         # long sweep — fragmentation there turns later big-MoE shapes into false
         # OOMs (real on a 24GB part; avoidable when it's just leftover cache).
-        if env.cuda_available:
-            import torch
-            # `eff_cache` holds a per-grid weight copy AND its reference, so it
-            # is part of this shape's footprint, not bookkeeping — dropping only
-            # `inputs`/`ref_out` would leave the largest tensors alive.
-            inputs = ref_out = None
-            eff_cache.clear()
-            torch.cuda.empty_cache()
+        # `eff_cache` holds a per-grid weight copy AND its reference, so it
+        # is part of this shape's footprint, not bookkeeping — dropping only
+        # `inputs`/`ref_out` would leave the largest tensors alive.
+        inputs = ref_out = None
+        eff_cache.clear()
+        _release_device(env)
     # Across runs: what Kernel Bench's shared rows already measure
     # (`--skip-existing`), one lookup for every job's physical op through the
     # estimates' own client (`backend.measure.lookup.covered`). With no
@@ -927,6 +1056,13 @@ def run_jobs(
     # resumes at the job that died, not at one it never reached.
     staged: List[Tuple[Optional[Invocation], Any, Optional[BaseException]]] = []
     for job in jobs:
+        # The reach joins the CELL, not just the lookup key. `build_row`
+        # writes `shape_json` from `inv.dims`, so stamping only the
+        # PhysicalKey would leave the row on disk keyed as intra-host
+        # while coverage asked about the crossing one — the two sides
+        # disagreeing about the same measurement, which is the whole
+        # defect `n_comm_domain` exists to end.
+        job = _job_with_comm_domain(job, comm_domain)
         try:
             inv = Invocation.from_job(job)
         except ValueError as e:
@@ -1040,7 +1176,7 @@ def run_jobs(
             # against the canary's cell, and nothing before it is lost.
             if on_job_start is not None:
                 on_job_start(job_index, jobs[j])
-            attempt(inv_j, entries)
+            attempt(inv_j, entries, jobs[j])
             for e in entries:
                 judge(inv_j, e)
         if ahead and on_job_start is not None:
@@ -1054,7 +1190,7 @@ def run_jobs(
             kept.append(entry)
         if not kept:
             continue
-        attempt(inv, kept)
+        attempt(inv, kept, job)
         for entry in kept:
             if _launch_path(inv, entry[0].library, entry[1]) in here:
                 judge(inv, entry)
@@ -1102,6 +1238,15 @@ class Band(NamedTuple):
 #     bf16        0.0031      0.0402        (0.008, 0.10)
 #     fp8_e4m3    0.0446      1.2353        (0.11,  3.1)
 #     fp8_e5m2    0.0646      2.7954        (0.16,  7.0)
+#     int8        0.0090      0.0683        (0.023, 0.17)
+#
+# int8's row was measured later and NARROWER than the others: on the two
+# signatures an Ascend W8A8 deployment reaches (gemm 8 cells, grouped_gemm
+# 4), because those are the only int8 providers registered. Its floors sit
+# between fp16's and bf16's, which is what a per-channel weight and a
+# per-token activation should give — the grid is coarse but each scale
+# covers few elements. A third int8 signature arriving should re-measure
+# rather than assume this row covers it.
 #
 # The RMS floor is a property of the DTYPE (bf16 lands between 0.0010 and
 # 0.0031 whatever the op) while the maximum's distance from it is a property
@@ -1132,6 +1277,7 @@ _XCHECK_BANDS = {
     "bf16": Band(8e-3, 1e-1),
     "fp8_e4m3": Band(1.1e-1, 3.1),
     "fp8_e5m2": Band(1.6e-1, 7.0),
+    "int8": Band(2.3e-2, 1.7e-1),
 }
 
 # Each band is keyed by the dtype token a cell is measured at, and that is
@@ -1164,6 +1310,34 @@ def _band_for(dtype: str, *, role: str = "dtype") -> Band:
             f"a fallback") from None
 
 
+def _device_backend(env: Optional[Env]):
+    """The accelerator this env computes on, or None on a host-only box."""
+    if env is None or not env.accelerated:
+        return None
+    from .device import NoDeviceBackend, backend_named
+    try:
+        return backend_named(env.device)
+    except NoDeviceBackend:
+        return None
+
+
+def _release_device(env: Optional[Env]) -> None:
+    """Drop the caching allocator's hold on this process's device.
+
+    Named once: the CUDA-only `empty_cache` sites left an NPU OOM's
+    tensors resident, so the next job in a multi-die sweep inherited
+    the leak. `DeviceBackend.empty_cache` is the same call on both.
+    """
+    backend = _device_backend(env)
+    if backend is None:
+        return
+    try:
+        backend.synchronize()
+    except Exception:
+        pass
+    backend.empty_cache()
+
+
 def _fits_after_release(env: Env, error: BaseException) -> bool:
     """Release what this process is holding and say whether the card looks
     able to take the allocation that failed after all.
@@ -1188,15 +1362,18 @@ def _fits_after_release(env: Env, error: BaseException) -> bool:
     disabled the path. Only an allocation failure that does not say its
     size falls back to that line.
     """
-    if not env.cuda_available:
+    backend = _device_backend(env)
+    if backend is None:
         return False
-    import torch
     try:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        free, total = torch.cuda.mem_get_info()
+        backend.synchronize()
+        backend.empty_cache()
+        info = backend.mem_get_info()
     except Exception:
         return False
+    if info is None:
+        return False
+    free, total = info
     asked = _requested_bytes(error)
     if asked is not None:
         return free >= asked
@@ -1241,7 +1418,7 @@ def _is_out_of_memory(error: BaseException, env: Optional[Env] = None) -> bool:
     subclass counts and another library's unrelated `OutOfMemoryError` does
     not.
     """
-    if env is not None and not env.cuda_available:
+    if env is not None and not env.accelerated:
         return False
     chain = []
     seen = set()
@@ -1252,7 +1429,12 @@ def _is_out_of_memory(error: BaseException, env: Optional[Env] = None) -> bool:
         cursor = cursor.__cause__ or cursor.__context__
     try:
         import torch
-        oom_types: tuple = (torch.cuda.OutOfMemoryError,)
+        oom_types = []
+        for ns in (getattr(torch, "cuda", None), getattr(torch, "npu", None)):
+            typed = getattr(ns, "OutOfMemoryError", None) if ns is not None else None
+            if typed is not None:
+                oom_types.append(typed)
+        oom_types = tuple(oom_types)
     except Exception:
         oom_types = ()
     # Allocation failures a library reports in its own words rather than as

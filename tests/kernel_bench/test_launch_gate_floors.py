@@ -405,7 +405,7 @@ def test_a_balanced_grouped_build_packs_its_rows_in_place():
     provider = next(p for p in all_providers()
                     if p.kernel_impl == "torch_ragged_matmul")
     launched = provider.convert_inputs(inv, inputs)
-    case = provider.build(inv, Env("2.11", False, None, None, None,
+    case = provider.build(inv, Env("2.11", None, None, None, None,
                                    libs={"torch": "2.11"}), launched)
     rows = case.run.args[0]
     assert rows.shape == (sum(inv.moe_token_counts), job["dims"]["d_reduce"])
@@ -485,7 +485,7 @@ def _timed_trace(impl, job, monkeypatch=None, *, with_inputs=False):
         inv, "cpu", input_generator(inv, "cpu"))
     provider = next(p for p in all_providers() if p.kernel_impl == impl)
     launched = provider.convert_inputs(inv, inputs)
-    case = provider.build(inv, Env("2.11", False, None, None, None,
+    case = provider.build(inv, Env("2.11", None, None, None, None,
                                    libs={"torch": "2.11"}), launched)
     with record() as recorded:
         case.run()
@@ -576,7 +576,7 @@ def test_a_windowed_cell_past_the_dense_max_is_walked_in_query_blocks(
         inv, "cpu", input_generator(inv, "cpu"))
     provider = next(p for p in all_providers()
                     if p.kernel_impl == "torch_sdpa")
-    case = provider.build(inv, Env("2.11", False, None, None, None,
+    case = provider.build(inv, Env("2.11", None, None, None, None,
                                    libs={"torch": "2.11"}),
                           provider.convert_inputs(inv, inputs))
     with launch_trace.record() as recorded:
@@ -637,8 +637,8 @@ def test_the_grouped_floor_declines_a_torch_without_grouped_mm():
     from kernel_bench.providers import all_providers
     floor = next(p for p in all_providers()
                  if p.kernel_impl == "torch_ragged_matmul")
-    old = Env("2.8.0", False, None, None, None, libs={"torch": "2.8.0"})
-    new = Env("2.9.0", False, None, None, None, libs={"torch": "2.9.0"})
+    old = Env("2.8.0", None, None, None, None, libs={"torch": "2.8.0"})
+    new = Env("2.9.0", None, None, None, None, libs={"torch": "2.9.0"})
     assert not floor.available(old)
     assert floor.available(new)
     # Not a typo in an intersection: the shared torch env may start at 2.5,
@@ -667,12 +667,16 @@ def _assert_launches_the_cell(impl, job, monkeypatch):
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [
         p for p in original(inv, env) if p.kernel_impl == impl])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
     result = driver.run_jobs(
-        [job], env=Env("2.11", False, None, None, None, libs={"torch": "2.11"}),
+        [job], env=Env("2.11", None, None, None, None, libs={"torch": "2.11"}),
         date="2026-10-25", contributor="test")
     # The run is stopped right after the launch gate by a "too slow to time"
     # sentinel, which the driver records as a `timeout` attempt (4a8e081a1).
@@ -774,13 +778,17 @@ def test_sglangs_fp32_table_rope_launches_the_cell(monkeypatch, table_first):
                     if p.kernel_impl == "sgl_apply_rope_cos_sin_cache")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
     result = driver.run_jobs(
         [_SGL_ROPE_DECODE],
-        env=Env("2.11", False, None, None, None,
+        env=Env("2.11", None, None, None, None,
                 libs={"torch": "2.11", "sglang": "0.5.22"}),
         date="2026-10-26", contributor="test")
     assert len(result.failures) == 1, result.failures
@@ -830,13 +838,17 @@ def test_sglangs_partial_rope_launches_the_cell(monkeypatch, job):
                     if p.kernel_impl == "sglang_apply_rope_partial")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
 
     result = driver.run_jobs(
         [job],
-        env=Env("2.11", False, None, None, None,
+        env=Env("2.11", None, None, None, None,
                 libs={"torch": "2.11", "sglang": "0.5.22"}),
         date="2026-10-26", contributor="test")
     assert len(result.failures) == 1, result.failures
@@ -924,12 +936,16 @@ def test_vllms_fa3_decode_is_the_paged_varlen_entry(monkeypatch):
                     if p.kernel_impl == "vllm_flash_attention_v3_kvcache")
     monkeypatch.setattr(driver, "applicable", lambda inv, env: [provider])
 
-    def stop_before_timing(run):
+    # `**_kw` because this stands in for `timing.time_callable`, whose
+    # keyword arguments are the caller's business: the driver passes
+    # `align=` for a group's barrier. The stub's job is to raise before
+    # any timing happens, which no argument changes.
+    def stop_before_timing(run, **_kw):
         raise driver.TooSlowToMeasure("gate passed")
     monkeypatch.setattr(driver, "time_callable", stop_before_timing)
     result = driver.run_jobs(
         [_VLLM_FA3_DECODE],
-        env=Env("2.11", False, None, None, None,
+        env=Env("2.11", None, None, None, None,
                 libs={"torch": "2.11", "vllm": "0.32.0"}),
         date="2026-10-26", contributor="test")
     assert len(result.failures) == 1, result.failures

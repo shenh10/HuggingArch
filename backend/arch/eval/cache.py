@@ -960,7 +960,12 @@ class Edges:
                     f"is run by no launch, and the node is gone")
             return self.program.by_uid(written.uid), port
         node = self.program.by_uid(launch)
-        exposed = node.output_ports.get(written.uid)
+        # Keyed by the member AND the port asked for: a launch may publish
+        # two of ONE member's tensors (`hc_split_sinkhorn` writes `pre`,
+        # `post` and `comb`), and `output_ports` alone would answer both
+        # reads with the first. For a member with one output this is
+        # `output_ports.get(uid)` exactly (`FusedNode.published_port`).
+        exposed = node.published_port(written.uid, port)
         return node, (exposed if exposed else port)
 
     def runs(self, reader: Identified, index: int) -> Tuple["Run", ...]:

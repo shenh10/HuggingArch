@@ -58,7 +58,7 @@ def registered():
 
 
 def _env(library, torch="2.8"):
-    return Env(torch, False, None, None, None, libs={"torch": torch},
+    return Env(torch, None, None, None, None, libs={"torch": torch},
                library=library)
 
 
@@ -112,7 +112,7 @@ def test_run_all_measures_a_torch_floor_in_one_env_only(
         # release, every provider importable.
         version = torch_of[current[0]]
         monkeypatch.setattr(env_mod, "detect_env", lambda: Env(
-            version, False, None, None, None, libs={"torch": version}))
+            version, None, None, None, None, libs={"torch": version}))
         return supervisor.SupervisedResult(
             _cmd_run([*argv, "--no-gpu-lock"]), None, 0.1)
 

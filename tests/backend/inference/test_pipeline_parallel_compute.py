@@ -508,17 +508,130 @@ class TheAbsenceTravels(unittest.TestCase):
         )["kv_transfer"]
         self.assertAlmostEqual(over["handoff_latency_s"], kv / (25.0 * 1e9))
 
-        # No RDMA column: NVLink and PCIe are intra-node fabrics and never
+        # No RDMA column: the scale-up link and PCIe are intra-node fabrics and never
         # carry a cross-node handoff, so there is no latency to report.
         no_rdma = {
             **stub,
-            "gpu": {"nvlink_gbps": 450.0, "pcie_gbps": 64.0},
+            "gpu": {"scaleup_gbps": 450.0, "scaleup_fabric": "NVLink",
+                    "pcie_gbps": 64.0},
         }
         absent = disagg_handoff(
             stub, no_rdma, kv_transfer_bw_gbps=None, avg_output_tokens=1,
         )["kv_transfer"]
         self.assertIsNone(absent["handoff_latency_s"])
-        self.assertEqual(absent["link_bw_gbps"], 0.0)
+        # ... and no link of 0 GB/s either: the bandwidth is absent, with
+        # the column that would state it named beside it.
+        self.assertIsNone(absent["link_bw_gbps"])
+        self.assertIn("rdma_gbps", absent["unavailable_reason"])
+        self.assertEqual(kv_xfer["unavailable_reason"], "")
+
+
+class WhichLinkAHandoffCrosses(unittest.TestCase):
+    """The prefill and decode clusters are separate machines, so the KV
+    handoff always leaves the chassis. On an Ascend supernode it does not
+    thereby leave the scale-up fabric: 768 dies reach each other over HCCS
+    across machines. The handoff used to be priced on `rdma_gbps` wherever
+    it happened, which put a transfer between two machines of one
+    supernode on the NIC that only carries traffic LEAVING the supernode --
+    25 GB/s where the link is 196."""
+
+    def _cluster(self, sku, ranks, **gpu):
+        from backend.inference.gpu_specs import get_gpu
+        return {"kv_cache": {"per_request_kv_bytes": 8e9},
+                "gpu": {"sku": sku, "rdma_gbps": get_gpu(sku).rdma_gbps,
+                        **gpu},
+                "cluster_size": ranks,
+                "phases": {"prefill": {"t_sol_s": 1.0},
+                           "decode": {"t_sol_s": 1.0}}}
+
+    def _handoff(self, prefill, decode, bw=None):
+        from backend.inference.disagg import disagg_handoff
+        return disagg_handoff(prefill, decode, kv_transfer_bw_gbps=bw,
+                              avg_output_tokens=1)["kv_transfer"]
+
+    def test_two_machines_of_one_supernode_stay_on_scale_up(self):
+        a = "Ascend-910C-A3"
+        kv = self._handoff(self._cluster(a, 16), self._cluster(a, 16))
+        self.assertEqual((kv["link"], kv["link_bw_gbps"]), ("HCCS", 196.0))
+        self.assertAlmostEqual(kv["handoff_latency_s"],
+                               kv["per_request_kv_bytes"] / 196e9)
+        self.assertEqual(kv["unavailable_reason"], "")
+
+    def test_the_domain_is_filled_in_whole_machines(self):
+        """768 dies are 48 chassis and a chassis is not shared between the
+        two clusters, so each is counted at the machines it occupies: 753
+        dies take 48 of them and leave no room for a 49th, though 753 + 1
+        is under 768."""
+        a = "Ascend-910C-A3"
+        for prefill, decode, inside in ((752, 16, True), (16, 752, True),
+                                        (384, 384, True), (753, 1, False),
+                                        (768, 1, False), (385, 385, False),
+                                        (1, 768, False)):
+            kv = self._handoff(self._cluster(a, prefill),
+                               self._cluster(a, decode))
+            with self.subTest(prefill=prefill, decode=decode):
+                if inside:
+                    self.assertEqual(kv["link_bw_gbps"], 196.0)
+                else:
+                    self.assertEqual(kv["link"], "RDMA")
+                    self.assertNotEqual(kv["link_bw_gbps"], 196.0)
+
+    def test_a_card_with_no_supernode_hands_off_over_its_nic(self):
+        """Two TP4 clusters on 8-GPU H200 nodes are 8 ranks, which is one
+        node's worth, and are still two machines: NVLink does not join
+        them. A rule that only asked whether the ranks fit the domain would
+        put this handoff on 450 GB/s."""
+        from backend.inference.gpu_specs import get_gpu, load_gpu_specs
+        kv = self._handoff(self._cluster("H200", 4), self._cluster("H200", 4))
+        self.assertEqual((kv["link"], kv["link_bw_gbps"]),
+                         ("RDMA", get_gpu("H200").rdma_gbps))
+        for gpu in load_gpu_specs():
+            if gpu.sku == "Ascend-910C-A3":
+                continue
+            for ranks in (1, 4, 36):
+                kv = self._handoff(self._cluster(gpu.sku, ranks),
+                                   self._cluster(gpu.sku, ranks))
+                with self.subTest(sku=gpu.sku, ranks=ranks):
+                    self.assertEqual((kv["link"], kv["link_bw_gbps"]),
+                                     ("RDMA", gpu.rdma_gbps))
+
+    def test_clusters_on_different_cards_share_no_scale_up_fabric(self):
+        kv = self._handoff(self._cluster("H200", 8),
+                           self._cluster("Ascend-910C-A3", 16))
+        self.assertEqual(kv["link"], "RDMA")
+
+    def test_a_link_the_card_does_not_state_is_absent_not_zero(self):
+        """Past the supernode the handoff needs the NIC. With that column
+        blank there is nothing to divide by: no latency, no 0 GB/s link, no
+        exception -- and the reason names the column."""
+        a = "Ascend-910C-A3"
+        kv = self._handoff(self._cluster(a, 768, rdma_gbps=None),
+                           self._cluster(a, 16, rdma_gbps=None))
+        self.assertIsNone(kv["handoff_latency_s"])
+        self.assertIsNone(kv["link_bw_gbps"])
+        self.assertIn("rdma_gbps", kv["unavailable_reason"])
+        self.assertIn("kv_transfer_bw_gbps", kv["unavailable_reason"])
+        # Inside the supernode that column is never read.
+        kv = self._handoff(self._cluster(a, 16, rdma_gbps=None),
+                           self._cluster(a, 16, rdma_gbps=None))
+        self.assertEqual(kv["link_bw_gbps"], 196.0)
+
+    def test_a_stated_link_is_the_link(self):
+        """The request's `kv_transfer_bw_gbps` outranks the placement both
+        ways: a measured 81.8 GB/s replaces the 196 GB/s rating inside the
+        supernode, and a stated link prices a handoff whose card states
+        none."""
+        a = "Ascend-910C-A3"
+        kv = self._handoff(self._cluster(a, 16), self._cluster(a, 16),
+                           bw=81.8)
+        self.assertEqual((kv["link"], kv["link_bw_gbps"]), ("stated", 81.8))
+        self.assertAlmostEqual(kv["handoff_latency_s"],
+                               kv["per_request_kv_bytes"] / 81.8e9)
+        kv = self._handoff(self._cluster(a, 768, rdma_gbps=None),
+                           self._cluster(a, 16, rdma_gbps=None), bw=25.0)
+        self.assertAlmostEqual(kv["handoff_latency_s"],
+                               kv["per_request_kv_bytes"] / 25e9)
+        self.assertEqual(kv["unavailable_reason"], "")
 
 
 class OneStageNamedOnce(unittest.TestCase):

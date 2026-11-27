@@ -69,6 +69,14 @@ ADDED = {
         "identity-source edges, so their order is not the inputs'",
     "per_op_timing_decode[*].point_law.in_terms[*].index":
         "as for prefill",
+    "gpu.ranks_per_scaleup_domain":
+        "the GPU sheet states how many ranks a SKU's SCALE-UP domain holds "
+        "when that is wider than one chassis (an Atlas A3 supernode "
+        "reaches 768 dies over Lingqu while `gpus_per_node` stays 16), "
+        "which is what decides whether a collective's traffic leaves the "
+        "fast fabric (`comm_cost.price_collective`, `comm_reach`); the SKU "
+        "block publishes every sheet column, and a reader comparing two "
+        "cards' interconnects needs both sizes to tell them apart",
     "gpu.nvls":
         "the GPU sheet states whether a SKU's NVLink domain reduces in the "
         "switch (NVLink SHARP), which decides whether an NVLS all-reduce "
@@ -244,6 +252,18 @@ for _phase in ("per_op_timing", "per_op_timing_decode"):
         "a sliding band's FLOPs read its pairs (`s_pairs`), not `s_window`")
 for _phase in ("prefill", "decode"):
     REMOVED[f"phases.{_phase}.binding.causal_factor"] = _PAIRS
+
+# The scale-up link is not always NVLink: an Ascend node's is HCCS, a
+# CloudMatrix384 supernode's is UB. The sheet states the bandwidth under a
+# vendor-neutral name and names the link beside it, so a label is read, not
+# assumed from the column's name.
+_SCALEUP = ("the scale-up link's bandwidth, renamed from `nvlink_gbps` "
+            "because NVLink is one vendor's link (Ascend: HCCS)")
+REMOVED["gpu.nvlink_gbps"] = _SCALEUP
+ADDED["gpu.scaleup_gbps"] = _SCALEUP
+ADDED["gpu.scaleup_fabric"] = (
+    "the name of that link (`NVLink`, `HCCS`, `UB`), which the intra-node "
+    "bandwidth label reads (`gpu_specs.intra_bw_label`)")
 
 # The batch's routing skew is a workload input the walk reads as `rho`
 # (`Workload.ep_load_factor`): a point names its value, and a routed row's

@@ -371,7 +371,7 @@ def build_refusal_row(
     row["op"] = inv.op
     row["node_spec_id"] = inv.node_spec_id
     row["moe_block_member"] = "1" if inv.moe_block_member else ""
-    row["shape_json"] = json.dumps(inv.dims, separators=(",", ":"), sort_keys=True)
+    row["shape_json"] = _cell_text(inv)
     row["dtype_env_json"] = json.dumps(inv.dtype_env, separators=(",", ":"),
                                        sort_keys=True)
     row["kernel_impl"] = impl_id
@@ -413,6 +413,27 @@ def one_line(text: str) -> str:
     flat = " ".join(str(text or "").split())
     limit = _benchmarks.OUTCOME_DETAIL_MAX
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
+
+def _cell_text(inv: "Invocation") -> str:
+    """The cell this launch measured, as the row states it.
+
+    The dims, and -- for a collective group that reached past one chassis
+    -- where it reached (`comm_domain`). The reach is not a dim, so it
+    does not live in `inv.dims`; it joins here, at the one place the row's
+    cell is written, so the shape on disk and the key coverage asks about
+    cannot say different things about one measurement.
+
+    Intra-host writes nothing, which is what keeps every row measured
+    before the axis existed byte-identical.
+    """
+    dims = dict(inv.dims)
+    reach = getattr(inv, "comm_domain", 0) or 0
+    if int(reach) > 1 and "n_comm_ranks" in dims:
+        from backend.inference.op_signatures import COMM_DOMAIN_AXIS
+        dims[COMM_DOMAIN_AXIS] = int(reach)
+    return json.dumps(dims, separators=(",", ":"), sort_keys=True)
 
 
 def build_row(
@@ -457,7 +478,7 @@ def build_row(
     # A boundary/expert-block flag rides the row as "1"/"" so the block
     # aggregation reads it without re-deriving from op names.
     row["moe_block_member"] = "1" if inv.moe_block_member else ""
-    row["shape_json"] = json.dumps(inv.dims, separators=(",", ":"), sort_keys=True)
+    row["shape_json"] = _cell_text(inv)
     row["dtype_env_json"] = json.dumps(inv.dtype_env, separators=(",", ":"), sort_keys=True)
     # What the kernel COMPUTED in, when that is not what the cell asks for
     # (`Provider.computes_at`): a load-time dequantising path runs bf16 on an

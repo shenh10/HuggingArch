@@ -101,8 +101,8 @@ measures empty and small collectives and launches.
   all-reduces.
   - *Feasibility is a hardware fact and nothing else* (`Fabric.refusal`):
     the group inside one node (`gpus_per_node`, with the group's mesh
-    stride; an NVL72 rack is one node), an NVLink domain (`nvlink_gbps` in
-    `gpu_specs.csv`; a PCIe card has none) for one-shot and two-shot, and a
+    stride; an NVL72 rack is one node), a scale-up domain (`scaleup_gbps` in
+    `gpu_specs.csv`, named by `scaleup_fabric` — NVLink, HCCS; a PCIe card has none) for one-shot and two-shot, and a
     switch that reduces (`nvls`) for NVLS. NCCL's schedule runs everywhere
     and is the only one across nodes, where it is priced as the
     hierarchical schedule, and for every collective but the all-reduce,

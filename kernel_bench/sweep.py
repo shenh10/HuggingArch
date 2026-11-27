@@ -157,7 +157,8 @@ def frontier_parallel_configs(resolved: Any, gpu: str) -> List[Tuple[str, Any]]:
 
 def _ceilings_for_deployment(
     *, config: dict, gpu: str, parallel: Any, seq_lens: List[int],
-    avg_output_tokens: int, precision: Any, resolved: Any = None,
+    avg_output_tokens: int, precision: Any, framework: str,
+    resolved: Any = None,
 ) -> Dict[int, Any]:
     """L1 for one deployment across every seq — `{seq: CapacityCeilings}`.
 
@@ -182,6 +183,14 @@ def _ceilings_for_deployment(
                 config=config, gpu_sku=gpu, parallel=parallel,
                 num_gpus=getattr(parallel, "cluster_size", 1) or 1,
                 seq_lens=seq_lens, avg_output_tokens=avg_output_tokens,
+                # The framework the sweep plans under, not the default: a
+                # binding and a card must agree on the device before either
+                # can price anything (`FrameworkBinding.deployed`). Left
+                # unstated, this gate asked the DEFAULT framework about an
+                # Ascend card and every cell of every non-CUDA box came back
+                # a gate error — the plan then wrote zero jobs, for a card
+                # whose own framework fits it fine.
+                framework=framework,
                 # The spec the sweep matched once — capacity uses it directly
                 # instead of re-matching (its single-entry-point path).
                 resolved=resolved,
@@ -414,7 +423,7 @@ def _plan_deployment(label: str, par: Any, *, model_id: str, gpu: str,
     try:
         ceilings = _ceilings_for_deployment(
             config=config, gpu=gpu, parallel=par, seq_lens=list(seq_lens),
-            avg_output_tokens=avg_output_tokens,
+            avg_output_tokens=avg_output_tokens, framework=framework,
             precision=precision, resolved=resolved)
     except Exception as e:
         # A gate crash is NOT a fit verdict — surface it, don't let the
@@ -532,7 +541,8 @@ def _plan_deployment(label: str, par: Any, *, model_id: str, gpu: str,
                 # page is an axis of these cells in both phases
                 # (`op_signatures.PAGE_AXIS`), so this changes
                 # which cells are planned and no identity.
-                kv_block_sizes=served_kv_block_sizes(), with_unplaced=True)
+                kv_block_sizes=served_kv_block_sizes(gpu=gpu),
+                with_unplaced=True)
         except Exception as e:
             log(f"skip {label} {phase} ({len(wanted)} points): {e}")
             continue
@@ -620,6 +630,13 @@ def plan_points(model_id: str, gpu: str, parallel: Any, phase: str,
     rather than the ones a surface's tracks and capacity choose. For a
     measured row whose point today's grid no longer reaches (a batch the
     capacity moved, a deployment the surface dropped)."""
+    # NOTE: as-shipped here, deliberately not yet a parameter. A restamp
+    # re-keys rows the lake already holds, and a row records the dtypes it
+    # was measured at (`dtype_env_json`) but not the profile that chose
+    # them — so there is nothing to pass. A row measured under a non-shipped
+    # precision therefore cannot be replanned by this path; giving it a
+    # `precision` argument no caller can fill correctly would hide that
+    # rather than fix it. The fix is for a row to carry its profile.
     from .plan import build_jobs_over_points
     from .providers import served_kv_block_sizes
     if resolved is None:
@@ -629,7 +646,7 @@ def plan_points(model_id: str, gpu: str, parallel: Any, phase: str,
         avg_output_tokens=avg_output_tokens, parallel=parallel,
         framework=framework, precision=AS_SHIPPED, resolved=resolved,
         binding=_deployed_binding(framework, gpu, AS_SHIPPED, resolved),
-        gpu=gpu, kv_block_sizes=served_kv_block_sizes())
+        gpu=gpu, kv_block_sizes=served_kv_block_sizes(gpu=gpu))
 
 
 def sweep_surfaces() -> Dict[str, Dict[str, Any]]:
@@ -657,14 +674,24 @@ def plan_surface(
     framework: str = DEFAULT_FRAMEWORK,
     max_seq: int = 0,
     output_tokens: Optional[int] = None,
+    precision: Any = None,
     workers: int = 1,
     log=lambda m: None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """`(jobs, stats)` of one surface (`sweep_surfaces`) for one model on
-    `gpu`, every model as shipped — the corpus the shipped estimates read.
-    `max_seq` caps the context grid (0 = the surface's whole grid);
+    `gpu`. `max_seq` caps the context grid (0 = the surface's whole grid);
     `output_tokens` overrides the surface's served output length, and
-    `stats["output_tokens"]` is the one planned with."""
+    `stats["output_tokens"]` is the one planned with.
+
+    `precision` is the profile the cells are shaped under (None = as
+    shipped, the corpus the shipped estimates read). It is a parameter
+    rather than a constant because a deployment's precision decides the
+    dtypes of every cell, and therefore its measurement key: under
+    as-shipped, a checkpoint that ships BF16/FP8 can only ever plan
+    BF16/FP8 cells, so no INT8 row can be measured for it no matter how
+    many times the sweep runs. GLM-5.3-Flash is the case that showed it —
+    2301 planned jobs, zero INT8 cells, while the deployment the page
+    prices runs its FFN INT8."""
     spec = sweep_surfaces()[surface]
     seq_lens = [s for s in spec["seq_lens"] if max_seq <= 0 or s <= max_seq]
     if output_tokens is None:
@@ -681,7 +708,7 @@ def plan_surface(
         model_id=model_id, gpu=gpu, seq_lens=seq_lens,
         tracks=spec["tracks"], parallel_configs=parallel_configs,
         avg_output_tokens=output_tokens, resolved=resolved,
-        framework=framework, precision=AS_SHIPPED, log=log, workers=workers)
+        framework=framework, precision=precision, log=log, workers=workers)
     return jobs, {**stats, "output_tokens": output_tokens}
 
 

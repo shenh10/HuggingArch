@@ -27,6 +27,40 @@ def test_the_gate_runs_the_real_capacity_call():
         avg_output_tokens=256,
         # The gate states its precision, as `build_sweep_jobs` does (as
         # shipped when the caller names none).
-        precision=AS_SHIPPED, resolved=resolved)
+        precision=AS_SHIPPED, resolved=resolved, framework="vllm")
     assert set(by_seq) == {1024}
     assert by_seq[1024].max_batch > 0
+
+
+def test_the_gate_asks_the_framework_the_sweep_plans_under():
+    """The gate's framework is the caller's, not the default.
+
+    A binding and a card must agree on the device before either prices
+    anything (`FrameworkBinding.deployed`). Left unstated, this gate asked
+    the DEFAULT framework about whatever card it was given, so every cell of
+    a non-CUDA box came back a gate error and the sweep wrote zero jobs —
+    for a card whose own framework fits it fine.
+    """
+    import pytest
+
+    from backend.arch.eval.precision import AS_SHIPPED
+    from backend.arch.loader import SpecLoader
+    from backend.inference.framework_bindings import FrameworkNotOnDevice
+    from kernel_bench.sweep import _ceilings_for_deployment, routine_parallel_configs
+
+    config = json.loads(SNAPSHOT.read_text())["config"]
+    resolved = SpecLoader().match(config, model_id="Qwen/Qwen3-8B")
+    _label, parallel = routine_parallel_configs(config, resolved=resolved)[0]
+
+    def gate(framework: str):
+        return _ceilings_for_deployment(
+            config=config, gpu="Ascend-910C-A3", parallel=parallel,
+            seq_lens=[1024], avg_output_tokens=256, precision=AS_SHIPPED,
+            resolved=resolved, framework=framework)
+
+    # The NPU card's own framework fits it...
+    assert gate("vllm_ascend")[1024].max_batch > 0
+    # ...and a CUDA framework on it is refused rather than priced, which is
+    # what the gate used to ask by default.
+    with pytest.raises(FrameworkNotOnDevice):
+        gate("vllm")

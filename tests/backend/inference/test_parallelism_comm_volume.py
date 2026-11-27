@@ -334,9 +334,10 @@ class TestContextParallelDenseIsDataParallel(_VolumeBase):
     MODELS = ("meta-llama/Llama-2-7b-hf",)
 
     def _ffn_down(self, pc):
-        resolved = self.specs.get("meta-llama/Llama-2-7b-hf")
-        if resolved is None:
-            self.skipTest("no llama spec")
+        # `_resolved`, not `specs.get`: the cache starts empty and only
+        # `_resolved` fills it, so reading it directly skipped on the first
+        # call and therefore on every one. Both tests below never ran.
+        resolved = self._resolved("meta-llama/Llama-2-7b-hf")
         r = analyze(
             resolved_spec=resolved, parallel=pc, batch_size=_B, avg_input_tokens=_S, avg_output_tokens=0,
             peak_flops_per_sec=1e15, peak_hbm_bw_bytes_per_sec=1e12,

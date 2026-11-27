@@ -51,6 +51,7 @@ from backend.arch.loader import get_default_loader
 
 from .parallel_config import ParallelConfig
 from .module_rows import served
+from .gpu_specs import NoFabricBandwidth
 from .pipeline import NoPeakForDtype
 from backend.arch.eval.analysis import Point
 from backend.measure.pool import map_cells
@@ -61,6 +62,7 @@ from .frontier import (POINT_DIMS, PointDim, frontier_view, line_view)
 from .frontier import layout_label as layout_label
 from .point_cloud import parallel_cloud, point_coordinates
 from .gpu_specs import get_gpu, gpus_per_node, hbm_bytes, load_gpu_specs
+from .framework_bindings import DEFAULT_FRAMEWORK, get_binding
 from .prefill_geometry import PrefillEndpointGeometry, PrefillChunkSchedule
 from .serving_view import servingLawPointView
 from .sweep_grid import (FRONTIER_MAX_GPUS, GALLERY_GPUS,
@@ -107,6 +109,29 @@ def _series(*skus: str) -> List[str]:
 
 
 DEFAULT_SWEEP_GPUS = [spec.sku for spec in load_gpu_specs()]
+
+
+def default_sweep_gpus(framework: Optional[str] = None) -> List[str]:
+    """The sweep's series when the caller named no cards: every card of the
+    sheet the framework runs on at all.
+
+    `DEFAULT_SWEEP_GPUS` is the whole sheet, and the sheet now spans two
+    devices — asking vLLM to walk an Ascend card is not a narrower sweep,
+    it is `FrameworkNotOnDevice` (`FrameworkBinding.devices`). A caller who
+    names that card anyway still gets the error: this filters the DEFAULT,
+    it does not forgive an explicit ask.
+
+    An absent framework is `DEFAULT_FRAMEWORK`, the same reading the rest
+    of the estimate takes (`calibration_overlay`) — defaulting the series
+    by one rule and pricing it by another is how this diverged in the first
+    place. A framework with no binding, or a binding naming no devices,
+    walks the whole sheet: `THEORY` is off no device."""
+    binding = get_binding(framework or DEFAULT_FRAMEWORK)
+    devices = getattr(binding, "devices", ()) if binding else ()
+    if not devices:
+        return list(DEFAULT_SWEEP_GPUS)
+    return [sku for sku in DEFAULT_SWEEP_GPUS
+            if (spec := get_gpu(sku)) is not None and spec.device in devices]
 # The Gallery's cards live beside the other `GALLERY_*` grid constants, which
 # cannot import this module; they are resolved here, by the same rule, because
 # this is where the rule is stated and `class_cards` defaults to them.
@@ -525,9 +550,10 @@ def _estimate_layout(payload: Dict[str, Any]) -> Dict[str, List[dict]]:
                                        schedule=schedule)
                         for length, schedule in zip(contexts, schedules,
                                                     strict=True)]
-        except NoPeakForDtype as exc:
+        except (NoPeakForDtype, NoFabricBandwidth) as exc:
             # The card's answer at every context: a format it lists no peak
-            # for is not a fact of the context.
+            # for, or a fabric this layout crosses that it states no
+            # bandwidth for, is not a fact of the context.
             out[sku] = [_absent("card", exc) for _ in contexts]
     return {sku: out[sku] for sku in gpu_skus}
 
@@ -552,7 +578,7 @@ def _price_context(payload: Dict[str, Any], p: Any, anchors: ContextAnchors,
     try:
         return {"context": length, **_priced_context(
             payload, p, anchors, length=length, schedule=schedule)}
-    except (NoPeakForDtype, MeasurementsUnavailable):
+    except (NoPeakForDtype, NoFabricBandwidth, MeasurementsUnavailable):
         raise  # the card's answer at every context / the whole sweep's
     except ValueError as exc:
         return _absent("layout", exc)
@@ -817,7 +843,7 @@ class ParallelSweepPlan:
         wanted = _resolve_modes(mode, modes)
         if not contexts:
             raise ValueError("contexts must be non-empty")
-        series = list(gpu_skus or DEFAULT_SWEEP_GPUS)
+        series = list(gpu_skus or default_sweep_gpus(base_env.get("framework")))
         resolved = get_default_loader().match(base_env["config"],
                                               model_id=base_env["model_id"])
         caps = sweep_caps(base_env["config"], resolved=resolved)

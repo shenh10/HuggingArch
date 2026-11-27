@@ -67,6 +67,48 @@ from backend.inference.benchmark_identity import (
 from kernel_bench.emit import UTILIZATION_CEILING
 
 SURFACES = ("routine", "frontier")
+
+
+def precisions(extra: Sequence[str] = ()) -> Tuple[Optional[str], ...]:
+    """The precision ids a surface is replanned under: as shipped, plus any
+    the caller names (`--precision`).
+
+    The join is on the PHYSICAL cell and `dtype_env_json` is part of it, so
+    a row measured under a non-shipped precision matches no as-shipped job
+    and lands in `unplanned` — a bucket that means "the walk no longer
+    gives this key", i.e. a defect indicator. `kernel_bench sweep
+    --precision` made such rows possible (GLM-5.3-Flash's INT8 FFN is the
+    first), so they have to be plannable here too.
+
+    Why the caller names them rather than this planning every declared
+    preset: a row does not record the profile it was measured under, so
+    there is nothing to derive from, and planning all of them costs the
+    whole tool a multiple of its runtime (six presets today) for a class of
+    rows that is empty until someone measures one. The operator who ran the
+    sweep knows which profile they passed; `unplanned_hint` makes the
+    report say so when rows land there.
+
+    When a row does carry its profile, this becomes derivable and the flag
+    should go."""
+    from backend.arch.precision_profile import PRESETS
+    unknown = sorted(set(extra) - set(PRESETS))
+    if unknown:
+        raise SystemExit(f"unknown precision preset(s) {unknown}; "
+                         f"one of {sorted(PRESETS)}")
+    rest = tuple(p for p in dict.fromkeys(extra) if p != "as_shipped")
+    return (None, *rest)
+
+
+def unplanned_hint(unplanned: Sequence[Any], asked: Sequence[str]) -> str:
+    """What to say when rows went unplanned and no extra precision was
+    asked for. `unplanned` is a defect indicator, so a row that is merely
+    measured under another profile must not be left looking like one."""
+    if not unplanned or asked:
+        return ""
+    return ("note: rows a non-shipped precision measured match no "
+            "as-shipped cell and land here. If any of these were measured "
+            "with `kernel_bench sweep --precision <preset>`, re-run with "
+            "the same `--precision <preset>` so their cells are planned.")
 #: A numerator that moved by less than this is the plan's own rounding.
 _SAME = 1e-3
 #: The achieved columns carry four decimals (`emit.achieved_from_latency`),
@@ -114,8 +156,13 @@ def cell_of(op: str, shape: Any, dtype_env: Any, phase: str) -> Cell:
     return physical_cell_of(op, shape, dtype_env, phase)
 
 
-def _plan_file(cache: Path, model: str, gpu: str, surface: str) -> Path:
-    return cache / gpu / f"{model.replace('/', '__')}__{surface}.json"
+def _plan_file(cache: Path, model: str, gpu: str, surface: str,
+               precision: Optional[str] = None) -> Path:
+    # The precision is part of the cache identity: two profiles plan
+    # different cells for the same (model, gpu, surface), so sharing one
+    # file would let whichever ran first answer for both.
+    at = f"__{precision}" if precision else ""
+    return cache / gpu / f"{model.replace('/', '__')}__{surface}{at}.json"
 
 
 def _provenance_file(cells: Path) -> Path:
@@ -189,22 +236,27 @@ def _write_provenance(cells: Path, jobs) -> None:
     tmp.replace(out)
 
 
-def replan(task: Tuple[str, str, str, str]) -> Tuple[str, str, str, str]:
-    """`(model, gpu, surface, why not)`: plan one surface for one model on
-    one GPU into the cache (`_write_cells`). A cached plan is kept."""
-    model, gpu, surface, cache = task
-    out = _plan_file(Path(cache), model, gpu, surface)
+def replan(task: Tuple[str, str, str, Optional[str], str]
+           ) -> Tuple[str, str, str, Optional[str], str]:
+    """`(model, gpu, surface, precision, why not)`: plan one surface for one
+    model on one GPU at one precision into the cache (`_write_cells`). A
+    cached plan is kept."""
+    model, gpu, surface, precision, cache = task
+    out = _plan_file(Path(cache), model, gpu, surface, precision)
     provenance = _provenance_file(out)
     if out.exists() and provenance.exists():
-        return model, gpu, surface, ""
+        return model, gpu, surface, precision, ""
     from kernel_bench.sweep import plan_surface
     try:
-        jobs, _stats = plan_surface(model, gpu, surface)
+        from backend.arch.precision_profile import PrecisionProfile
+        profile = (PrecisionProfile.from_request({"preset": precision})
+                   if precision else None)
+        jobs, _stats = plan_surface(model, gpu, surface, precision=profile)
     except Exception as e:  # a model the engine refuses is counted, not fatal
-        return model, gpu, surface, f"{type(e).__name__}: {e}"
+        return model, gpu, surface, precision, f"{type(e).__name__}: {e}"
     _write_cells(out, jobs)
     _write_provenance(out, jobs)
-    return model, gpu, surface, ""
+    return model, gpu, surface, precision, ""
 
 
 def own_points(phase: str, parallel: Any,
@@ -493,7 +545,8 @@ def _stale_reasons(unplanned: List[dict],
 
 
 def plan_restamp(groups: List[dict], cache: Path, workers: int, *,
-                 own_points: bool = True
+                 own_points: bool = True,
+                 extra_precisions: Sequence[str] = (),
                  ) -> Tuple[List[dict], Counter, Dict[str, str], List[dict],
                             List[dict]]:
     """`(rewrites, counts, refused, moved, unplanned)`: each group of rows (one
@@ -509,20 +562,24 @@ def plan_restamp(groups: List[dict], cache: Path, workers: int, *,
     capacity has since moved, a deployment the surface no longer plans, or a
     boundary form only the row's node identifies still has a cell today's
     walk prices."""
-    tasks = sorted({(g["model"], g["gpu"], s, str(cache))
-                    for g in groups for s in SURFACES})
+    tasks = sorted(
+        {(g["model"], g["gpu"], s, p, str(cache))
+         for g in groups for s in SURFACES
+         for p in precisions(extra_precisions)},
+        key=lambda t: (t[0], t[1], t[2], t[3] or ""))
     refused: Dict[str, str] = {}
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for i, (model, gpu, surface, why) in enumerate(
+        for i, (model, gpu, surface, precision, why) in enumerate(
                 pool.map(replan, tasks), 1):
+            at = f" {precision}" if precision else ""
             if why:
-                refused[f"{model} @ {gpu} ({surface})"] = why
-            print(f"  [{i}/{len(tasks)}] {model} @ {gpu} {surface}"
+                refused[f"{model} @ {gpu} ({surface}{at})"] = why
+            print(f"  [{i}/{len(tasks)}] {model} @ {gpu} {surface}{at}"
                   + (f": {why}" if why else ""), flush=True)
     priced: Dict[Tuple[str, Cell], set] = defaultdict(set)
     exact = _Provenance()
-    for model, gpu, surface, _ in tasks:
-        path = _plan_file(cache, model, gpu, surface)
+    for model, gpu, surface, precision, _ in tasks:
+        path = _plan_file(cache, model, gpu, surface, precision)
         _load_cells(path, gpu, priced)
         _load_provenance(_provenance_file(path), gpu, exact)
 
@@ -696,6 +753,9 @@ def plan_restamp(groups: List[dict], cache: Path, workers: int, *,
               f"({len(no_point)} groups state no (B, s_query) point)", flush=True)
         for (gpu, op), n in by_op.most_common(20):
             print(f"  {n:8d}  {op:32s} {gpu}", flush=True)
+        hint = unplanned_hint(unplanned, extra_precisions)
+        if hint:
+            print(f"  {hint}", flush=True)
     stale = _stale_reasons(unplanned, priced)
     if stale:
         reasons: Counter = Counter()
@@ -853,6 +913,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--workers", type=int, default=8,
                     help="plans run at once (one process each)")
     ap.add_argument("--model", action="append", help="only these models (repeatable)")
+    ap.add_argument("--precision", action="append", default=[], metavar="PRESET",
+                    help="also plan every surface under this precision preset "
+                         "(repeatable). A row measured under a non-shipped "
+                         "precision (`kernel_bench sweep --precision`) has "
+                         "dtypes no as-shipped cell carries, so it is "
+                         "unplannable without the same preset named here. "
+                         "Not the default because a row does not record the "
+                         "profile it was measured under, so there is nothing "
+                         "to derive, and each extra preset re-plans every "
+                         "(model, GPU, surface).")
     ap.add_argument("--stale-only", action="store_true",
                     help="classify surface leftovers without the own-point "
                          "replanning pass (a diagnosis, never an apply plan)")
@@ -881,7 +951,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"{sum(g['n'] for g in groups)} measured rows in {len(groups)} groups", flush=True)
     (rewrites, counts, refused, moved, unplanned) = plan_restamp(
         groups, Path(args.cache), args.workers,
-        own_points=not args.stale_only)
+        own_points=not args.stale_only,
+        extra_precisions=tuple(args.precision))
     report(counts, refused, moved)
     if args.out:
         with open(args.out, "w") as f:

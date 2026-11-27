@@ -40,6 +40,11 @@ audited_at:
   tag: v0.32.0
   commit: 5df63a7203cdb9328d824a27b682e77c7b9928be
 
+# The devices vLLM runs on (`gpu_specs.csv` `device`). A deployment on any
+# other device is refused (`FrameworkBinding.deployed`); per-entry
+# `when: device` only narrows inside this list.
+devices: [cuda]
+
 # Each entry: a fused-op concept (`fusion_plans/`) vLLM runs as one launch,
 # where its source says so, and `when:` it does (absent: whenever the pattern
 # matches).

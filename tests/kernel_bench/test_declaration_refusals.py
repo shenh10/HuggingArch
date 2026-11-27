@@ -480,7 +480,7 @@ class TestDeepGemmNeedsHopper:
         p = _named(kernel_impl)
 
         def card(sm):
-            return Env("2.9", True, "x", "x", 1008.0, sm=sm,
+            return Env("2.9", "cuda", "x", "x", 1008.0, sm=sm,
                        libs={"deep_gemm": "2.8.2", "torch": "2.9"})
         assert not p.available(card("sm_89"))
         assert p.available(card("sm_90"))
@@ -497,14 +497,14 @@ class TestVllmVendoredFa3IsHoppersOnly:
         from kernel_bench.env import Env
 
         def card(sm):
-            return Env("2.9", True, "x", "x", 1008.0, sm=sm,
+            return Env("2.9", "cuda", "x", "x", 1008.0, sm=sm,
                        libs={"vllm": "0.32.0", "torch": "2.9"})
         assert not _named(kernel_impl).available(card("sm_89"))
         assert _named(kernel_impl).available(card("sm_90"))
 
     def test_sglang_keeps_ada(self):
         from kernel_bench.env import Env
-        env = Env("2.9", True, "x", "x", 1008.0, sm="sm_89",
+        env = Env("2.9", "cuda", "x", "x", 1008.0, sm="sm_89",
                   libs={"sglang": "0.5.22", "torch": "2.9"})
         assert _named("sglang_flash_attention_v3_kvcache").available(env)
 
@@ -528,7 +528,7 @@ class TestARetiredKernelIsAbsent:
     @staticmethod
     def _env(sgl_kernel):
         from kernel_bench.env import Env
-        return Env("2.9", True, "x", "x", 1008.0, sm="sm_90",
+        return Env("2.9", "cuda", "x", "x", 1008.0, sm="sm_90",
                    libs={"sgl_kernel": sgl_kernel, "sglang": "0.5.22",
                          "torch": "2.9"})
 
@@ -1111,7 +1111,7 @@ def test_a_state_taking_floor_writes_its_state_back(kernel_impl, dims):
     inputs = get_ref(p.signature).make_inputs(
         inv, "cpu", input_generator(inv, "cpu"))
     before = inputs["initial_state"].clone()
-    case = p.build(inv, Env("2.11", False, None, None, None,
+    case = p.build(inv, Env("2.11", None, None, None, None,
                             libs={"torch": "2.11"}),
                    p.convert_inputs(inv, inputs))
     with record() as recorded:
@@ -1147,7 +1147,7 @@ def test_flashkda_reads_and_writes_the_state_at_its_cached_width(monkeypatch):
         "dtype_env": {"activation": "bf16"}, "carries_state": True,
         "physical_key": ["kda", str(sorted(dims.items())), "bf16", "prefill"]})
     inputs = get_ref("kda").make_inputs(inv, "cpu", input_generator(inv, "cpu"))
-    case = p.build(inv, Env("2.11", False, None, None, None,
+    case = p.build(inv, Env("2.11", None, None, None, None,
                             libs={"torch": "2.11"}),
                    p.convert_inputs(inv, inputs))
     case.run()

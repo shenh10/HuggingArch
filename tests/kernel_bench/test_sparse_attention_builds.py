@@ -111,7 +111,7 @@ def _run_build(kernel_impl, signature, op, dims, dtype_env, monkeypatch):
     provider = next(p for p in all_providers() if p.kernel_impl == kernel_impl)
     assert provider.serves.accepts(inv)
     launched = provider.convert_inputs(inv, dict(inputs))
-    case = provider.build(inv, Env("2.11", False, None, None, None,
+    case = provider.build(inv, Env("2.11", None, None, None, None,
                                    libs={"torch": "2.11"}), launched)
     got = provider.wrap_output(inv, case.to_canonical)(case.run())
     return got, want
@@ -256,7 +256,7 @@ def test_flashmlas_sparse_kernels_are_offered_on_hopper_and_up_only(
     from kernel_bench.env import Env
     provider = _named(kernel_impl)
     libs = {provider.import_name: "1"}
-    ada = Env("2.11", True, None, None, None, sm="sm_89", libs=libs)
-    hopper = Env("2.11", True, None, None, None, sm="sm_90", libs=libs)
+    ada = Env("2.11", "cuda", None, None, None, sm="sm_89", libs=libs)
+    hopper = Env("2.11", "cuda", None, None, None, sm="sm_90", libs=libs)
     assert not provider.available(ada)
     assert provider.available(hopper)

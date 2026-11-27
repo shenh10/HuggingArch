@@ -390,6 +390,18 @@ TIMING_METHODS: Dict[str, str] = {
     # second one inside it, after the launch, that drains the launch's own
     # dirty lines; the sweep's own cost is timed alone and subtracted.
     "l2_drain": "L2 swept clean before the launch; its own write-back drained inside the window",
+    # The same drain on a device with no spin primitive (Ascend: the Sleep
+    # operator is not built for the ascend910_93 SoC), where the sweep's own
+    # device time covers the host launch path instead — MEASURED per run,
+    # not assumed. A separate name because the guard differs: a reader
+    # comparing an Ascend row with an NVIDIA one must be able to see which
+    # kept the queue full.
+    "l2_drain_sweep_hold": "L2 drained; the sweep itself held the queue (no spin on this device)",
+    # The drain ran but nothing covered the host launch path: the sweep was
+    # shorter than the time the CPU needs to queue the call, so the window
+    # may bill launch overhead as kernel time. Published rather than
+    # silently dropped, because the number is still an upper bound.
+    "l2_drain_unheld": "L2 drained, queue NOT held: the window may include host launch overhead",
     # GPU with `flush_l2=False`: inputs may still be in L2 from the last call.
     "warm_l2": "no L2 flush; the launch may read what the previous one left in cache",
     # No GPU: `perf_counter` around the call.

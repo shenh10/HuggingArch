@@ -447,10 +447,12 @@ class InferenceEstimateRequest(PrecisionRequest):
     # Absent → single deployment (byte-identical to today).
     decode: Optional[dict] = None
     # Disagg KV-handoff link bandwidth (GB/s) for the prefill→decode KV cache
-    # transfer. Only used when `decode` is set. None → default to the decode
-    # GPU's cross-node RDMA bandwidth (`gpu.rdma_gbps`), the realistic
-    # cross-node disaggregation link; pass a value to model NVLink (same node)
-    # or a slower fabric.
+    # transfer. Only used when `decode` is set. None → the link the two
+    # clusters' placement puts between them (`disagg.HandoffLink.between`):
+    # the decode GPU's cross-node RDMA bandwidth (`gpu.rdma_gbps`), or the
+    # card's scale-up fabric where both clusters sit inside one scale-up
+    # domain wider than a chassis. Pass a value to state a measured link or
+    # a slower fabric.
     kv_transfer_bw_gbps: Optional[float] = None
 
     def resolved_selection_mode(self) -> str:

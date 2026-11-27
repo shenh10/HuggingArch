@@ -313,7 +313,7 @@ def test_scaling_jobs_cover_parallel_and_batch(monkeypatch):
     (every context inside) plus GPU × parallel × degree (Context × Batch).
     KV storage reuses the batch payload, so it is not a third kind."""
     import backend.api.warm as warm
-    from backend.inference.parallel_sweep import ALL_MODES, DEFAULT_SWEEP_GPUS
+    from backend.inference.parallel_sweep import ALL_MODES, default_sweep_gpus
     from backend.inference.sweep_grid import SCALING_DEGREES
 
     jobs = warm.scaling_jobs(models=[MODEL])
@@ -322,7 +322,10 @@ def test_scaling_jobs_cover_parallel_and_batch(monkeypatch):
     n_mid = 1
     assert sum(1 for k, _, _ in jobs if k == "parallel") == n_mid
     assert sum(1 for k, _, _ in jobs if k == "batch") == (
-        n_mid * len(DEFAULT_SWEEP_GPUS) * len(ALL_MODES) * len(SCALING_DEGREES)
+        # The series a warm defaults to is the default framework's own
+        # cards (`default_sweep_gpus`): the sheet spans two devices now,
+        # and warming vLLM onto an Ascend card is `FrameworkNotOnDevice`.
+        n_mid * len(default_sweep_gpus()) * len(ALL_MODES) * len(SCALING_DEGREES)
     )
 
 

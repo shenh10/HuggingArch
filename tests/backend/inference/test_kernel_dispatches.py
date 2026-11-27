@@ -86,7 +86,7 @@ def _invocation(point, phase: str, extra_dims=None) -> Invocation:
 
 
 def _provider_env() -> Env:
-    return Env("2.11", False, "sm_90", None, None,
+    return Env("2.11", None, "sm_90", None, None,
                libs={"torch": "2.11", "vllm": "0.32.0"})
 
 
@@ -458,3 +458,165 @@ def test_undeclared_op_does_not_fall_back_to_a_matching_corpus_row():
                          "reason": "undeclared_kernel_dispatch"},
         current_peak_tflops_at=lambda _d: 1.0, current_peak_bw_gbps=1.0)
     assert got is None and state == "ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# A condition's dtype and a key's dtype are the same fact, so they have to be
+# the same string.
+# ---------------------------------------------------------------------------
+
+def _conditions_naming_an_activation_dtype():
+    """`{stored value: [where it is declared]}` over every binding.
+
+    Both tables that carry conditions, because a value is as unreachable in
+    one as in the other.
+    """
+    import collections
+    from backend.inference.framework_bindings import FRAMEWORK_BINDINGS
+    seen = collections.defaultdict(list)
+    for name, binding in sorted(FRAMEWORK_BINDINGS.items()):
+        for key, impl in binding.op_implementations:
+            for when in (impl.whens or ()):
+                for value in (when.activation_dtype or ()):
+                    seen[value].append(f"{name}: fusion {key}")
+        for entry in (binding.kernel_dispatches or ()):
+            for when in (entry.whens or ()):
+                for value in (when.activation_dtype or ()):
+                    seen[value].append(f"{name}: {entry.op} -> {entry.impl_id}")
+    return seen
+
+
+def _activation_dtypes_a_key_can_present():
+    """Every spelling a real measurement key puts in front of a condition.
+
+    Through the one constructor, not a list written here: a key states its
+    dtypes in the corpus vocabulary and `ResolvedLaunch` is what a condition
+    is asked about, so whatever that pair produces IS the reachable set.
+    """
+    from backend.arch.dtypes import CORPUS_TOKENS
+    from backend.inference.framework_bindings import ResolvedLaunch
+    return {ResolvedLaunch.from_dtype_env_json(
+        json.dumps({"activation": token})).activation_dtype
+        for token in CORPUS_TOKENS}
+
+
+def test_every_activation_dtype_a_condition_names_is_one_a_key_can_present():
+    """The oracle for a bug that is silent by construction.
+
+    `DispatchCondition.of` canonicalises a condition's own values, so
+    `activation_dtype: [int8]` is stored as `i8`. A key spelled the dtype
+    the corpus spells it, and `_among` compares the two strings — so every
+    condition naming a dtype whose canonical form differs from its corpus
+    token could never match, and nothing failed: the dispatch merely
+    resolved `no_active` and the estimate priced on the roofline. Three
+    bindings had such conditions (`f16` x11, `f32` x2, `i8` x3) and the
+    only reason anything worked is that `bf16` is one of the five tokens
+    canonicalisation leaves alone.
+
+    Asserted as a round trip rather than as a mapping: this compares what
+    the loader stores against what the key constructor produces, so the two
+    sides cannot drift without this going red — which is the thing a
+    counter of known-bad spellings would not do.
+    """
+    declared = _conditions_naming_an_activation_dtype()
+    reachable = _activation_dtypes_a_key_can_present()
+    unreachable = {value: where for value, where in declared.items()
+                   if value not in reachable}
+    assert not unreachable, (
+        "these dispatch conditions can never hold — no measurement key "
+        "spells its activation dtype the way the condition stores it:\n"
+        + "\n".join(f"  {value!r}: {where[:3]}"
+                    for value, where in sorted(unreachable.items()))
+        + f"\n  reachable spellings: {sorted(x for x in reachable if x)}")
+
+
+def test_an_int8_launch_reaches_the_ascend_w8a8_dispatch():
+    """The case the oracle above was written for, end to end.
+
+    vLLM-Ascend's W8A8 deployment runs `npu_quant_matmul_w8a8` for a
+    quantised linear (`vllm_ascend.yaml`), and the corpus holds rows
+    measured on a 910C die under exactly this key. Until the launch side
+    was canonicalised the condition read `i8` against a key saying `int8`,
+    so the op dispatched `no_active` and every one of those rows was
+    invisible to the estimate that had asked for it.
+    """
+    from backend.inference.framework_bindings import ResolvedLaunch
+    binding = get_binding("vllm_ascend")
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    launch = ResolvedLaunch.from_dtype_env_json(json.dumps({
+        "activation": "int8", "activation_granularity": "per-token",
+        "metadata": "bf16", "output": "bf16",
+        "weight": "int8", "weight_granularity": "per-channel"}))
+    entries = [e for e in binding.kernel_dispatches if e.op == "linear"]
+    active = [e for e in entries
+              if any(w.holds_for(deployment, launch) for w in (e.whens or ()))]
+    assert [e.impl_id for e in active] == ["npu_quant_matmul_w8a8"], (
+        f"an INT8 linear launch should reach exactly the W8A8 kernel; "
+        f"active: {[e.impl_id for e in active]}")
+
+
+def test_a_condition_naming_the_output_slot_reads_the_output_slot():
+    """A quantise kernel is decided by what it WRITES, not what it reads.
+
+    Every `activation_dtype` condition asks about the operand a kernel
+    consumes. A quantiser's whole job is to consume a wide tensor and
+    produce a narrow one, so its int8 lives in the OUTPUT slot — and a
+    condition saying `activation_dtype: [int8]` asks "is the thing this
+    kernel reads already int8", which is never true of a quantiser. The
+    dispatch then resolved `no_active` and the measured rows went unread.
+
+    `output_dtype` is the launch's own fact, supplied per row after
+    `precision_launches` has materialized the walk — the same provenance
+    `unquantized_bf16_launch` has, which is why it belongs in LAUNCH_KEYS.
+    """
+    from backend.inference.framework_bindings import ResolvedLaunch
+    binding = get_binding("vllm_ascend")
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    launch = ResolvedLaunch.from_dtype_env_json(json.dumps({
+        "activation": "bf16", "activation_granularity": "per-token",
+        "metadata": "fp32", "output": "int8"}))
+    entries = [e for e in binding.kernel_dispatches
+               if e.op == "quantise_activation"]
+    active = [e for e in entries
+              if any(w.holds_for(deployment, launch) for w in (e.whens or ()))]
+    assert [e.impl_id for e in active] == ["npu_dynamic_quant_int8"], (
+        f"a cast whose OUTPUT is int8 should reach the quantise kernel; "
+        f"active: {[e.impl_id for e in active]}")
+
+
+def test_an_output_dtype_condition_cannot_hold_without_a_launch():
+    """No launch, no output slot — and no guess.
+
+    A deployment has no output dtype; it is a property of one launch. The
+    condition must be unsatisfiable there rather than falling back to the
+    request's model dtype, which would be the second derivation this
+    module exists to remove.
+    """
+    binding = get_binding("vllm_ascend")
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    entries = [e for e in binding.kernel_dispatches
+               if e.op == "quantise_activation"]
+    active = [e for e in entries
+              if any(w.holds_for(deployment, None) for w in (e.whens or ()))]
+    assert active == []
+
+
+def test_the_output_slot_is_compared_in_the_condition_vocabulary():
+    """`int8` in a cell and `i8` in a condition are the same dtype.
+
+    The launch side canonicalises (0016); a slot read straight from a
+    `dtype_env` does not. Comparing them raw is the same defect one slot
+    over, so the output slot takes the same route.
+    """
+    from backend.inference.framework_bindings import (
+        DispatchCondition, ResolvedLaunch)
+    deployment = ServingDeployment.at(gpu_sku="Ascend-910C-A3",
+                                      activation_dtype="bf16")
+    cond = DispatchCondition.parse({"output_dtype": ["int8"]}, "test")
+    for spelling in ("int8", "I8", " i8 "):
+        launch = ResolvedLaunch.from_dtype_env_json(json.dumps({
+            "activation": "bf16", "output": spelling}))
+        assert cond.holds_for(deployment, launch), spelling

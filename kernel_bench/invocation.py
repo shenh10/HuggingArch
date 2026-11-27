@@ -8,7 +8,7 @@ roofline numerators (flops / access_bytes) needed to emit a CSV row.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Optional, Tuple
 
 from backend.arch.eval.routed import RoutedLaunch
@@ -64,6 +64,15 @@ class Invocation:
     # (`driver.physical_key_for`). A job without it cannot be keyed here —
     # assembling one from `dims` and `dtype_env` is the second derivation this
     # field exists to remove — so the driver refuses it and asks for a re-plan.
+    #: How far this launch's collective group physically reached, when it
+    #: reached past one chassis (`comm_cost.comm_reach`). Not a dim: a dim
+    #: is an extent and this is a placement, which is why it rides beside
+    #: them rather than in them. `emit.build_row` joins it to the cell the
+    #: row states, so a crossing measurement reads as one when the corpus
+    #: is read back. A TIER code (`comm_cost.COMM_REACHES`), not a rank
+    #: count: `scaleout` has no fixed extent to count. 0 is intra-host,
+    #: the default every row carried before the axis existed.
+    comm_domain: int = 0
     physical_key: Optional[Tuple[str, str, str, str]] = None
 
     # --- roofline numerators (for achieved_* on emit) ---
@@ -102,6 +111,12 @@ class Invocation:
     # numerators bill the state's read and write-back, so only a kernel that
     # takes the state is this cell (`OpSignature.carries_state`).
     carries_state: bool = False
+    # This process's rank in the measurement group. 0 is a single process.
+    # A collective oracle reads this so each rank's payload is a different,
+    # reconstructable draw; `refs` must not mix `rank` into the seed
+    # privately, because then the same cell on two ranks would disagree
+    # about which numbers the other ranks held.
+    rank: int = 0
 
     # --- provenance carried through to the CSV identity ---
     model: str = ""
@@ -141,6 +156,33 @@ class Invocation:
                 f"`bench plan` to state the key")
         payload = b"\x1f".join(f.encode("utf-8") for f in self.physical_key)
         return int.from_bytes(blake2b(payload, digest_size=8).digest(), "big")
+
+    def seed_for_rank(self, rank: int) -> int:
+        """The draw this cell uses on `rank`.
+
+        Mixes the physical key with the rank so two ranks of one all-reduce
+        do not hold the same buffer (a silent identity reduction) while
+        remaining reconstructable: the oracle on any rank calls this for
+        every rank and reduces what it would have drawn. GEMM cells keep
+        `input_seed`; only a collective fill reads this.
+        """
+        from hashlib import blake2b
+        if self.physical_key is None:
+            raise ValueError(
+                f"{self.op} [{self.node_spec_id}]: this job carries no "
+                f"measurement key, so its inputs have no seed; re-run "
+                f"`bench plan` to state the key")
+        payload = b"\x1f".join(f.encode("utf-8") for f in self.physical_key)
+        payload += b"\x1frank=" + str(int(rank)).encode("utf-8")
+        return int.from_bytes(blake2b(payload, digest_size=8).digest(), "big")
+
+    @property
+    def rank_seed(self) -> int:
+        return self.seed_for_rank(self.rank)
+
+    def at_rank(self, rank: int) -> "Invocation":
+        """The same cell as seen from `rank`. Frozen, so a copy."""
+        return replace(self, rank=int(rank))
 
     @property
     def weight_granularity(self) -> Optional[str]:
@@ -343,9 +385,11 @@ class Invocation:
             parallel=job.get("parallel", f"tp={job.get('tp', 1)}"),
             count_per_step=int(job.get("count_per_step", 1)),
             moe_block_member=bool(job.get("moe_block_member", False)),
+            comm_domain=int(job.get("comm_domain") or 0),
             physical_key=(tuple(job["physical_key"])
                           if job.get("physical_key") else None),
             kernel_params=dict(job.get("kernel_params") or {}),
             routed=job.get("routed"),
             carries_state=bool(job.get("carries_state", False)),
+            rank=int(job.get("rank", 0) or 0),
         )

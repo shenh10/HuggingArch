@@ -815,11 +815,23 @@ register(Provider(
     # reference omitted the collective too, so the cross-check agreed. The
     # rows then said a `n_comm_ranks=8` all-reduce costs what a local norm
     # costs; with the group now in the shape they would still be the fastest
-    # candidate of their own cell. Measuring it needs a process per rank.
+    # candidate of their own cell.
+    #
+    # Multi-process groups arrived and this stayed disabled, because a process
+    # per rank is only half of what it needs. The other half is a framework
+    # that fuses the two, and vLLM-Ascend does not: `npu_mm_all_reduce`,
+    # `matmul_all_reduce` and `all_reduce_fusion` are absent from the
+    # v0.30.0-a3 plugin, and GLM-5.3-Flash reaches the collective through
+    # plain `tensor_model_parallel_all_gather`
+    # (`vllm_ascend/models/glm5next/model.py:261`). The one kernel that
+    # looks like this — `npu_add_rms_norm_quant` — adds, norms and
+    # quantises without communicating at all.
     disabled_reason=(
-        "one process: the all-reduce is the identity, so this times "
-        "residual+RMSNorm and records it as a collective — a group of "
-        "n_comm_ranks needs that many processes"),
+        "vLLM-Ascend has no fused allreduce+rmsnorm launch (no "
+        "npu_mm_all_reduce / matmul_all_reduce / all_reduce_fusion in "
+        "v0.30.0-a3), so there is nothing on an NPU for this cell to "
+        "measure; on one process the all-reduce is the identity and the "
+        "row would say an 8-rank collective costs what a local norm does"),
 ))
 
 

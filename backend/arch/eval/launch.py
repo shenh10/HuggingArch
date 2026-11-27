@@ -46,6 +46,15 @@ class FusedNode:
     #: Origin uid -> output port exposed by the fused kernel. The empty string
     #: is the primary output; named and positional outputs stay explicit.
     output_ports: Mapping[int, str] = field(default_factory=dict)
+    #: (Origin uid, origin port) -> published port, for a member whose
+    #: SECONDARY output the launch exposes (`post: split.post`). The main
+    #: output stays in `output_ports`, so one member may publish several
+    #: tensors: `hc_split_sinkhorn` writes `pre` for the reduce beside it
+    #: and `post` / `comb` for the post-mix outside, and the Ascend `HcPre`
+    #: launch publishes the last two. Empty for a plan whose targets are
+    #: all `<node>.out` — every plan before this field existed.
+    secondary_ports: Mapping[Tuple[int, str], str] = field(
+        default_factory=dict)
     role: Optional[str] = None
     name: str = ""
     template: str = ""
@@ -144,6 +153,25 @@ class FusedNode:
         """The origin this launch runs with (`home_uid`; the first origin
         for a launch built without one)."""
         return self.origins[0] if self.home_uid is None else self.home_uid
+
+    def published_port(self, origin: int, port: str = "") -> Optional[str]:
+        """The port this launch publishes an origin's output at — `""` the
+        primary — or None when it publishes no such tensor. `port` is the
+        ORIGIN's port the reader asked for (`""` / `"out"` its main output,
+        a name one of its secondary outputs)."""
+        if port in ("", "out", None):
+            return self.output_ports.get(origin)
+        return self.secondary_ports.get((origin, port))
+
+    def publishers(self) -> Tuple[Tuple[int, str, str], ...]:
+        """Every `(origin uid, origin port, published port)` this launch
+        exposes, main outputs first: the one iteration a consumer that asks
+        "which member's tensor is on port X" needs."""
+        return (
+            *((uid, "", port) for uid, port in self.output_ports.items()),
+            *((uid, origin, port)
+              for (uid, origin), port in self.secondary_ports.items()),
+        )
 
     @property
     def aggregation_id(self) -> str:

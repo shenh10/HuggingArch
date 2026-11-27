@@ -41,3 +41,27 @@ presets:
       cache:
         - select: { slots: [kv, latent, rope_key, index_key, compressed_kv] }
           format: fp8_per_tensor
+  # msModelSlim's W8A8 export quantises the FFN and leaves attention alone.
+  # That is the shape of the real checkpoints (GLM-5.3-Flash-W8A8: every one
+  # of its 100 tensor-path patterns carries exactly one label, and the
+  # boundary falls on the role), so this preset states the same two rules
+  # the export's own `quant_model_description.json` does.
+  #
+  # The first rule is not redundant: a model shipping quantised attention
+  # (GLM-5.3-Flash ships block-FP8 MLA) keeps it unless a rule says
+  # otherwise, and a W8A8 export does not ship it — it dequantises to the
+  # compute dtype. Most-specific-wins then leaves the two FFN roles INT8.
+  #
+  # A GLOBAL INT8 preset was removed with this one: selecting
+  # `weight_class` turned attention INT8 too, which no msModelSlim export
+  # does, and grafted a cast in front of each attention linear. It answered
+  # "what would full W8A8 cost" while reading like "what this export costs".
+  w_int8_w8a8_ffn:
+    label: FFN INT8 W8A8 (msModelSlim mixed)
+    description: The FFN — dense and MoE matrices — in msModelSlim W8A8_DYNAMIC (INT8 per channel) with INT8 per-token activations; attention, router and norms in BF16, as the export leaves them. Needs a card with an INT8 peak.
+    profile:
+      weights:
+        - select: { roles: weight_class }
+          format: { dtype: bf16 }
+        - select: { roles: [ffn_dense, ffn_moe] }
+          format: { scheme: modelslim-w8a8-dynamic, activation: w8a8 }

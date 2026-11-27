@@ -1802,6 +1802,10 @@ class Fusion:
             member_nodes = tuple(bound.values())
             sink, _exposed = _boundary_outputs(member_nodes, consumers)
             ordered_members = tuple(sorted(member_nodes, key=lambda n: n.uid))
+            # A member's SECONDARY output the plan publishes (`post:
+            # split.post`), keyed by the member and its port: the main
+            # output keeps its place in `output_ports`.
+            secondary_ports: Dict[Tuple[int, str], str] = {}
             if is_parallel:
                 output_ports = {
                     member.uid: f"output_{index}"
@@ -1816,21 +1820,25 @@ class Fusion:
             else:
                 output_ports = {}
                 for port_name, target in pattern.io_mapping.items():
-                    pattern_name, _, _origin_port = str(target).partition(".")
+                    pattern_name, _, origin_port = str(target).partition(".")
                     if pattern_name == "external":
                         continue
                     pattern_name = pattern.port_node(pattern_name, bound)
                     if pattern_name is None:
                         continue
-                    output_ports[bound[pattern_name].uid] = (
-                        "" if port_name == "output" else str(port_name)
-                    )
+                    published = "" if port_name == "output" else str(port_name)
+                    if origin_port in ("", "out"):
+                        output_ports[bound[pattern_name].uid] = published
+                    else:
+                        secondary_ports[(bound[pattern_name].uid,
+                                         origin_port)] = published
             # The widths the plan declares, keyed as `output_ports` names
             # the ports; a declared port this match did not bind is a plan
             # whose topology and width contract disagree.
             output_dtype = {("" if port == "output" else port): dtype
                             for port, dtype in self.scheme.output_dtype.items()}
-            missing = sorted(set(output_dtype) - set(output_ports.values()))
+            missing = sorted(set(output_dtype) - set(output_ports.values())
+                             - set(secondary_ports.values()))
             if missing:
                 raise ValueError(
                     f"fusion scheme {self.scheme_name!r} declares an "
@@ -1922,6 +1930,7 @@ class Fusion:
                 boundary_role=anchor.boundary_role,
                 ports={k: (n.uid, "out") for k, n in bound.items()},
                 output_ports=output_ports,
+                secondary_ports=secondary_ports,
                 inputs_obj=refs,
                 sink=sink,
                 previous_iteration=previous,
@@ -2089,6 +2098,12 @@ def fusion_matches(source: Any, program: Any, rewrite: Rewrite,
             "absorbed_output_ports": tuple(
                 (source.by_uid(uid).aggregation_id, port)
                 for uid, port in node.output_ports.items()
+            ),
+            # A member's secondary output the launch publishes, with the
+            # origin port a pre-fusion ref names it by (`split.post`).
+            "absorbed_secondary_ports": tuple(
+                (source.by_uid(uid).aggregation_id, origin, port)
+                for (uid, origin), port in node.secondary_ports.items()
             ),
             "is_parallel": bool(
                 pattern is not None and pattern.is_parallel()
@@ -2294,7 +2309,8 @@ def materialize_tree(source: Any, program: Any, rewrite: Rewrite) -> Any:
         fused_uid = absorbed_by.get(producer_uid)
         if fused_uid is None:
             return port
-        return source_by_uid[fused_uid].output_ports.get(producer_uid, port)
+        published = source_by_uid[fused_uid].published_port(producer_uid, port)
+        return port if published is None else published
 
     def writing_leaf(ref: Any) -> Optional[Tuple[int, str]]:
         """`(leaf uid, port)` a ref that names a COMPONENT resolves to — the
@@ -2607,6 +2623,23 @@ def _passed_through(fused: Any, members: Sequence[Any],
         if any(dims is None for dims in regions):
             continue
         writes[port] = less(whole, regions)
+    # A member's secondary output the launch publishes: the whole of it is
+    # that port's tensor, and what nobody moved is read off the member's
+    # inputs exactly as for its main output.
+    for (member_uid, origin), port in fused.secondary_ports.items():
+        if member_uid not in inside:
+            continue
+        row = pre.get(member_uid)
+        whole = None if row is None else (row.ports or {}).get(origin)
+        if whole is None:
+            continue
+        slots = unwritten(member_uid, frozenset())
+        if not slots:
+            continue
+        regions = [region(uid, index) for uid, index in slots]
+        if any(dims is None for dims in regions):
+            continue
+        writes[port] = less(whole, regions)
 
     return Moved(reads=reads, writes=writes) if (reads or writes) else None
 
@@ -2679,20 +2712,36 @@ def rebase_shapes(
             ins.append(shape.ins[index])
             sources.append((member_uid, index))
         output_ports = fused.output_ports
+        secondary_ports = fused.secondary_ports
         exposed.update(output_ports)
+        exposed.update(uid for uid, _origin in secondary_ports)
         primary = next(
             (uid for uid, port in output_ports.items() if not port),
             None,
         )
         primary_shape = pre.get(primary) if primary is not None else None
+        primary_out = primary_shape.out if primary_shape is not None else None
+        if primary_out is None:
+            # The primary may be a member's SECONDARY output
+            # (`output: split.post`): then it is that port's tensor.
+            primary_out = next(
+                ((pre[uid].ports or {}).get(origin)
+                 for (uid, origin), port in secondary_ports.items()
+                 if not port and uid in pre),
+                None)
+        ports = {
+            port: pre[uid].out
+            for uid, port in output_ports.items()
+            if port and uid in pre and pre[uid].out is not None
+        }
+        for (uid, origin), port in secondary_ports.items():
+            dims = (pre[uid].ports or {}).get(origin) if uid in pre else None
+            if port and dims is not None:
+                ports[port] = dims
         boundary[fused_uid] = Shape(
-            out=primary_shape.out if primary_shape is not None else None,
+            out=primary_out,
             ins=tuple(ins),
-            ports={
-                port: pre[uid].out
-                for uid, port in output_ports.items()
-                if port and uid in pre and pre[uid].out is not None
-            },
+            ports=ports,
             # The tensors above are what the launch is HANDED; a match that
             # absorbed a partition is handed more than it moves, and the
             # difference is the match's own topology (`_passed_through`).

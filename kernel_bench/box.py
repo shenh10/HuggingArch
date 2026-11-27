@@ -420,8 +420,13 @@ class BoxEnvs:
                 line = library.spec_for(import_name) or import_name
                 return pins.get(canonicalize_name(Requirement(line).name),
                                 "unknown")
+            # The device the card is, off the sheet (`gpu_specs.csv`), not
+            # "cuda because every box so far was". A profile naming an
+            # Ascend SKU describes an npu env, and its providers are judged
+            # against that.
             out[lib] = Env(
-                torch_version=pins.get("torch"), cuda_available=True,
+                torch_version=pins.get("torch"),
+                device=(spec.device if spec else "cuda"),
                 device_name=None, gpu_sku=self.gpu, peak_bw_gbps=None, sm=sm,
                 libs={name: pinned(name) for name in info["import_names"]},
                 library=lib)

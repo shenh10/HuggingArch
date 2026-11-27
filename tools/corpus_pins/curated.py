@@ -211,6 +211,14 @@ CURATED_OUT_OF_SCOPE: Tuple[CuratedSet, ...] = (
     CuratedSet('tests/backend/arch/layout/test_layout_weight_adapter.py', 'LANE_COHORT',
                'the chosen lane cohort, read from its golden',
                artifact='tests/golden/shardv3_lane_snapshots.json'),
+    CuratedSet('tests/backend/inference/test_ascend_calibration_overlay.py',
+               'CORPUS',
+               'the Ascend rows measured on one 910C die, kept as the fixed '
+               'evidence that a row written by `kernel_bench run` is found '
+               'again by `calibration_overlay` — a round trip, not a corpus '
+               'sweep: a new model does not join it and the admitter never '
+               'writes it',
+               artifact='tests/golden/ascend_vllm_ascend.csv'),
     CuratedSet('tests/backend/arch/eval/test_absorbed_latent_read.py', 'CASES', "a chosen cohort for this test's behaviour, not the corpus"),
     CuratedSet('tests/backend/inference/test_serving_measure_law.py', 'LONG_CASES',
                "a MoE, an MTP MoE and a hybrid-attention MoE whose stored measure keys are checked against a direct estimate, not the corpus"),

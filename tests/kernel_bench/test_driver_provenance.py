@@ -180,7 +180,7 @@ class TestTheTwoFormsTogetherReadAsASubstitution(unittest.TestCase):
 
 
 def _env(**over) -> Env:
-    base = dict(torch_version="2.13.0+cu130", cuda_available=True,
+    base = dict(torch_version="2.13.0+cu130", device="cuda",
                 device_name="NVIDIA H100 80GB HBM3", gpu_sku="H100-SXM",
                 peak_bw_gbps=3350.0, sm="sm_90",
                 libs={"flash_attn": "3.0.0"})

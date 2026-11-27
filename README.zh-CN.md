@@ -71,8 +71,8 @@ HuggingArch 是分析型的规划工具，不是 profiler，也不是推理 runt
 | **模型** | 51 个架构族；**58 个已验证 model id**，覆盖 18 家机构——DeepSeek、Kimi、Qwen、Llama、Mistral、Gemma、GLM、MiMo、gpt-oss、Step、LongCat、Nemotron 等。不在列表里的 id 由 agent 起草 spec，校验通过后才会上线。 |
 | **注意力** | MHA、GQA、MLA、稀疏注意力（DSA）、滑窗、线性注意力与 SSM 混合结构——186 个可复用 component DAG。 |
 | **量化** | FP8、FP4 / MXFP4 / NVFP4、AWQ、GPTQ、ModelOpt、compressed-tensors。 |
-| **GPU** | 15 种型号：从 A100 到 GB300。 |
-| **推理框架** | vLLM、sglang 和 DeepInfer 的融合绑定（94 个融合 plan）。 |
+| **加速卡** | 16 种型号：NVIDIA 从 A100 到 GB300，以及昇腾 910C（一行一颗 die，Atlas A3 节点）。 |
+| **推理框架** | vLLM、sglang、DeepInfer 和 vLLM-Ascend 的融合绑定（95 个融合 plan）。 |
 
 ## 延伸阅读
 

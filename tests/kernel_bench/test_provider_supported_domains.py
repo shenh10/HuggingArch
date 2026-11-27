@@ -56,7 +56,7 @@ def _provider(library, impl) -> Provider:
     raise LookupError(f"{library}:{impl} is not registered")
 
 
-_ENV = Env(torch_version=None, cuda_available=False, device_name=None,
+_ENV = Env(torch_version=None, device=None, device_name=None,
            gpu_sku=None, peak_bw_gbps=None)
 
 

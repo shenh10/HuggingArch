@@ -183,7 +183,7 @@ class TestProviderRegistry:
         assert "sm90_page_table" not in caps["shape_constraints"]
 
     def test_framework_fa3_sink_providers_are_sink_only(self):
-        env = Env("2.8.0+cu128", True, "H100 80GB HBM3", "H100-SXM",
+        env = Env("2.8.0+cu128", "cuda", "H100 80GB HBM3", "H100-SXM",
                   3350.0, sm="sm_90",
                   libs={"vllm": "0.11.0", "sglang": "0.5.5.post3"})
         base_dims = _gqa_job()["dims"]
@@ -211,7 +211,7 @@ class TestProviderRegistry:
         provs = {(p.library, p.kernel_impl) for p in all_providers()}
         assert ("torch", "torch_cublas_linear") in provs
         assert ("deepgemm", "deepgemm_fp8_blockwise") in provs
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"torch": "2.11", "deep_gemm": "1.0"})
         dims = {"B": 1, "s_query": 2048, "d_reduce": 3072, "d_out": 3072}
         bf16 = Invocation.from_job({
@@ -256,7 +256,7 @@ class TestProviderRegistry:
         assert ("vllm", "silu_and_mul", "vllm_silu_and_mul") in provs
 
     def test_norm_provider_matches_only_its_signature(self):
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"vllm": "0.6.3"})
         rms = next(p for p in all_providers() if p.kernel_impl == "vllm_rms_norm")
         rms_inv = Invocation.from_job({
@@ -271,7 +271,7 @@ class TestProviderRegistry:
         assert rms.accepts(Invocation.from_job(_gqa_job()), env) is False
 
     def test_prefill_and_decode_capability_split(self):
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_attn": "2.6.3", "flash_attn_interface": "3.0.0"})
         pre = Invocation.from_job(_gqa_job(phase="prefill"))
         dec = Invocation.from_job(_gqa_job(phase="decode"))
@@ -287,14 +287,14 @@ class TestProviderRegistry:
 
     def test_no_provider_applicable_without_libs(self):
         # A GPU-less / lib-less env → nothing applicable (clean degradation).
-        empty = Env(torch_version="2.11", cuda_available=False, device_name=None,
+        empty = Env(torch_version="2.11", device=None, device_name=None,
                     gpu_sku=None, peak_bw_gbps=None, libs={})
         inv = Invocation.from_job(_gqa_job())
         assert applicable(inv, empty) == []
 
     def test_flashmla_capability_scoped_to_mla_decode(self):
         mla = next(p for p in all_providers() if p.library == "flashmla")
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_mla": "1.0"})
         # gqa prefill invocation must NOT match the MLA-decode provider
         assert mla.accepts(Invocation.from_job(_gqa_job()), env) is False
@@ -408,7 +408,7 @@ class TestFusionOpSignatures:
         ref = spec.reference(ins)
         prov = next(p for p in all_providers()
                     if p.signature == "rope" and p.library == "torch")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         case = prov.build(inv, env, ins)
         assert case.to_canonical(case.run()).shape == ref.shape
         # Judged by the harness's own gate, not a hand-picked epsilon. The old
@@ -439,7 +439,7 @@ class TestFusionOpSignatures:
         ref = spec.reference(ins)
         prov = next(p for p in all_providers()
                     if p.signature == "rope_2d" and p.library == "torch")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         verdict, rel, cos, _typical, _worst = _cross_check(prov.build(inv, env, ins), ref,
                                          inv.dtype)
         assert verdict is None, f"rel_err={rel:.3g} cosine={cos:.5f}"
@@ -456,7 +456,7 @@ class TestFusionOpSignatures:
         ref = spec.reference(ins)
         prov = next(p for p in all_providers()
                     if p.signature == "indexer_logits" and p.library == "torch")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         out = (lambda c: c.to_canonical(c.run()))(prov.build(inv, env, ins))
         assert out.shape == ref.shape
         # bf16 matmul vs fp32 oracle — loose relative tolerance
@@ -474,7 +474,7 @@ class TestFusionOpSignatures:
         ins = build_inputs(get_ref("indexer_logits"), inv, "cpu")
         prov = next(p for p in all_providers()
                     if p.signature == "indexer_logits" and p.library == "torch")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         one_shot = (lambda c: c.to_canonical(c.run()))(prov.build(inv, env, ins))
         # A budget of 7 tokens' intermediates (128 keys x (4 heads x (2 B
         # bf16 + 4 B fp32) + 4 B logit)) forces the tiled path, and a chunk
@@ -497,7 +497,7 @@ class TestFusionOpSignatures:
         ins = build_inputs(get_ref("moe_gate"), inv, "cpu")
         prov = next(p for p in all_providers()
                     if p.signature == "moe_gate" and p.library == "torch")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         case = prov.build(inv, env, ins)
         weights, ids = case.run()
         assert tuple(weights.shape) == (8, 8)               # tokens × topk
@@ -547,7 +547,7 @@ class TestEmit:
         prov = Provider(library="fa3", signature="gqa_attention",
                         kernel_impl="flash_attention_v3", import_name="flash_attn",
                         applies_to=lambda i, e: True, build=lambda i, e: (lambda: None))
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0,
                   libs={"flash_attn": "3.0.0"})
         stats = LatencyStats(p50_us=387.5, p95_us=410.0, mean_us=390.0, samples=60, timing_method="l2_drain")
         row = build_row(inv, prov, stats, env, date="2026-07-27", contributor="@t")
@@ -573,7 +573,7 @@ class TestEmit:
             import_name="torch", applies_to=lambda i, e: True,
             build=lambda i, e: (lambda: None),
             computes_at_for=lambda i: {"activation": "fp32", "output": "fp32"})
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0,
                   libs={"torch": "2.11"})
         row = build_row(inv, prov, LatencyStats(10, 11, 10, 3, "l2_drain"), env,
                         date="2026-10-28", contributor="@t")
@@ -614,7 +614,7 @@ class TestSkipKeyMatchesStorage:
             dims={"kv_block_size": 16, "B": 1, "n_heads": 24, "n_kv_heads": 8, "s_query": 1, "s_kv": 2176, "d_head": 128},
             phase="decode",
         ))
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_attn_interface": "3.0.0"})
         prov = Provider(library="fa3", signature="gqa_attention",
                         kernel_impl="flash_attention_v3_kvcache",
@@ -820,7 +820,7 @@ class TestUpAndReport:
         jobs.write_text("".join(_json.dumps(j) + "\n"
                                 for j in (job_hit, job_miss)))
 
-        env = Env(None, False, None, "H100-SXM", None)
+        env = Env(None, None, None, "H100-SXM", None)
         inv = Invocation.from_job(job_hit)
         pk = physical_key_for(inv, env)
         prov = next(p for p in all_providers()
@@ -1030,7 +1030,7 @@ class TestDriverIsolatesBadJob:
         from kernel_bench.driver import run_jobs
         bad = _gemm_job(dims={"B": 1, "s_query": 1, "n_heads": 64})    # no K → refs KeyError
         good = _gemm_job()
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([bad, good], env=env, date="2026-07-28",
                        contributor="@t", cross_check=False)
         assert any("input build failed" in f for f in res.failures)
@@ -1056,7 +1056,7 @@ class TestDriverDedupsWithinRun:
         # Same GEMM job three times over: `gemm` has no paged KV, so no provider
         # folds kv_block_size into its identity — all three collapse to one row.
         jobs = [_gemm_job(kernel_params={"kv_block_size": b}) for b in (16, 64, 128)]
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs(jobs, env=env, date="2026-07-28",
                        contributor="@t", cross_check=False)
         assert len(res.rows) == 1, [r.get("kernel_impl") for r in res.rows]
@@ -1085,7 +1085,7 @@ class TestDriverDedupsWithinRun:
                  "node_spec_id": "b|norm", "parallel": "tp=1",
                  "count_per_step": 1}]
         jobs[1]["physical_key"] = _stated_key(jobs[1])
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0,
                   libs={"torch": "2.11"})
         res = run_jobs(jobs, env=env, date="2026-07-28",
                        contributor="@t", cross_check=False)
@@ -1152,7 +1152,7 @@ class TestMLARouting:
         from backend.inference.op_calibration import BenchmarkKey
 
         inv = Invocation.from_job(_mla_job())
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_mla": "1.0"})
         prov = Provider(library="flashmla", signature="mla_attention",
                         kernel_impl="flashmla_decode", import_name="flash_mla",
@@ -1172,7 +1172,7 @@ class TestMLARouting:
         assert tuple(out.shape) == (1, 1, 4, 512)          # [B,Sq,N,Dv]
 
     def test_flashmla_provider_selected_for_mla_decode(self):
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_mla": "1.0"})
         inv = Invocation.from_job(_mla_job())
         libs = {p.library for p in applicable(inv, env)}
@@ -2698,7 +2698,7 @@ class TestGroupedGemmMoE:
             "phase": "prefill"})
         floor = next(p for p in all_providers()
                      if p.kernel_impl == "torch_weighted_combine")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         case = floor.build(inv, env, inputs)
         got = case.to_canonical(case.run())
         ref = get_ref("moe_combine").reference(inputs)
@@ -2854,7 +2854,7 @@ class TestGroupedGemmMoE:
         from kernel_bench.providers import all_providers
         torch_p = next(p for p in all_providers()
                        if p.kernel_impl == "torch_fused_moe")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         got = torch_p.build(inv, env, inputs).run().float()
         cos = torch.nn.functional.cosine_similarity(
             got.flatten(), out.flatten(), dim=0).item()
@@ -2866,7 +2866,7 @@ class TestExpandedProviderCoverage:
     (that's the whole point of cross-library measurement)."""
 
     def _h100(self, **libs):
-        return Env("2.11", True, "H100", "H100-SXM", 3350.0, libs=libs)
+        return Env("2.11", "cuda", "H100", "H100-SXM", 3350.0, libs=libs)
 
     def test_attention_decode_envelope_has_fa_and_flashinfer(self):
         env = self._h100(flash_attn_interface="3.0.0", flashinfer="0.2.5")
@@ -2959,7 +2959,7 @@ class TestExpandedProviderCoverage:
                                     "output": "bf16",
                                     "activation_granularity": "per-token"},
                          phase="prefill", tp=1)
-        env = Env("2.11", False, None, None, None, libs={})
+        env = Env("2.11", None, None, None, None, libs={})
         assert by["vllm_cutlass_scaled_mm"].accepts(inv, env) is True
         assert by["deepgemm_fp8_blockwise"].accepts(inv, env) is False
 
@@ -2993,7 +2993,7 @@ class TestDeepGEMMScaleLayout:
         from kernel_bench.providers import all_providers, discover
         discover()
         dg = {p.kernel_impl: p for p in all_providers()}["deepgemm_fp8_blockwise"]
-        env = Env("2.11", False, None, None, None, libs={})
+        env = Env("2.11", None, None, None, None, libs={})
 
         def cell(K, N):
             return Invocation(signature="gemm", op="linear",
@@ -3105,10 +3105,10 @@ class TestDependencyManifest:
         # considered available for the fa2 provider.
         fa2 = next(p for p in all_providers()
                    if p.kernel_impl == "flash_attention_v2")
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_attn": "2.5.0"})
         assert fa2.available(env) is False
-        ok = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        ok = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                  libs={"flash_attn": "2.7.0"})
         assert ok.has("flash_attn") and fa2.available(ok) is True
 
@@ -3116,7 +3116,7 @@ class TestDependencyManifest:
         # importable but version unknown → allow (importability already passed).
         fa2 = next(p for p in all_providers()
                    if p.kernel_impl == "flash_attention_v2")
-        env = Env("2.11", True, "H800", "H800-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H800", "H800-SXM", 3350.0,
                   libs={"flash_attn": "unknown"})
         assert fa2.available(env) is True
 
@@ -3493,20 +3493,20 @@ class TestGpuSkuResolution:
         # One card, one peak per MMA family. An FP8 GEMM judged against the
         # BF16 peak read 2x its real MFU and the SOL gate dropped honest rows
         # above 1088 TF on an H100; INT8 used to read the FP8 column.
-        h100 = Env("2.11", True, "H100", "H100-SXM", 3350.0)
+        h100 = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0)
         assert h100.peak_tflops("bf16") == pytest.approx(989.0)
         assert h100.peak_tflops("fp8_e4m3") == pytest.approx(1979.0)
         # The 4090's cells are its sheet peaks scaled to the 2.73 GHz the card
         # actually holds under a bf16 GEMM, not the 2.52 GHz rated boost clock
         # (see gpu_specs.csv notes); the per-family ratios are unchanged.
-        rtx = Env("2.11", True, "RTX-4090", "RTX-4090", 1008.0)
+        rtx = Env("2.11", "cuda", "RTX-4090", "RTX-4090", 1008.0)
         assert rtx.peak_tflops("bf16") == pytest.approx(178.9)
         assert rtx.peak_tflops("fp8_e4m3") == pytest.approx(357.8)
         assert rtx.peak_tflops("int8") == pytest.approx(715.7)
         # A family the sheet has no column for is an unstated peak, not 0.
-        a100 = Env("2.11", True, "A100", "A100-80G-SXM", 2039.0)
+        a100 = Env("2.11", "cuda", "A100", "A100-80G-SXM", 2039.0)
         assert a100.peak_tflops("fp8_e4m3") is None
-        assert Env("2.11", False, None, None, None).peak_tflops("bf16") is None
+        assert Env("2.11", None, None, None, None).peak_tflops("bf16") is None
 
     def test_ambiguous_name_reports_unknown_rather_than_guessing(self):
         # A bare "NVIDIA H100" carries no variant marker. An empty peak is a
@@ -3988,7 +3988,7 @@ class TestMlaGeometryIsPhaseDependent:
                   "s_kv": 128, "d_head": 192, "d_v_head": 128},
             dtype_env={"activation": "bf16", "weight": "bf16", "kv": "bf16"},
             tp=1)
-        env = Env("2.11", False, "RTX-4090", "RTX-4090", 1008.0, sm="sm_89")
+        env = Env("2.11", None, "RTX-4090", "RTX-4090", 1008.0, sm="sm_89")
         eligible = {p.kernel_impl for p in all_providers()
                     if p.signature == "mla_attention" and p.accepts(inv, env)}
         assert "torch_sdpa_mla_prefill" in eligible
@@ -4070,7 +4070,7 @@ class TestLinearAttentionKernelFamilies:
         from kernel_bench.invocation import Invocation
         from kernel_bench.env import Env
         discover()
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90")
         families = (
             ("gated_delta_rule", {"B": 1, "s_query": 128, "n_lin_k_heads": 2,
                                   "n_lin_v_heads": 2, "d_lin_k_head": 64,
@@ -4250,7 +4250,7 @@ class TestFlashKdaIsItsOwnRow:
         discover()
         p = next(p for p in all_providers()
                  if p.kernel_impl == "flash_kda_cutlass_fwd")
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90")
 
         def inv(dk, dv, phase="prefill"):
             return Invocation(
@@ -4411,7 +4411,7 @@ class TestKernelParametersComeFromTheExport:
                      import_name="flashinfer",
                      applies_to=lambda i, e: True, build=lambda i, e, x: None,
                      impl_params=lambda i: f"_b{i.kv_block_size}")
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90",
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90",
                   libs={"flashinfer": "0.2.5"})
         stats = LatencyStats(p50_us=1.0, p95_us=1.0, mean_us=1.0, samples=10, timing_method="l2_drain")
         row = build_row(inv, p, stats, env, date="2026-08-05", contributor="t",
@@ -4445,7 +4445,7 @@ class TestKernelParametersComeFromTheExport:
         # checkpoint can only run the block-scaled one.
         from kernel_bench.providers import all_providers
         from kernel_bench.invocation import Invocation
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0, sm="sm_90")
 
         def served(granularity, K=7168, N=1536):
             # The FP8 GEMMs write their output at the activation's width
@@ -4588,7 +4588,7 @@ class TestKernelParametersComeFromTheExport:
         from kernel_bench.providers import all_providers, discover
         from kernel_bench.env import Env
         discover()
-        env = Env("2.11", False, "H100", "H100-SXM", 3350.0, sm="sm_90")
+        env = Env("2.11", None, "H100", "H100-SXM", 3350.0, sm="sm_90")
         from kernel_bench.providers import served_kv_block_sizes
         jobs, _ = build_jobs(avg_output_tokens=0, model_id="deepseek-ai/DeepSeek-V3.1", batch_size=2,
                              seq_len=2048, phase="decode",
@@ -4665,7 +4665,7 @@ class TestIncrementalPersist:
         seen = []
         jobs = [_gemm_job(dims={"B": 1, "s_query": 1, "d_reduce": 512, "d_out": n})
                 for n in (512, 1024, 2048)]
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs(jobs, env=env, date="2026-07-28", contributor="@t",
                        cross_check=False, on_row=seen.append)
         assert len(seen) == len(res.rows) == 3
@@ -4679,7 +4679,7 @@ class TestIncrementalPersist:
         from kernel_bench.driver import run_jobs
         jobs = [_gemm_job(dims={"B": 1, "s_query": 1, "d_reduce": 512, "d_out": n})
                 for n in (512, 1024)]
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
 
         def boom(_row):
             raise OSError("disk full")
@@ -4814,7 +4814,7 @@ class TestIncrementalPersist:
         from kernel_bench.emit import IncrementalCsvWriter, resume_from_output
 
         job = _gemm_job()
-        env = Env("2.11", False, None, "H100-SXM", 3350.0,
+        env = Env("2.11", None, None, "H100-SXM", 3350.0,
                   libs={"torch": "2.11"})
         inv = Invocation.from_job(job)
         provs = applicable(inv, env)
@@ -4925,7 +4925,7 @@ class TestSolGate:
         seen = []
         with pytest.raises(KeyError):
             run_jobs([{"not": "an invocation"}],
-                     env=Env("2.11", False, None, None, None, libs={}),
+                     env=Env("2.11", None, None, None, None, libs={}),
                      date="2026-08-16", contributor="@t",
                      on_job_start=lambda index, job: seen.append((index, job)))
         assert seen == [(0, {"not": "an invocation"})]
@@ -5441,7 +5441,7 @@ class TestBlockScaledCutlassIsHopperOnly:
     def _serving(self, sm, gran):
         from kernel_bench.env import Env
         from kernel_bench.providers import all_providers
-        env = Env("2.9", True, "x", "x", 1008.0, sm=sm,
+        env = Env("2.9", "cuda", "x", "x", 1008.0, sm=sm,
                   libs={"vllm": "0.32.0", "torch": "2.9"})
         return {p.kernel_impl for p in all_providers()
                 if p.signature == "gemm" and p.library == "vllm"
@@ -5952,7 +5952,8 @@ class TestSweepKeepsKernelParamVariants:
             seen = True
             # Each signature keeps every page ITS backends serve, and no
             # page only another family's backend does.
-            assert blocks == set(served_kv_block_sizes(sig)), (sig, blocks)
+            assert blocks == set(served_kv_block_sizes(sig, gpu="H100-SXM")), (
+                sig, blocks)
         if not seen:
             pytest.skip("model has no paged decode signature")
 
@@ -6155,7 +6156,7 @@ class TestTimingHasAWallClockBudget:
                  "node_spec_id": "b|norm", "parallel": "tp=1",
                  "count_per_step": 1, "physical_key": None}]
         jobs[1]["physical_key"] = _stated_key(jobs[1])
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0,
                   libs={"torch": "2.11"})
         import kernel_bench.driver as drv
 
@@ -6833,7 +6834,7 @@ class TestSweepReportsWhatItCannotPlan:
         from kernel_bench.providers import all_providers
         from kernel_bench.invocation import Invocation
         from backend.inference.parallel_config import ParallelConfig
-        env = Env(None, False, None, "H100-SXM", None)
+        env = Env(None, None, None, "H100-SXM", None)
         jobs, _ = build_jobs(avg_output_tokens=0, model_id="openai/gpt-oss-20b", batch_size=2,
                              seq_len=1024, phase="prefill",
                              parallel=ParallelConfig(tp_attention=2,
@@ -6889,7 +6890,7 @@ class TestSweepReportsWhatItCannotPlan:
         # rather than deleted, so the cells read as a gap.
         from kernel_bench.providers import all_providers
         from kernel_bench.invocation import Invocation
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         inv = Invocation(op="allreduce_fused_rmsnorm",
                          signature="allreduce_fused_rmsnorm", phase="prefill",
                          dims={"B": 2, "s_query": 4, "d_model": 512,
@@ -6935,7 +6936,7 @@ class TestSweepReportsWhatItCannotPlan:
         spec = get_ref("fused_inv_rope")
         inputs = build_inputs(spec, inv, "cpu")
         torch_p = next(p for p in ps if p.library == "torch")
-        got = torch_p.build(inv, Env("2.11", False, None, None, None,
+        got = torch_p.build(inv, Env("2.11", None, None, None, None,
                                      libs={"torch": "2.11"}), inputs).run()
         assert torch.allclose(got.float(), spec.reference(inputs), atol=2e-2)
 
@@ -6950,7 +6951,7 @@ class TestSweepReportsWhatItCannotPlan:
         from kernel_bench.providers import all_providers
         from kernel_bench.refs import get_ref
         from kernel_bench.invocation import Invocation
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         dims = {"B": 2, "s_query": 4, "d_model": 64}
         out = {}
         for sig in ("rope_emb", "rope_emb_inverse"):
@@ -7039,7 +7040,7 @@ class TestCrossCheckIsRecordedPerRow:
     def test_measured_with_a_working_reference_says_passed(self):
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=True)
         assert res.rows, res.failures + res.skipped
@@ -7048,7 +7049,7 @@ class TestCrossCheckIsRecordedPerRow:
     def test_checking_turned_off_says_disabled_not_passed(self):
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=False)
         assert res.rows, res.failures + res.skipped
@@ -7075,7 +7076,7 @@ class TestCrossCheckIsRecordedPerRow:
         monkeypatch.setattr(drv, "get_ref", oom_ref, raising=False)
         import kernel_bench.refs as refs
         monkeypatch.setattr(refs, "get_ref", oom_ref)
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=True)
         assert res.rows, res.failures + res.skipped
@@ -7089,7 +7090,7 @@ class TestCrossCheckIsRecordedPerRow:
         # so the on-pass values are the only ones that survive at all.
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=True)
         assert res.rows, res.failures + res.skipped
@@ -7106,7 +7107,7 @@ class TestCrossCheckIsRecordedPerRow:
         # ran, which is exactly the confusion the column exists to remove.
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=False)
         assert res.rows, res.failures + res.skipped
@@ -7120,7 +7121,7 @@ class TestCrossCheckIsRecordedPerRow:
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
         from backend.inference import benchmarks as B
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-06",
                        contributor="@t", cross_check=True)
         assert res.rows, res.failures + res.skipped
@@ -7349,7 +7350,7 @@ class TestCoverageCheckedBeforeAllocating:
         from kernel_bench.invocation import Invocation
         from kernel_bench.providers import applicable
 
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         inv = Invocation.from_job(_gemm_job())
         pk = physical_key_for(inv, env)
         # Every provider's identity already measured (`--skip-existing` /
@@ -7375,7 +7376,7 @@ class TestCoverageCheckedBeforeAllocating:
         from kernel_bench.invocation import Invocation
         from kernel_bench.providers import applicable
 
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         inv = Invocation.from_job(_gemm_job())
         pk = physical_key_for(inv, env)
         asked: list = []
@@ -7405,7 +7406,7 @@ class TestCoverageCheckedBeforeAllocating:
         from backend.measure import lookup
         from kernel_bench import driver
 
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         monkeypatch.setattr(driver, "COVERAGE_BATCH", 2)
         monkeypatch.setattr(driver, "physical_key_for",
                             lambda inv, env: inv.dims["d_out"])
@@ -7428,7 +7429,7 @@ class TestCoverageCheckedBeforeAllocating:
     def test_uncovered_job_still_measures(self):
         pytest.importorskip("torch")
         from kernel_bench.driver import run_jobs
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         res = run_jobs([_gemm_job()], env=env, date="2026-08-07",
                        contributor="@t", cross_check=True)
         assert len(res.rows) == 1, res.skipped + res.failures
@@ -7493,7 +7494,7 @@ class TestOracleHasAMemoryBudget:
             _reference_footprint_bytes(inv, {})
         import torch
         if torch.cuda.is_available():
-            env = Env("2.11", True, None, None, None, libs={"torch": "2.11"})
+            env = Env("2.11", "cuda", None, None, None, libs={"torch": "2.11"})
             assert "cannot be sized" in _reference_will_not_fit(inv, {}, env)
 
     def test_oversized_oracle_is_declined_with_a_reason(self):
@@ -7502,7 +7503,7 @@ class TestOracleHasAMemoryBudget:
         if not torch.cuda.is_available():
             pytest.skip("needs a GPU to read free VRAM")
         from kernel_bench.driver import _reference_will_not_fit
-        env = Env("2.11", True, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", "cuda", None, None, None, libs={"torch": "2.11"})
         # 4 PiB of scores: nothing fits this.
         why = _reference_will_not_fit(
             self._inv(B=2**20, s_kv=2**20), {}, env)
@@ -7514,7 +7515,7 @@ class TestOracleHasAMemoryBudget:
         if not torch.cuda.is_available():
             pytest.skip("needs a GPU to read free VRAM")
         from kernel_bench.driver import _reference_will_not_fit
-        env = Env("2.11", True, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", "cuda", None, None, None, libs={"torch": "2.11"})
         assert _reference_will_not_fit(self._inv(B=1), {}, env) is None
 
     def test_declining_does_not_mutate_the_shared_spec(self):
@@ -7591,7 +7592,7 @@ class TestHardwareFloorIsDeclaredNotDescribed:
     """
 
     def _env(self, sm):
-        return Env("2.11", True, None, None, None, sm=sm,
+        return Env("2.11", "cuda", None, None, None, sm=sm,
                    libs={"sgl_kernel": "0.4.2"})
 
     def test_below_the_floor_is_unavailable(self):
@@ -7621,7 +7622,7 @@ class TestHardwareFloorIsDeclaredNotDescribed:
         others = [p for p in P.all_providers() if p.min_sm is None]
         assert others, "every provider suddenly has a floor — check the default"
         prov = next(p for p in others if p.library == "torch")
-        assert prov.available(Env("2.11", True, None, None, None,
+        assert prov.available(Env("2.11", "cuda", None, None, None,
                                   sm="sm_75", libs={"torch": "2.11"}))
 
 
@@ -7716,7 +7717,7 @@ class TestSmokeMeetsTheDeclarations:
                 signature="rmsnorm", activation=("bf16",),
                 dtype_slots=(("kv", ("fp8_e4m3",)),)),
             impl_params=params, build=build)
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         r = _one(p, env, "", "bf16", "prefill", "cpu")
         assert r.outcome == "declined", r
         assert "not the cache" in r.detail
@@ -7859,8 +7860,8 @@ class TestLibraryRecord:
         from backend.inference.framework_bindings import get_binding
         p = self._prov("vllm", "vllm")
         audited = get_binding("vllm").audited_at.release
-        old = Env("2.11", False, None, None, None, libs={"vllm": "0.6.0"})
-        new = Env("2.11", False, None, None, None, libs={"vllm": audited})
+        old = Env("2.11", None, None, None, None, libs={"vllm": "0.6.0"})
+        new = Env("2.11", None, None, None, None, libs={"vllm": audited})
         assert not p.available(old)
         assert p.available(new)
 
@@ -7869,7 +7870,7 @@ class TestLibraryRecord:
         of incompatibility, and rejecting on it would silently drop providers
         on any env whose metadata is thin."""
         p = self._prov("flashmla", "flash_mla")
-        env = Env("2.11", False, None, None, None,
+        env = Env("2.11", None, None, None, None,
                   libs={"flash_mla": "unknown"})
         assert p.available(env)
 
@@ -7896,13 +7897,13 @@ class TestLibraryRecord:
         assert lib.pip[0] == f"sglang=={get_binding('sglang').audited_at.release}"
         assert lib.spec_for("sglang") == "sglang>=0.5.5.post3"
         assert lib.spec_for("sgl_kernel") == "sgl-kernel"
-        newer = Env("2.11", False, None, None, None,
+        newer = Env("2.11", None, None, None, None,
                     libs={"sglang": "0.5.12", "sgl_kernel": "0.4.2"})
         assert self._prov("sglang", "sglang").available(newer)
         # a module the library never names constrains nothing
         assert lib.spec_for("torch") == ""
 
-        old = Env("2.11", False, None, None, None,
+        old = Env("2.11", None, None, None, None,
                   libs={"sglang": "0.4.0", "sgl_kernel": "0.4.0"})
         assert not self._prov("sglang", "sglang").available(old)
         # ...and the unbounded package stays available at that same version
@@ -8013,7 +8014,7 @@ class TestWeightGridIsPlacedBeforeAnyoneSeesIt:
     def _run(self, prov, weight_dtype):
         from kernel_bench.driver import run_jobs
         from kernel_bench import providers as P
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         job = _gemm_job(dtype_env={"weight": weight_dtype, "activation": "bf16",
                                    "kv": "bf16", "output": "bf16",
                                    "metadata": "fp32"},
@@ -8183,7 +8184,7 @@ class TestWeightGridIsPlacedBeforeAnyoneSeesIt:
         # The reason has to name the release mismatch, so that fixing the
         # accuracy alone does not read as discharging it.
         assert "pre-0.30" in p.disabled_reason
-        env = Env("2.13", True, None, None, None, sm="sm_90",
+        env = Env("2.13", "cuda", None, None, None, sm="sm_90",
                   libs={"vllm": "0.32.0"})
         weights = p.serves.weight or ("int4",)
         acts = p.serves.activation or ("bf16",)
@@ -8340,7 +8341,7 @@ class TestPartiallyWrittenOutputsAreNotGarbage:
         saved = list(P._PROVIDERS)
         P._PROVIDERS[:] = [prov]
         try:
-            env = Env("2.11", False, None, None, None,
+            env = Env("2.11", None, None, None, None,
                       libs={"torch": "2.11"})
             res = run_jobs([_gemm_job(dims={"B": 1, "s_query": 8,
                                             "d_reduce": 64, "d_out": 64})],
@@ -8496,7 +8497,7 @@ class TestCausalAlignmentMatchesTheKernels:
                                "n_heads": 8, "n_kv_heads": 2, "d_head": 64},
                          dtype_env={"activation": "bf16"}, phase="prefill", tp=1)
         ins = build_inputs(get_ref("gqa_attention"), inv, "cuda")
-        env = Env("2.11", True, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", "cuda", None, None, None, libs={"torch": "2.11"})
         prov = next(p for p in all_providers() if p.kernel_impl == "torch_sdpa")
         got = prov.build(inv, env, prov.convert_inputs(inv, ins))
         to_can = prov.wrap_output(inv, got.to_canonical)
@@ -8815,7 +8816,7 @@ class TestInt32StateCeilingIsAProduct:
         v = next(p for p in P.all_providers()
                  if p.kernel_impl == "vllm_causal_conv1d_update")
         assert "CompilationError" in v.disabled_reason
-        env = Env("2.11", True, None, None, None, sm="sm_90",
+        env = Env("2.11", "cuda", None, None, None, sm="sm_90",
                   libs={"vllm": "0.26"})
         assert not v.accepts(self._inv(16, 4096), env)
 
@@ -9275,7 +9276,7 @@ class TestTheKernelThatRanIsRecorded:
                              {"signature": "rmsnorm", "phase": "prefill",
                               "dims": {"B": 1, "s_query": 8, "d_model": 8},
                               "dtype_env": {"activation": "bf16"}}))
-        env = Env("2.11", True, "H100", "H100-SXM", 3350.0,
+        env = Env("2.11", "cuda", "H100", "H100-SXM", 3350.0,
                   libs={"torch": "2.11"})
         row = build_row(inv, p, LatencyStats(1.0, 1.0, 1.0, 3, "l2_drain"), env,
                         date="2026-08-11", contributor="@t")
@@ -9780,7 +9781,7 @@ class TestEverySignaturesDimsCanBeRecorded:
                                     signature=sig.name, op=sig.name, dims=seen,
                                     dtype_env=dtype_env, phase="prefill",
                                     tp=1),
-                                Env(None, False, None, "", None), {})
+                                Env(None, None, None, "", None), {})
                         except Exception:
                             pass
                         by_kernel |= {k for k in seen.read if k in MINIMAL_DIMS}

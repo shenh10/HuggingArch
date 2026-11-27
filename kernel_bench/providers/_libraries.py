@@ -56,13 +56,15 @@ def _audited_release(framework: str) -> str:
 for _lib in (
     Library("torch", pip=("torch>=2.5",)),
     Library("vllm", pip=(f"vllm=={_audited_release('vllm')}",),
-            accepts=("vllm>=0.10.2",)),
-    Library("flashinfer", pip=("flashinfer-python>=0.2.0",)),
+            accepts=("vllm>=0.10.2",), device="cuda"),
+    Library("flashinfer", pip=("flashinfer-python>=0.2.0",),
+            device="cuda"),
     # Two packages, not two opinions about one.
     Library("sglang", pip=(f"sglang=={_audited_release('sglang')}",
                            "sglang-kernel"),
-            accepts=("sglang>=0.5.5.post3", "sgl-kernel")),
-    Library("humming", pip=("humming-kernels",)),
+            accepts=("sglang>=0.5.5.post3", "sgl-kernel"),
+            device="cuda"),
+    Library("humming", pip=("humming-kernels",), device="cuda"),
     # marlin ships inside vllm; the corpus keeps it as its own `framework`
     # because a marlin row is a different measurement from a vllm-native one.
     # It installs the SAME release as the `vllm` library and for the same
@@ -73,7 +75,7 @@ for _lib in (
     # row saying so only after the fact. The floor survives as `accepts`, so a
     # box that already has another release still measures.
     Library("marlin", pip=(f"vllm=={_audited_release('vllm')}",),
-            accepts=("vllm>=0.20",)),
+            accepts=("vllm>=0.20",), device="cuda"),
     # PyPI's flash-linear-attention ships `fla/layers` and `fla/models` and
     # nothing else — wheel and sdist, every version from 0.3.2 to 0.5.2 — so
     # `fla/ops`, which every one of these kernels imports, is in no published
@@ -86,37 +88,70 @@ for _lib in (
     # too — rows measured from an arbitrary tree would be indistinguishable
     # from rows measured at the release. `v0.5.2` reports 0.5.2 and IS 0.5.2.
     Library("fla", pip=("flash-linear-attention @ git+https://github.com/"
-                        "fla-org/flash-linear-attention.git@v0.5.2",)),
-    Library("fa2", pip=("flash-attn>=2.6,<3",), no_build_isolation=True),
+                        "fla-org/flash-linear-attention.git@v0.5.2",),
+            device="cuda"),
+    # The vLLM plugin for Huawei Ascend NPUs. `torch_npu` is the import
+    # gate rather than `vllm_ascend` itself: every kernel registered under
+    # this library calls a `torch_npu.npu_*` entry point, and that package
+    # is what the plugin's own wheels depend on. Neither is installable from
+    # PyPI against a CANN toolchain the way a CUDA wheel is, so the box
+    # brings its own (the `quay.io/ascend/vllm-ascend` image), which is the
+    # same arrangement `fa3` has: declared as a source build so a fresh env
+    # does not pretend it can resolve one.
+    # The AscendC delta-rule kernels the plugin calls (`chunk_kda_fwd`,
+    # `recurrent_kda`). A DISTRIBUTION whose name is not its module's: the
+    # wheel is `flash-linear-attention-npu-a3` and the package sets no
+    # `__version__`, so every availability probe read it as absent while the
+    # import worked — the `kda` cells were planned and then skipped as
+    # "fla_npu not importable" on a box that runs them.
+    Library("fla_npu", pip=("flash-linear-attention-npu-a3",),
+            dist_name="flash-linear-attention-npu-a3", source_build=True,
+            device="npu"),
+    Library("vllm_ascend", source_build=True,
+            build_hint="run inside the vllm-ascend image for the release the "
+                       "binding is audited at (quay.io/ascend/vllm-ascend"
+                       ":v0.30.0-a3); needs CANN + torch_npu, which do not "
+                       "resolve from PyPI",
+            device="npu"),
+    Library("fa2", pip=("flash-attn>=2.6,<3",), no_build_isolation=True,
+            device="cuda"),
     Library("fa3", source_build=True,
             build_hint="build hopper/ from github.com/Dao-AILab/flash-attention "
-                       "(needs sm90)"),
+                       "(needs sm90)",
+            device="cuda"),
     Library("fa4", source_build=True,
             build_hint=(
                 "FA4 via sglang jit_kernel (sglang.jit_kernel.flash_attention_v4) "
                 "+ FlashAttention 4's CUTE frontend, sm90+. Its flash_attn build "
                 "CONFLICTS with the flash_attn 2.x that fa2 measures, so the two "
-                "cannot share one env.")),
+                "cannot share one env."),
+            device="cuda"),
     Library("flashmla", source_build=True,
             build_hint="pip install from github.com/deepseek-ai/FlashMLA "
-                       "(no PyPI release)"),
+                       "(no PyPI release)",
+            device="cuda"),
     Library("deepgemm", source_build=True,
             build_hint="build from github.com/deepseek-ai/DeepGEMM "
-                       "(no PyPI release)"),
+                       "(no PyPI release)",
+            device="cuda"),
     Library("deepinfer", source_build=True,
             build_hint=(
                 "build DeepInfer at the commit framework_bindings/"
                 "deepinfer.yaml audits, from github.com/deepseek-ai/"
                 "DeepInfer (Python 3.12, CUDA 13, SM100; build.sh also "
                 "builds its vendored DeepGEMM / FlashMLA / DeepSelect "
-                "submodules and installs tile-kernels)")),
+                "submodules and installs tile-kernels)"),
+            device="cuda"),
     Library("cutlass_mla", source_build=True,
-            build_hint="sgl_kernel cutlass_mla_decode — SM100 (Blackwell) only"),
+            build_hint="sgl_kernel cutlass_mla_decode — SM100 (Blackwell) only",
+            device="cuda"),
     Library("flash_kda", source_build=True,
             build_hint="pip install from github.com/MoonshotAI/FlashKDA "
-                       "(CUTLASS, SM90+, CUDA 12.9+, K=V=128 only)"),
+                       "(CUTLASS, SM90+, CUDA 12.9+, K=V=128 only)",
+            device="cuda"),
     Library("mamba_ssm", source_build=True,
             build_hint="pip install mamba-ssm (CUDA build), or use vLLM/sglang "
-                       "vendored kernel"),
+                       "vendored kernel",
+            device="cuda"),
 ):
     register_library(_lib)

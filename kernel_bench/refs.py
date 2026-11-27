@@ -111,8 +111,15 @@ def torch_dtype(name: str):
     """The one `str → torch.dtype` table for kernel_bench.
 
     Activation-width names only (`bf16` / `fp16` / `fp32` / the two
-    fp8s). Packed weight formats are not torch dtypes and must not
-    silently become bf16.
+    fp8s / `int8`). Packed weight formats are not torch dtypes and must
+    not silently become bf16.
+
+    `int8` is here on that same test and passes it: one element per byte
+    with `torch.int8` holding it exactly, like the fp8s and unlike int4 or
+    fp4, which pack two to a byte and have no torch dtype to be. Without
+    it an Ascend W8A8 cell could not even be given its operands — the
+    kernel ran, the provider served it, and the input generator refused
+    the dtype.
     """
     import torch
     table = {
@@ -121,6 +128,7 @@ def torch_dtype(name: str):
         "fp32": torch.float32,
         "fp8_e4m3": torch.float8_e4m3fn,
         "fp8_e5m2": torch.float8_e5m2,
+        "int8": torch.int8,
     }
     try:
         return table[str(name).lower()]
@@ -147,7 +155,13 @@ def _store_dtype(name: str):
     """
     import torch
     dt = _dtype(name)
-    return torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # Too narrow to hold a reference value is a matter of WIDTH, not of
+    # float-ness: `torch.randn` into int8 truncates to the handful of
+    # integers near zero (-2..3, two thirds of them 0 — measured on a die),
+    # which is a degenerate operand that still produces a number. The test
+    # read `is_floating_point` only because fp8 was the one narrow format in
+    # the table; int8 joining it made the omission reachable.
+    return torch.bfloat16 if dt.itemsize < 2 else dt
 
 
 def _operand_dtype(inv: Invocation, name: str):
@@ -474,25 +488,37 @@ def _routed_source(inv: Invocation, device: str, gen: Any, tokens: int,
     moe_token_counts`, which is where a measured or declared load imbalance
     already lives): the row map is the routing, so a balanced cell and a
     skewed one are different gathers of the same width.
+
+    Every token appears the same number of times, give or take one, because
+    a router sends each token to exactly `topk` experts — the count is a
+    property of the routing rule, not a draw. Independent uniform picks
+    would instead be Poisson about that mean, and the tail is wide: at
+    8352 rows over 1024 tokens the mean is 8.16 and the fullest token
+    takes 18-22. That tail is not an abstraction a consumer can ignore —
+    a provider laying these rows out `[tokens, max_slots]`, as
+    `npu_moe_token_unpermute` requires, allocates and walks 2.7x the rows
+    the cell has, and the measurement comes back slow for a reason that
+    exists nowhere but in this generator. The sum is unchanged, so no
+    cross-check catches it.
+
+    So the counts are dealt out evenly and then shuffled: the same rows,
+    the same per-expert blocks, the same seeded generator, and the fullest
+    token now takes `ceil(routed / tokens)`.
     """
     import torch
-    counts = list(inv.moe_token_counts) or [routed]
-    out = torch.empty(routed, dtype=torch.int64, device=device)
-    at = 0
-    for count in counts:
-        if at >= routed:
-            break
-        take = min(int(count), routed - at)
-        if take:
-            out[at:at + take] = torch.randint(
-                0, max(1, tokens), (take,), device=device, dtype=torch.int64,
-                generator=gen)
-        at += take
-    if at < routed:                      # a cell whose counts under-fill the
-        out[at:] = torch.randint(        # padded buffer: the rest are padding
-            0, max(1, tokens), (routed - at,), device=device,
-            dtype=torch.int64, generator=gen)
-    return out
+    # Deal every token the same number of rows (the last few take one more
+    # when the total does not divide), then let the generator decide which
+    # row is whose. `randperm` is the one draw, so a cell's routing still
+    # varies with its seed.
+    #
+    # `moe_token_counts` is not read here any more and does not need to be:
+    # it blocks the rows BY EXPERT, and this answers which TOKEN each row
+    # came from. The per-expert blocking is a property of the row ORDER,
+    # which the shuffle leaves to the cell — the old loop walked those
+    # counts only to pick a different `randint` per block, which drew from
+    # the same distribution each time.
+    deal = torch.arange(routed, device=device, dtype=torch.int64) % max(1, tokens)
+    return deal[torch.randperm(routed, device=device, generator=gen)]
 
 
 def _moe_permute_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
@@ -3636,8 +3662,9 @@ register_ref("moe_topk_hash_sqrtsoftplus",
 
 def _indexer_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     import torch
-    dt = _dtype(inv.dtype)
-    store_dt = torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # `_store_dtype` states this rule once; restating it here is how the two
+    # drifted when the rule changed from float-ness to width.
+    store_dt = _store_dtype(inv.dtype)
     return {
         "q": torch.randn(*_shape(inv, "q"), dtype=store_dt, device=device, generator=gen),
         "k": torch.randn(*_shape(inv, "k"), dtype=_operand_dtype(inv, "k"),
@@ -3699,8 +3726,9 @@ def causal_block_max(scores: Any, block: int) -> Any:
 
 def _block_score_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     import torch
-    dt = _dtype(inv.dtype)
-    store_dt = torch.bfloat16 if dt.is_floating_point and dt.itemsize < 2 else dt
+    # `_store_dtype` states this rule once; restating it here is how the two
+    # drifted when the rule changed from float-ness to width.
+    store_dt = _store_dtype(inv.dtype)
     return {
         "q": torch.randn(*_shape(inv, "q"), dtype=store_dt, device=device, generator=gen),
         "k": torch.randn(*_shape(inv, "k"), dtype=_operand_dtype(inv, "k"),
@@ -5303,6 +5331,40 @@ register_ref("conv2d", RefSpec(_conv2d_inputs, _conv2d_reference))
 # The bare collectives: one contiguous payload over a group
 # ---------------------------------------------------------------------------
 
+def _collective_rank_seeds(inv: Invocation, ranks: int):
+    """The draw each rank of this cell uses, or None on an unkeyed smoke.
+
+    Owned by `Invocation.seed_for_rank`. This module reads the method; it
+    does not mix `seed + rank` itself, so two ranks cannot disagree about
+    what the others held.
+    """
+    try:
+        return tuple(inv.seed_for_rank(r) for r in range(ranks))
+    except ValueError:
+        return None
+
+
+def _collective_payload(signature: str, n_elems: int, ranks: int, rank: int,
+                        dtype, device: str, seed: int):
+    """This rank's buffer at `seed`, on `device`.
+
+    The cell's payload is always `n_comm_elems` (eval's T). all-gather's
+    T is the gathered buffer, so this rank only draws its send shard of
+    T/N and places it; the other collectives draw the whole T.
+    """
+    import torch
+    gen = torch.Generator("cpu").manual_seed(int(seed))
+    dt = dtype if dtype is not None else torch.float32
+    if signature == "all_gather" and ranks > 1 and n_elems % ranks == 0:
+        chunk = n_elems // ranks
+        shard = torch.randn(chunk, dtype=torch.float32, generator=gen)
+        payload = torch.zeros(n_elems, dtype=torch.float32)
+        payload[int(rank) * chunk:(int(rank) + 1) * chunk] = shard
+        return payload.to(dtype=dt, device=device)
+    payload = torch.randn(n_elems, dtype=torch.float32, generator=gen)
+    return payload.to(dtype=dt, device=device)
+
+
 def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
     """One payload buffer, the group that moves it, and the group's spacing.
 
@@ -5323,19 +5385,49 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     for whichever of them the signature's cell declares, so the flat
     exchange's inputs do not change.
 
-    No oracle. On one process every one of these collectives is the
-    identity, so an oracle here would agree with a provider that never
-    communicated — which is exactly how a fused all-reduce once
-    cross-checked green without a fabric. A provider that brings
-    `n_comm_ranks` processes brings its own comparison.
+    An oracle only where there is something to compare. On ONE process
+    every one of these collectives is the identity, so a reference built
+    here would agree with a provider that never communicated — which is
+    exactly how a fused all-reduce once cross-checked green without a
+    fabric. So the payload is drawn at the cell's `gen` and no reference
+    is offered.
+
+    A cell measured by a real GROUP is the other case: each rank draws at
+    `Invocation.seed_for_rank`, so two ranks of one all-reduce do NOT hold
+    the same buffer, and `_collective_reference` rebuilds every rank from
+    those seeds and reduces them on the CPU. A kernel that moved nothing
+    then disagrees, which is the comparison the single-process path cannot
+    have. `_collective_rank_seeds` returns None exactly when there is no
+    keyed group, which is what selects between the two.
     """
     import torch
     dims = _dims(inv)
+    ranks = int(dims["n_comm_ranks"])
+    shape = _shape(inv, "payload")
+    dt = _dtype(inv.dtype)
+    seeds = _collective_rank_seeds(inv, ranks)
+    if seeds is None:
+        payload = torch.randn(*shape, dtype=dt, device=device, generator=gen)
+    else:
+        n_elems = 1
+        for extent in shape:
+            n_elems *= int(extent)
+        payload = _collective_payload(
+            inv.signature, n_elems, ranks, int(inv.rank), dt, device,
+            seeds[int(inv.rank)])
+        if payload.shape != shape:
+            payload = payload.reshape(*shape)
     out = {
-        "payload": torch.randn(*_shape(inv, "payload"),
-                               dtype=_dtype(inv.dtype), device=device, generator=gen),
-        "n_comm_ranks": int(dims["n_comm_ranks"]),
+        "payload": payload,
+        "n_comm_ranks": ranks,
         "n_comm_stride": int(dims["n_comm_stride"]),
+        # What `_collective_reference` needs to rebuild the other ranks;
+        # `rank_seeds` is None on the single-process path, which is what
+        # makes that path offer no reference at all.
+        "rank": int(inv.rank),
+        "signature": inv.signature,
+        "rank_seeds": seeds,
+        "payload_dtype": inv.dtype,
     }
     # Only what this signature's cell declares: the flat exchange's inputs
     # must not so much as LOOK at a routing axis, or every collective would
@@ -5349,12 +5441,86 @@ def _collective_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]
     return out
 
 
+def _collective_reference(inputs: Dict[str, Any]):
+    """The collective's result on this rank, reconstructed from every
+    rank's seed.
+
+    REFUSES without `rank_seeds`. On one process the collective IS the
+    identity, so returning the payload unchanged would be a reference that
+    a provider which never communicated agrees with — green for a kernel
+    that moved nothing, which is the failure this whole per-rank draw
+    exists to prevent. `_collective_oracle` asks first and offers no
+    reference at all in that case; reaching here without seeds is a bug
+    in that gate, not a cell to wave through.
+    """
+    import torch
+    payload = inputs["payload"]
+    ranks = int(inputs["n_comm_ranks"])
+    rank = int(inputs.get("rank", 0) or 0)
+    signature = str(inputs.get("signature") or "")
+    seeds = inputs.get("rank_seeds")
+    if not seeds or ranks < 2:
+        raise ValueError(
+            "collective reference asked for without per-rank seeds: on one "
+            "process this collective is the identity and any reference here "
+            "would pass a kernel that never communicated")
+    dt = payload.dtype
+    n_elems = int(payload.numel())
+    device = payload.device
+    payloads = [
+        _collective_payload(signature, n_elems, ranks, r, torch.float32,
+                            "cpu", seeds[r]).reshape(-1)
+        for r in range(ranks)
+    ]
+    stacked = torch.stack(payloads, dim=0)
+    if signature == "all_reduce":
+        out = stacked.sum(dim=0)
+    elif signature == "all_gather":
+        chunk = n_elems // ranks
+        out = torch.cat([p[r * chunk:(r + 1) * chunk]
+                         for r, p in enumerate(payloads)], dim=0)
+    elif signature == "reduce_scatter":
+        chunk = n_elems // ranks
+        reduced = stacked.sum(dim=0)
+        out = reduced[rank * chunk:(rank + 1) * chunk]
+    elif signature == "all_to_all":
+        chunk = n_elems // ranks
+        out = torch.cat([payloads[peer][rank * chunk:(rank + 1) * chunk]
+                         for peer in range(ranks)], dim=0)
+    elif signature == "send_recv":
+        peer = rank ^ 1 if ranks == 2 else (rank + 1) % ranks
+        out = payloads[peer]
+    else:
+        out = stacked.sum(dim=0)
+    return out.to(dtype=dt, device=device)
+
+
 # Which signatures those are is the catalog's own declaration — the
 # signatures whose cell IS a collective launch (`shape_projection`), asked
 # rather than restated as a list of collective names here.
+def _collective_oracle(inputs: Dict[str, Any]):
+    """The reference, or none at all.
+
+    A cell measured by a real group carries every rank's seed, so the
+    other ranks can be rebuilt and a kernel that moved nothing disagrees.
+    A single-process cell carries no seeds and gets NO reference: there
+    the collective is the identity and any reference would agree with a
+    provider that never communicated.
+    """
+    if not inputs.get("rank_seeds"):
+        # The driver reads a raising reference as `no_reference` and
+        # measures without a cross-check, which is the honest answer here
+        # — not the identity this cell would otherwise agree with.
+        raise ValueError(
+            "a collective on one process is the identity; a provider that "
+            "brings `n_comm_ranks` processes brings its own comparison")
+    return _collective_reference(inputs)
+
+
 for _sig in all_signatures():
     if _sig.shape_projection == "collective":
-        register_ref(_sig.name, RefSpec(_collective_inputs, None))
+        register_ref(_sig.name, RefSpec(_collective_inputs,
+                                        _collective_oracle))
 del _sig
 
 
@@ -5494,6 +5660,75 @@ def _hc_pre_gemm_reference(inputs: Dict[str, Any]) -> Any:
 
 register_ref("mhc_pre_gemm",
              RefSpec(_hc_pre_gemm_inputs, _hc_pre_gemm_reference))
+
+
+def _hc_pre_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:
+    """The whole pre-mix's cell: the multi-copy residual, the mix
+    projection, and the affine of the split. `scale` and `base` are drawn
+    rather than set to the identity parameterisation the big fuse uses,
+    because this launch applies the Sinkhorn rounds to the result and a
+    degenerate cross-mix would make them a no-op — the rounds are an axis
+    of this cell and have to do their work."""
+    import torch
+    out = {
+        "residual": torch.randn(*_shape(inv, "residual"),
+                                dtype=_dtype(inv.dtype), device=device,
+                                generator=gen),
+        "fn": _hc_fn(inv, device, gen),
+        "scale": torch.rand(*_shape(inv, "scale"), dtype=torch.float32,
+                            device=device, generator=gen) + 0.5,
+        "base": 0.1 * torch.randn(*_shape(inv, "base"), dtype=torch.float32,
+                                  device=device, generator=gen),
+    }
+    out.update(_hc_scalars())
+    # The rounds the cell is keyed at, not the span's default: this axis is
+    # in the identity (`OpSignature.structural_axes`), so the oracle runs
+    # the count the row was measured at.
+    out["sinkhorn_repeat"] = int(inv.dims["sinkhorn_repeat"])
+    return out
+
+
+def hc_pre_mix(inputs: Dict[str, Any]) -> Any:
+    """The hyper-connection pre-mix, whole — vLLM-Ascend's `npu_hc_pre_v2`.
+
+    The chain the component walks as seven primitives, in fp32:
+
+        flat   = flatten(residual)
+        mixes  = fn @ rms_unscaled(flat)
+        pre, post, comb = split_sinkhorn(mixes, scale, base)
+        y      = Σ_c pre[c]·residual[c]
+
+    Returns the three tensors the launch publishes — the sublayer input and
+    the two coefficient sets — in the order the fused node's ports list
+    them. `pre` stays inside: it is consumed by the reduce on the last line
+    and no reader outside the launch has it.
+    """
+    residual = inputs["residual"].float()
+    flat = residual.reshape(residual.shape[0], -1)
+    mixes = hc_normalised_mixes(flat, inputs["fn"], float(inputs["rms_eps"]))
+    pre, post, comb = hc_split_coefficients(
+        mixes, inputs["scale"].float(), inputs["base"].float(),
+        int(residual.shape[-2]),
+        pre_eps=float(inputs["hc_pre_eps"]),
+        post_mult=float(inputs["hc_post_mult_value"]),
+        sinkhorn_eps=float(inputs["hc_sinkhorn_eps"]),
+        sinkhorn_iters=int(inputs["sinkhorn_repeat"]))
+    y = (residual * pre.unsqueeze(-1)).sum(dim=-2)
+    return y, post, comb
+
+
+def _hc_pre_reference(inputs: Dict[str, Any]) -> Any:
+    """The oracle's single tensor: the three outputs folded the way the
+    provider's `to_canonical` folds them, because `_cross_check` compares
+    one tensor and a launch that writes three has to put them side by
+    side to be checked at all (`quantise_activation` folds a pair the
+    same way)."""
+    import torch
+    y, post, comb = hc_pre_mix(inputs)
+    return torch.cat([y, post, comb.flatten(1)], dim=-1)
+
+
+register_ref("mhc_pre", RefSpec(_hc_pre_inputs, _hc_pre_reference))
 
 
 def _hc_big_fuse_inputs(inv: Invocation, device: str, gen: Any) -> Dict[str, Any]:

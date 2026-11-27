@@ -1,0 +1,43 @@
+# Ascend 910C, one die of an Atlas 800T A3 node (16 dies: 8 packages x 2).
+#
+# The profile NAME carries the SKU: `box.gpu_of` resolves it by finding a
+# `gpu_specs.csv` row every part of whose name appears here
+# (`ascend`, `910c`, `a3` -> `Ascend-910C-A3`). That is the declaration,
+# because nothing else can make it: `env.detect_env` reads the device name
+# the driver reports (`Ascend910_9362`), and the SKU's family token
+# (`ascend`) carries no digit, so the name matcher that resolves an NVIDIA
+# card cannot resolve this one. Stated rather than inferred.
+name = "ascend-910c-a3-cann82"
+python = "3.11"
+
+# The box brings its own stack: CANN, torch_npu and the plugin arrive in
+# the `quay.io/ascend/vllm-ascend:v0.30.0-a3` image — the release
+# `framework_bindings/vllm_ascend.yaml` is audited at — and none of them
+# resolves from PyPI against a CANN toolchain. So there is no
+# `[env_requirements]` entry: `vllm_ascend` is declared a source build
+# (`providers/_libraries.py`) and the image is what satisfies it, the same
+# arrangement `fa3` has.
+#
+# Run one die at a time:
+#   docker run --rm --device /dev/davinci0 --device /dev/davinci_manager \
+#     --device /dev/devmm_svm --device /dev/hisi_hdc \
+#     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+#     -v /usr/local/dcmi:/usr/local/dcmi:ro \
+#     quay.io/ascend/vllm-ascend:v0.30.0-a3 \
+#     python -m kernel_bench run --jobs jobs.jsonl -o results/vllm_ascend.csv \
+#       --library vllm_ascend
+
+[env]
+# One die per process; the collectives that would span more are registered
+# and disabled (`providers/ascend.py`), so nothing here starts a group.
+ASCEND_RT_VISIBLE_DEVICES = "0"
+# The plugin's own custom operator package. The hyper-connection kernels
+# (`npu_hc_pre_v2` / `npu_hc_post`, the `mhc_pre` / `mhc_post` providers)
+# live in it rather than in CANN's own, and CANN reads this variable ONCE
+# at initialisation — a provider that sets it on first use gets the op
+# registered and then "The tiling function does not exist" (EZ1008). So it
+# is declared here, where a process-wide environment fact belongs, exactly
+# as the plugin itself prepends it (`vllm_ascend/utils.py:455-458`).
+ASCEND_CUSTOM_OPP_PATH = "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
+OMP_NUM_THREADS = "8"
+TOKENIZERS_PARALLELISM = "false"

@@ -342,6 +342,15 @@ checks it on DeepSeek-V3, V3.2 and V4-Pro at `cp = 8`.
 | `fit: exact\|replica_cells\|pad` | 自述词 | nondivisibility policy of a declared split |
 | `carrier` | 自述词 | which mechanism carries the expert-copy count (`instances` or a stored axis) |
 | `unrolled`, `leading_axis` | 自述词(社区口语 per-expert / stacked) | checkpoint encoding of the copy domain: one artifact per copy vs one stacked axis |
+| scale-up / scale-down | scale-up (industry standard; NVIDIA, Huawei, OCP) | growing one coherent accelerator domain, as against adding independent ones |
+| scale-out | scale-out (same sources) | adding domains and connecting them over a network |
+| `scaleup_fabric`, fabric | fabric (interconnect literature) | the named link a domain is built from, as against the bandwidth it carries |
+| `n_comm_domain` | 自述词 | which fabric a measured collective's traffic crossed, as an ordered TIER: 1 host, 2 scaleup, 3 scaleout (`comm_cost.COMM_REACHES`). A tier and not a rank count, because `scaleout` has no fixed extent and because one fabric at two sizes (a 384-die and a 768-die supernode) must not split into two keys. Omitted on a corpus row means host — the default every row carried before the axis existed |
+| supernode (超节点) | supernode / superpod (Huawei CloudMatrix; cf. NVIDIA NVL72 rack) | one scale-up domain spanning SEVERAL chassis — on Atlas A3, up to 384 dies reached over Lingqu, which `npu-smi info -t spod-info` reports as `Super Pod Size`. Crossing chassis inside one is NOT crossing into scale-out |
+| Lingqu (灵渠) / UB / UnifiedBus | UnifiedBus (Huawei) | the fabric a supernode's scale-up domain is built from. Vendor name 灵渠; `HCCS` is what `npu-smi info -t topo` prints for the switched links inside one chassis |
+| `SIO` | 自述词(厂商缩写) | the faster link joining the two dies of one Ascend package, printed by `npu-smi info -t topo` alongside `HCCS_SW` |
+| `rdma_gbps`, RDMA | RDMA over Converged Ethernet (RoCE v2); InfiniBand | the scale-OUT NIC. On a supernode member this carries traffic leaving the supernode, NOT traffic between its chassis. A row may leave it empty when the link was never observed; a collective or a disaggregated KV handoff that would cross it is then refused with the column named (`NoFabricBandwidth`, `disagg_handoff.kv_transfer.unavailable_reason`) rather than priced |
+| `gpus_per_node` | 自述词 | how many ranks one scale-up domain holds. The spelling says "node", but the fact is the DOMAIN's size: on Atlas A3 that is the supernode's 384, not one chassis's 16 |
 | `artifact` | 自述词(借建构词:a produced, stored thing) | one physically stored checkpoint tensor (primary or metadata sibling) |
 | `provenance` | data lineage | where a header count came from: declared, recovered, absent |
 | `oracle` | test oracle | an independent evidence source a declaration is checked against |

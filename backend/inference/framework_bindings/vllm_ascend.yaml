@@ -1,0 +1,421 @@
+# vLLM-Ascend framework binding — the vLLM hardware plugin for Huawei Ascend
+# NPUs. Every entry is read at `audited_at` in the plugin's own source
+# (prefill and decode checked separately), never copied from vllm.yaml,
+# whose kernels are CUDA's. The audit is for Ascend 910C (the A3 hardware
+# profile; A2 identical): vllm_ascend/device/hardware_profile.py:246-309.
+# Ascend 950 (A5) lacks the custom ops and worker patches these entries rest
+# on (vllm_ascend/device/hardware_profile.py:333-360) and is not covered.
+#
+# Only entries whose one-launch claim was confirmed are bound. An op left
+# unbound is priced unfused (its own launch and HBM round trip), which can
+# only over-state time. No collective ladder: every all-reduce is priced on
+# NCCL's (here HCCL's) schedule.
+
+framework: vllm_ascend
+audited_at:
+  repo: vllm-project/vllm-ascend
+  tag: v0.30.0
+  commit: c09d3e20b9c45c80b34ae3781440d90904a44023
+
+# The plugin runs on Ascend NPUs only (`gpu_specs.csv` `device: npu`).
+devices: [npu]
+
+# The paged-KV page the plugin allocates in on its default serving path:
+# `refresh_block_size` (vllm_ascend/utils.py:1482-1505, called from
+# vllm_ascend/platform.py:1373) sets an unset block size to 128, and forces
+# 128 under prefix caching or chunked prefill (vllm_ascend/utils.py:1536-1540).
+# Billed at 128 for every model. Not modelled as this field: a deepseek_v4
+# checkpoint defaults to 32 (vllm_ascend/utils.py:1520-1528), a hybrid
+# attention+mamba model aligns the scheduler / KV-pool block (640 without
+# int8 KV; 2176/4352 with it — vllm_ascend/utils.py:1531-1534), and C8 MXFP
+# KV rounds to its kernel block (vllm_ascend/utils.py:1509-1515). Those
+# alignments are the pool grain. This field is the kernel page
+# (`op_signatures.PAGE_AXIS`); every Ascend attention backend's
+# `get_supported_kernel_block_sizes()` is `[128]`.
+kv_block_size: 128
+
+# The plugin runs vLLM's model config: `ModelConfig.get_mamba_chunk_size`
+# reads `mamba_chunk_size`, then `chunk_size` (vllm v0.30.0
+# vllm/config/model.py:1664-1672, the vLLM release vLLM-Ascend v0.30.0
+# pairs with).
+ssm_chunk_size:
+  from_config: [mamba_chunk_size, chunk_size]
+
+# The plugin reads the Sinkhorn round count the hyper-connection pre-mix
+# kernel is handed from the checkpoint config, first field present wins:
+# `Glm5NextConfig` folds `hc_sinkhorn_iters` into `mhc_sinkhorn_iterations`
+# (vllm_ascend/models/glm5next/config.py:89) and the model hands that to
+# `npu_hc_pre_v2` as its fifth argument
+# (vllm_ascend/models/glm5next/model.py:505). The count is an axis of the
+# `mhc_pre` cell on the device's own numbers: at T=1024 the same launch
+# takes 119.2 us at 20 rounds and 164.0 us at 100.
+hc_sinkhorn_iters:
+  from_config: [mhc_sinkhorn_iterations, hc_sinkhorn_iters]
+
+# The launches the plugin selects for a quantised matmul, first viable wins
+# (a candidate whose `mma_dtypes` all have peak columns on the card).
+precision_launches:
+  # msModelSlim W8A8_DYNAMIC: the activation is quantised to INT8 per token
+  # and one INT8 x INT8 matmul runs, linear and MoE alike.
+  modelslim_w8a8_dynamic_int8:
+    schemes: [modelslim-w8a8-dynamic]
+    requested_activation_formats: [int8_per_token]
+    launch:
+      activation: int8_per_token
+      compute_dtype: I8
+      mma_dtypes: [I8]
+    source_anchor: "W8A8_DYNAMIC linear quantises x with npu_dynamic_quant(dst_type=int8) and runs npu_quant_matmul on the INT8 weight with its per-channel scale and the per-token scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:60-131); the MoE method holds INT8 expert weights and quantises the grouped-matmul input the same way (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:146-200, vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:528-529)"
+  # A native block-FP8 checkpoint (`quant_method: fp8`) off Ascend 950: the
+  # FP8 tiles are expanded once after loading into the model dtype and the
+  # ordinary unquantised GEMM serves them, linear and MoE alike — no
+  # activation is quantised. Ascend 950 re-quantises to MXFP8 instead; that
+  # candidate belongs FIRST here, priced on an FP8 column, once a 950 row
+  # exists on the sheet.
+  #
+  # Weight memory for a native FP8 checkpoint on this card is billed at ONE
+  # BYTE per weight, which is the production figure: a 910C deployment does
+  # not serve the FP8 tiles as they ship. It converts them to the equivalent
+  # W8A8 INT8 (msModelSlim, offline or at load) and serves that, and both
+  # formats are one byte per weight, so the resident footprint the walk
+  # reports is the one the card holds.
+  #
+  # The path this entry prices is the OTHER one: a checkpoint served without
+  # that conversion, where the plugin expands each tile into the model dtype
+  # after loading and the unquantised GEMM runs. Its COMPUTE is what this
+  # launch states (BF16, no activation quantised); its resident weight is
+  # then two bytes, which the walk does not bill, because a binding cannot
+  # declare a resident width today (docs/inference_cost_model.md, "The width
+  # a framework LOADS a resident tensor at: still unmodelled"). Deliberately
+  # left: the modelled byte figure matches the deployment anyone runs, and
+  # the unconverted path is a transitional one. To see that path's true
+  # footprint, serve the model under an explicit BF16 weight profile.
+  fp8_block_dequantised_bf16:
+    schemes: [fp8]
+    requested_activation_formats:
+      - fp8_token_group128
+      - fp8_token_group128_ue8m0
+      - fp8_token_group32_ue8m0
+    launch:
+      activation: none
+      compute_dtype: BF16
+      mma_dtypes: [BF16]
+    source_anchor: "The plugin's `fp8` quant method serves block-FP8 linears and MoE through the block scheme (vllm_ascend/quantization/configs/fp8_config.py:93-108); off Ascend 950 no MXFP8 method is built (vllm_ascend/quantization/methods/w8a8/fp8_block.py:181, vllm_ascend/quantization/methods/w8a8/fp8_block.py:280), so the tiles are resolved into the model dtype after loading (vllm_ascend/quantization/methods/w8a8/fp8_block.py:17-31, vllm_ascend/quantization/methods/w8a8/fp8_block.py:199-226, vllm_ascend/quantization/methods/w8a8/fp8_block.py:357-366) and the unquantised GEMM / BF16 MoE method runs (vllm_ascend/quantization/methods/w8a8/fp8_block.py:250-259, vllm_ascend/quantization/methods/w8a8/fp8_block.py:399-416)"
+
+# Every entry: custom ops are on for every standard profile
+# (`custom_ops = ["all"]`, vllm_ascend/platform.py:1375-1377), so vLLM's
+# layers dispatch to the plugin's `forward_oot` overrides registered at
+# vllm_ascend/utils.py:866-897. None of the entries below branches on phase.
+#
+# Deliberately NOT bound yet (each priced unfused):
+#   * fused_qk_norm_rope / fused_qk_norm_partial_rope — a default-on graph
+#     pass, compiled mode only; matching is pattern-dependent.
+#   * fused_qk_mrope, moe_topk_softmax_bias, rmsnorm_gated, causal_conv1d —
+#     medium confidence (section boundaries, kernel internals, the external
+#     fla_npu package).
+#   * allreduce_fused_rmsnorm — no such fusion exists in the plugin.
+#
+# W8A8_DYNAMIC caveat: `fused_add_rmsnorm` and `silu_and_mul` take an
+# optional `quantise_activation` member (the consumer-follows rule), but the
+# plugin quantises inside the next linear (w8a8_dynamic.py:101, :117), a
+# launch of its own: under `w_int8_w8a8_ffn` this binding under-counts about one
+# launch per norm and per dense activation. Its MoE gate_up GMM + SwiGLU +
+# quant kernel (default on, vllm_ascend/ascend_config.py:181) has no plan.
+# Which provider implementation the plugin dispatches to, per op. The
+# `latest` selection mode compares this by equality against a measured
+# row's `kernel_impl` (docs/measured_calibration.md §7.4), so a row of a
+# kernel named nowhere here is measured and never read — which is what
+# happened before these entries existed: 205 Ascend rows sat in the corpus
+# and no estimate found one.
+#
+# `library` is the provider's provenance (`providers/ascend.py` registers
+# them under `vllm_ascend`), not the serving framework; `impl_id` is the
+# complete id that provider records.
+kernel_dispatches:
+  - op: rmsnorm
+    library: vllm_ascend
+    impl_id: npu_rms_norm
+    when: {device: [npu]}
+    source_anchor: "AscendRMSNorm.forward_oot without a residual -> torch_npu.npu_rms_norm (vllm_ascend/ops/layernorm.py:96-101), registered over vLLM's RMSNorm (vllm_ascend/utils.py:884)"
+  - op: fused_add_rmsnorm
+    library: vllm_ascend
+    impl_id: npu_add_rms_norm
+    when: {device: [npu]}
+    source_anchor: "AscendRMSNorm.forward_oot residual branch -> torch.ops._C_ascend.npu_add_rms_norm_bias (vllm_ascend/ops/layernorm.py:88-95)"
+  - op: silu_and_mul
+    library: vllm_ascend
+    impl_id: npu_swiglu
+    when: {device: [npu]}
+    source_anchor: "AscendSiluAndMul.forward_oot -> torch_npu.npu_swiglu (vllm_ascend/ops/activation.py:35-38), registered as SiluAndMul (vllm_ascend/utils.py:869)"
+  - op: grouped_gemm
+    library: vllm_ascend
+    impl_id: npu_grouped_matmul
+    when: {device: [npu], unquantized_bf16_launch: true}
+    source_anchor: "The routed experts' grouped GEMM: AscendUnquantizedFusedMoEMethod runs npu_grouped_matmul over the expert bank (vllm_ascend/ops/fused_moe/routed_experts.py:231-239, vllm_ascend/ops/fused_moe/routed_experts.py:294-302)"
+  - op: grouped_gemm
+    library: vllm_ascend
+    impl_id: npu_grouped_matmul_w8a8
+    when: {device: [npu], activation_dtype: [int8]}
+    source_anchor: "The W8A8_DYNAMIC MoE method holds INT8 expert weights and runs the same grouped matmul on them (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:146-200, vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:203-239)"
+  # An unquantised linear runs torch's own `F.linear`, which the plugin
+  # calls directly (`vllm_ascend/ops/linear.py:49-54` unquantized_gemm).
+  # On an NPU that dispatches to `aclnnMatmul_MatMulV3Common_MatMulV3` —
+  # read off the Ascend profiler, not assumed — so the kernel measured is
+  # the Ascend one and the provider that measures it is torch's, which is
+  # why `library` here is `torch` rather than `vllm_ascend`.
+  - op: linear
+    library: torch
+    impl_id: torch_cublas_linear
+    when: {device: [npu], unquantized_bf16_launch: true}
+    source_anchor: "AscendUnquantizedLinearMethod.apply -> torch.ops.vllm.unquantized_gemm -> torch.nn.functional.linear (vllm_ascend/ops/linear.py:133-139, vllm_ascend/ops/linear.py:49-54)"
+  - op: linear
+    library: vllm_ascend
+    impl_id: npu_quant_matmul_w8a8
+    when: {device: [npu], activation_dtype: [int8]}
+    source_anchor: "W8A8_DYNAMIC linear: npu_dynamic_quant then npu_quant_matmul with the per-channel weight scale and the per-token activation scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:104-131)"
+  # `output_dtype`, not `activation_dtype`. A quantise cell's activation
+  # slot is the WIDE tensor it reads (`bf16`); the int8 is what it writes.
+  # Naming the input slot asked "is the thing this kernel reads already
+  # int8", which is never true of a quantiser, so this dispatch could not
+  # hold for the two rows measured on a die and they went unread.
+  - op: quantise_activation
+    library: vllm_ascend
+    impl_id: npu_dynamic_quant_int8
+    when: {device: [npu], output_dtype: [int8]}
+    source_anchor: "The activation cast the W8A8 linear performs before its matmul (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:117)"
+  - op: flash_attention
+    library: vllm_ascend
+    impl_id: npu_fused_infer_attention_score
+    when: {device: [npu], phase: [prefill]}
+    source_anchor: "AscendAttentionBackendImpl.forward_impl -> forward_fused_infer_attention, one npu_fused_infer_attention_score (vllm_ascend/attention/attention_v1.py:1248-1269, vllm_ascend/attention/attention_v1.py:875-1019)"
+  - op: flash_attention
+    library: vllm_ascend
+    impl_id: npu_fused_infer_attention_score_paged
+    when: {device: [npu], phase: [decode]}
+    source_anchor: "The decode path reads the paged cache through a block table at the plugin's page (vllm_ascend/attention/attention_v1.py:1102-1121, page at vllm_ascend/utils.py:1504-1505)"
+
+  # MLA's absorbed W_UK / W_UV, one per-head matmul each, both phases: the
+  # SFA backend folds kv_b_proj into the two sides of the attention and runs
+  # each as one npu_transpose_batchmatmul (vllm_ascend/attention/sfa_v1.py:
+  # 1342 for the query against W_UK_T, :1373 for the output against W_UV).
+  # The node names on the walk are `q_absorbed_nope` and `v_absorbed`.
+  - op: per_head_linear
+    library: vllm_ascend
+    impl_id: npu_transpose_batchmatmul
+    when: {device: [npu]}
+    source_anchor: "AscendSFAImpl._q_proj_and_k_up_proj -> torch_npu.npu_transpose_batchmatmul(q_nope, self.W_UK_T, perm_x1=(1,0,2), perm_x2=(0,1,2), perm_y=(1,0,2)) (vllm_ascend/attention/sfa_v1.py:1337-1348) and _v_up_proj -> the same call on W_UV with perm_x1=(1,0,2), perm_y=(1,0,2) (vllm_ascend/attention/sfa_v1.py:1361-1379); both reached from the layer's forward (vllm_ascend/attention/sfa_v1.py:2079, vllm_ascend/attention/sfa_v1.py:2158). Weights packed at vllm_ascend/attention/sfa_v1.py:945-962"
+
+  # KDA, two kernels by phase: the chunked prefill and the one-token
+  # recurrent step. Not the Triton `chunk_kda_with_fused_gate` the patch
+  # file installs for upstream FLA's import — that is a shim whose body
+  # calls this same AscendC entry.
+  - op: kda
+    library: vllm_ascend
+    impl_id: npu_chunk_kda_fwd
+    when: {device: [npu], phase: [prefill]}
+    source_anchor: "Glm5NextLinearAttention._forward prefill branch -> chunk_kda (vllm_ascend/models/glm5next/kda.py:556-570) -> run_chunk_kda (vllm_ascend/ops/kda.py:60-110) -> fla_npu.ops.ascendc.chunk_kda_fwd, one aclnnChunkKdaFwd (profiler `aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd`, 546 us at 1024 tokens on one die)"
+  - op: kda
+    library: vllm_ascend
+    impl_id: npu_recurrent_kda
+    when: {device: [npu], phase: [decode]}
+    source_anchor: "Glm5NextLinearAttention._forward decode branch -> recurrent_kda (vllm_ascend/models/glm5next/kda.py:541-553) -> run_recurrent_kda (vllm_ascend/ops/kda.py:16-58) -> fla_npu.ops.ascendc.recurrent_kda, one aclnnRecurrentKda (profiler `aclnnRecurrentKda_RecurrentKda_RecurrentKda`, 34 us at B=16 on one die)"
+
+  # The two HC launches have no per-phase split: the plugin calls one
+  # AscendC entry for prefill and decode alike (`npu_hc_pre_v2` /
+  # `npu_hc_post`, read off the profiler as `HcPre` / `HcPost`). The
+  # `architectures` clause is the same one their fusions carry, so a
+  # measured HC row is only ever read on the model whose walk produced it.
+  - op: mhc_pre
+    library: vllm_ascend
+    impl_id: npu_hc_pre_v2
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "Glm5NextDecoderLayer.hc_pre -> torch.ops._C_ascend.npu_hc_pre_v2 (vllm_ascend/models/glm5next/model.py:499-507), registered npu_hc_pre_v2_npu -> run_hc_pre_fusion (csrc/torch_binding.cpp:3255-3264); profiler `HcPre`"
+  - op: mhc_post
+    library: vllm_ascend
+    impl_id: npu_hc_post
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); profiler `HcPost`"
+
+  # The packed projection takes the same path as a plain linear: the
+  # plugin's class keeps vLLM's concatenated weight and runs ONE GEMM
+  # through `AscendUnquantizedLinearMethod` (the fusion entry above says
+  # so), so its dispatch is `linear`'s, declared here rather than inherited
+  # — `dispatch_for` matches on the op name and knows nothing of variants.
+  # Its ROUTED rows are a different launch (`grouped_gemm`, already
+  # declared) and are not covered by this; a cell that carries a dispatch
+  # reads it by signature, and both ops bind to `gemm`.
+  - op: merged_column_parallel_linear
+    library: torch
+    impl_id: torch_cublas_linear
+    when: {device: [npu], unquantized_bf16_launch: true}
+    source_anchor: "AscendMergedColumnParallelLinear (vllm_ascend/ops/linear.py:251) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:100, vllm_ascend/ops/linear.py:133-139) -> unquantized_gemm -> torch.nn.functional.linear (vllm_ascend/ops/linear.py:49-54), which on an NPU dispatches aclnnMatmul_MatMulV3Common_MatMulV3"
+  - op: merged_column_parallel_linear
+    library: vllm_ascend
+    impl_id: npu_quant_matmul_w8a8
+    when: {device: [npu], activation_dtype: [int8]}
+    source_anchor: "W8A8_DYNAMIC packed projection: npu_dynamic_quant then npu_quant_matmul with the per-channel weight scale and the per-token activation scale (vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:104-131)"
+
+  # `moe_fused_gate` and `topk` are still NOT declared: the gate's kernel
+  # is chosen by `check_npu_moe_gating_top_k` from the checkpoint's
+  # `scoring_func`, `renormalize` and group widths (`ops/fused_moe/router/
+  # router_factory.py:15-33, :80-88`), which is not a deployment fact.
+  #
+  # `permute` and `combine` ARE the MoE dispatch, and above one expert
+  # rank the kernel that runs them follows a communication method chosen
+  # per step (AllGather / AllToAll / MC2 / FusedMC2). But at `ep_moe: 1`
+  # there is nothing to choose: `setup_moe_comm_method` registers all four
+  # implementations only when `moe_config.ep_size > 1`, and its `else`
+  # branch registers AllGather ALONE (`ops/fused_moe/moe_comm_method.py:
+  # 68-75`). So the unsharded expert world is a declaration, not a
+  # preference, and the two rows below state it.
+  #
+  # Above `ep_moe: 1` they stay `ambiguous` on purpose. The remaining
+  # branches turn on `num_tokens <= mc2_tokens_capacity`
+  # (`ascend_forward_context.py:330`), a per-step token count whose
+  # threshold is computed at startup (~512 x tp, `:271-274`). `phase`
+  # would be a proxy for it, not a statement of it, so it is not used
+  # here: a prefill chunk is USUALLY over the capacity and a decode batch
+  # USUALLY under, but "usually" is not what a dispatch declares.
+  - op: permute
+    library: vllm_ascend
+    impl_id: npu_moe_init_routing_v2
+    when: {device: [npu], expert_parallel: [1]}
+    source_anchor: "With one expert rank, setup_moe_comm_method registers AllGatherCommImpl alone (vllm_ascend/ops/fused_moe/moe_comm_method.py:68-75); its dispatcher pre-processes with torch_npu.npu_moe_init_routing_v2 (vllm_ascend/ops/fused_moe/moe_comm_method.py:210-233)"
+  - op: combine
+    library: vllm_ascend
+    impl_id: npu_moe_token_unpermute
+    when: {device: [npu], expert_parallel: [1]}
+    source_anchor: "The same AllGather implementation post-processes with torch_npu.npu_moe_token_unpermute, chosen over npu_moe_finalize_routing because that one is documented to lose accuracy (vllm_ascend/ops/fused_moe/moe_comm_method.py:216-226)"
+
+  # Tensor-parallel collectives, which on this plugin have exactly one
+  # path. `NPUCommunicator` does not override `all_reduce`, so it takes
+  # `DeviceCommunicatorBase.all_reduce` — `dist.all_reduce` on the device
+  # group, which is HCCL (`vllm/distributed/device_communicators/
+  # base_device_communicator.py:231-233`). There is no custom all-reduce
+  # bypass to pick between: nothing in the v0.30.0-a3 plugin matches
+  # `custom_all_reduce` / `should_custom_ar`, and the only other
+  # communicator it ships (`pyhccl`) is HCCL as well.
+  #
+  # Unlike `permute` / `combine`, these do not follow the MoE
+  # communication method: they are the TP seam's own reductions, declared
+  # on the walk at `hc_attn_post.out` and `out.out`, and they run the same
+  # kernel whatever the expert dispatch does.
+  - op: all_reduce
+    library: vllm_ascend
+    impl_id: hccl_all_reduce
+    when: {device: [npu]}
+    source_anchor: "NPUCommunicator inherits DeviceCommunicatorBase.all_reduce -> torch.distributed.all_reduce on the device group (vllm/distributed/device_communicators/base_device_communicator.py:231-233); the plugin's communicator (vllm_ascend/distributed/device_communicators/npu_communicator.py:40) declares no all_reduce of its own and ships no custom-all-reduce bypass"
+  - op: all_gather
+    library: vllm_ascend
+    impl_id: hccl_all_gather
+    when: {device: [npu]}
+    source_anchor: "The vocabulary gather at the LM head: tensor_model_parallel_all_gather (vllm_ascend/models/glm5next/model.py:261) through the same NPUCommunicator, so torch.distributed.all_gather_into_tensor on HCCL"
+
+  - op: flash_dsa
+    library: vllm_ascend
+    impl_id: npu_sparse_flash_attention
+    when: {device: [npu], architectures: [Glm5NextForConditionalGeneration]}
+    source_anchor: "sparse_mla -> torch.ops._C_ascend.npu_sparse_flash_attention (vllm_ascend/attention/sfa_v1.py:228), one launch per layer; profiler `SparseFlashAttention`"
+
+op_implementations:
+  # Residual add + RMSNorm: AscendRMSNorm.forward_oot with a residual makes
+  # one npu_add_rms_norm_bias call (one aclnnAddRmsNormBias), prefill and
+  # decode alike.
+  # Q and K rotated in one Triton launch, both phases: AscendRotaryEmbedding
+  # -> vllm::npu_rotary_embedding -> one _triton_rope over q and k. The
+  # partial form is the same kernel with rope_dim passed, rotating the
+  # leading lanes of every head.
+  #
+  # KNOWN OVERMATCH, accepted: on an MLA graph (DeepSeek-V3, Kimi-K2) the
+  # plugin does NOT rotate the pair — it rotates q_pe alone
+  # (npu_interleave_rope, vllm_ascend/attention/mla_v1.py:2787-2801) and
+  # folds k_pe into the KV norm+rope+cache op
+  # (vllm_ascend/attention/mla_v1.py:1865-1877) — yet this entry still binds
+  # there, because the pattern matches a q/k rope pair and the dispatch
+  # vocabulary has no fact that separates MLA from GQA: the role is
+  # `attention` on both, and `dims` can only include explicit values, which
+  # would be a per-model proxy. Excluding MLA would mean listing model
+  # classes. The error is bounded and smaller than the alternative: on MLA
+  # it merges two rotations of the 64-lane rope slice, while leaving the
+  # entry unbound would cost every GQA model a full Q and K HBM round trip.
+  # Revisit if the vocabulary gains an attention-family fact.
+  fused_qk_rope:
+    source_anchor: "AscendRotaryEmbedding.forward_oot (vllm_ascend/ops/rotary_embedding.py:274-322) -> rope_forward_oot (vllm_ascend/ops/rotary_embedding.py:198-254, registered vllm_ascend/ops/register_custom_ops.py:262-268) -> rope_forward_triton, one _triton_rope launch over q and k (vllm_ascend/ops/triton/rope.py:541-660, launch vllm_ascend/ops/triton/rope.py:599-620)"
+  fused_qk_rope_partial:
+    source_anchor: "rope_forward_oot with rope_dim (vllm_ascend/ops/rotary_embedding.py:216-236) -> rope_forward_triton(rope_dim=rotary_dim) (vllm_ascend/ops/triton/rope.py:580-620), from AscendRotaryEmbedding.forward_oot (vllm_ascend/ops/rotary_embedding.py:311-322)"
+
+  fused_add_rmsnorm:
+    source_anchor: "AscendRMSNorm.forward_oot residual branch -> torch.ops._C_ascend.npu_add_rms_norm_bias (vllm_ascend/ops/layernorm.py:88-95); registered over vLLM RMSNorm/GemmaRMSNorm (vllm_ascend/utils.py:884-885)"
+
+  # SiLU-and-mul: one torch_npu.npu_swiglu, prefill and decode alike; the
+  # unquantised routed experts run the same call.
+  silu_and_mul:
+    source_anchor: "AscendSiluAndMul.forward_oot -> torch_npu.npu_swiglu (vllm_ascend/ops/activation.py:35-38), registered as SiluAndMul (vllm_ascend/utils.py:869); routed experts vllm_ascend/ops/fused_moe/moe_mlp.py:90-95"
+
+  # Attention: one npu_fused_infer_attention_score launch per phase (or one
+  # _npu_paged_attention in the opt-in FULL_DECODE_ONLY decode graph; one
+  # launch either way). The prefill/decode split into two launches is
+  # A5-only. The KV-cache write is its own launch, outside this plan.
+  flash_attention:
+    source_anchor: "AscendAttentionBackendImpl.forward_impl (vllm_ascend/attention/attention_v1.py:1248-1269) -> forward_fused_infer_attention (vllm_ascend/attention/attention_v1.py:875-1019, vllm_ascend/device/device_op.py:216-224) / forward_paged_attention (vllm_ascend/attention/attention_v1.py:1102-1121); MLA vllm_ascend/attention/mla_v1.py:1749-1751 (prefill), vllm_ascend/attention/mla_v1.py:3051 (decode)"
+
+  # Packed projections: the plugin's linear classes keep vLLM's concatenated
+  # weight and run one GEMM (unquantised F.linear), both phases.
+  merged_column_parallel_linear:
+    source_anchor: "AscendMergedColumnParallelLinear (vllm_ascend/ops/linear.py:251-302) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:133-139) -> unquantized_gemm (vllm_ascend/ops/linear.py:49-54); registered vllm_ascend/utils.py:877"
+  qkv_parallel_linear:
+    source_anchor: "AscendQKVParallelLinear (vllm_ascend/ops/linear.py:175-248) -> AscendUnquantizedLinearMethod.apply (vllm_ascend/ops/linear.py:133-139); registered vllm_ascend/utils.py:878"
+
+  # MoE routers: one moe_gating_top_k (aclnnMoeGatingTopK) does the norm,
+  # the (grouped) top-k, the gather and the renormalisation, both phases.
+  moe_topk_softmax:
+    source_anchor: "AscendFusedTopKRouter._compute_routing, norm_type 0 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:140-241) -> DeviceOperator.moe_gating_top_k (vllm_ascend/device/device_op.py:257-284)"
+  moe_topk_sigmoid:
+    source_anchor: "AscendFusedTopKRouter._compute_routing, norm_type 1, group_count 1 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:156-158, vllm_ascend/ops/fused_moe/router/fused_topk_router.py:224-239) -> one aclnnMoeGatingTopK (csrc/moe/moe_gating_top_k/op_host/moe_gating_top_k_tiling.cpp:559-560)"
+  moe_fused_gate:
+    source_anchor: "AscendFusedTopKRouter._compute_routing with group_select_mode=1 (vllm_ascend/ops/fused_moe/router/fused_topk_router.py:227-239) -> one aclnnMoeGatingTopK, grouped top2-sum selection (csrc/moe/moe_gating_top_k/op_kernel/moe_gating_top_k_generalized.h:285)"
+
+  # Gated DeltaNet gates: one Triton launch for g and beta over the whole
+  # batch, both phases. beta is written at the input dtype while the plan
+  # bills fp32 — an over-statement of bytes, left as is.
+  # The hyper-connection seam, both halves, one launch each. GLM-5.3-Flash
+  # is the one model here that has it.
+  #
+  # `mhc_pre` takes the WHOLE pre-mix, the Sinkhorn split included — which
+  # is where this binding differs from the CUDA ones. There the split stays
+  # a billed node between `mhc_pre_gemm` and `mhc_pre_big_fuse`
+  # (`fusion_plans/mhc_pre_big_fuse.yaml` states that residual); here the
+  # kernel does all of it, and the profiler agrees: one `HcPre` per seam,
+  # 126.6 us at 1024 tokens against a launch floor near 35, where the
+  # seven primitives would be seven launches.
+  #
+  # The sublayer RMSNorm is NOT absorbed: the plugin calls `npu_rms_norm`
+  # on the launch's output (vllm_ascend/models/glm5next/model.py:513) and the trace shows its own
+  # `RmsNorm` kernel beside `HcPre`. It stays a node, as the plan does.
+  mhc_pre:
+    crosses: component
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "Glm5NextDecoderLayer.hc_pre -> torch.ops._C_ascend.npu_hc_pre_v2(x, hc_fn, hc_scale, hc_base, n, mhc_sinkhorn_iterations, rms_norm_eps, hc_eps) (vllm_ascend/models/glm5next/model.py:499-507), registered npu_hc_pre_v2_npu -> run_hc_pre_fusion (csrc/torch_binding.cpp:3255-3264); called once per sublayer seam from the layer's forward (vllm_ascend/models/glm5next/model.py:425-446) and through hc_post_pre (vllm_ascend/models/glm5next/model.py:536-545)"
+  mhc_post:
+    crosses: component
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "Glm5NextDecoderLayer.hc_post -> torch.ops._C_ascend.npu_hc_post(x, residual, post, comb) (vllm_ascend/models/glm5next/model.py:523-525), registered npu_hc_post_npu -> EXEC_NPU_CMD(aclnnHcPost) (csrc/torch_binding.cpp:1434); the last layer materialises its own (vllm_ascend/models/glm5next/model.py:484) and every other defers it into the next layer's pre (vllm_ascend/models/glm5next/model.py:536)"
+
+  # DSA's sparse main attention is ONE AscendC launch, not the three ops
+  # the naive plan spells it as. `sparse_mla` gathers the top-K KV entries
+  # inside the kernel — no score or softmax tensor reaches HBM — so the
+  # span is `flash_dsa`'s whole chain, exactly as it is on CUDA.
+  # Unbound, the three members priced separately and stayed `unplaced`
+  # (`missing_signature`) at 215 ms a step, larger than the attention
+  # class they belong to.
+  flash_dsa:
+    when:
+      architectures: [Glm5NextForConditionalGeneration]
+      device: [npu]
+    source_anchor: "sparse_mla -> torch.ops._C_ascend.npu_sparse_flash_attention(query, key=cache, value=cache, sparse_indices, sparse_mode=3, attention_mode=2) (vllm_ascend/attention/sfa_v1.py:172-245, the call at vllm_ascend/attention/sfa_v1.py:228); the profiler names it SparseFlashAttention"
+
+  fused_gdn_gating:
+    source_anchor: "fused_gdn_gating_patch (vllm_ascend/ops/triton/fused_gdn_gating.py:59-99, kernel vllm_ascend/ops/triton/fused_gdn_gating.py:14-56) via DeviceOperator.fused_gdn_gating (vllm_ascend/device/device_op.py:940-942), from AscendGatedDeltaNetAttention._forward_core (vllm_ascend/ops/gdn.py:680)"

@@ -18,6 +18,11 @@ audited_at:
   tag: v0.1.0
   commit: 553741557a57df44a46fb3ab72b6aafeaf945337
 
+# The devices DeepInfer runs on (`gpu_specs.csv` `device`). A deployment on any
+# other device is refused (`FrameworkBinding.deployed`); per-entry
+# `when: device` only narrows inside this list.
+devices: [cuda]
+
 # `ModelMetadata.resolved_tokens_per_block` is fixed at 128 for V4.1
 # (model_metadata_utils.py:134-135); engine args may only assert the same
 # value, never choose another (engine/arg_utils.py:80-97).

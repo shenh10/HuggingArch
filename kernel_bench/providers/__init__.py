@@ -275,6 +275,14 @@ class Library:
     """
     name: str
     pip: Tuple[str, ...] = ()
+    #: The DISTRIBUTION that ships one of this library's import gates, when
+    #: its name is not the module's. `_probe_version` asks the module for
+    #: `__version__`, then the distribution of the same name; `fla_npu` has
+    #: neither — the wheel is `flash-linear-attention-npu-a3` and the package
+    #: sets no version attribute — so the import succeeded and the gate still
+    #: read the kernel as absent. Named per library because it is an
+    #: installation fact, the same class as `pip`.
+    dist_name: str = ""
     #: The versions a kernel of this library may run on, when wider than what
     #: a fresh env installs (`pip`). The env installs one release; the gate
     #: still accepts any release the library's kernels run on, and the row
@@ -287,6 +295,22 @@ class Library:
     # env's torch from the build, so it fails before compiling; this
     # declares that the build must see the target env.
     no_build_isolation: bool = False
+    #: Which accelerator this library's kernels run on, in the sheet's
+    #: vocabulary (`gpu_specs.csv` `device`: `cuda`, `npu`). None: the
+    #: library is not bound to one (torch). This is the ONE stored device
+    #: fact for a library — `Env.device` is the box's; a CUDA-only library
+    #: on an NPU box is a mismatch even if the import gate passes, which
+    #: is how flashinfer was marked available on Ascend and its pages
+    #: (16/32/64) entered an NPU sweep.
+    device: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        from ..device import DEVICES
+        if self.device is not None and self.device not in DEVICES:
+            raise ValueError(
+                f"Library.device is one of {list(DEVICES)} or None "
+                f"(the `gpu_specs.csv` `device` vocabulary); "
+                f"got {self.device!r}")
 
     def spec_for(self, import_name: str) -> str:
         """The pip spec that constrains the module `import_name`, or "".
@@ -906,6 +930,16 @@ class Provider:
     # magnitude over the band; modelling the scale too takes it to exactly 0.
     # See `quant.SCALE_ENCODINGS`.
     weight_scale: str = "exact"
+    # The process-group axis this kernel reduces over, as the cell states
+    # it (`n_comm_ranks` for every collective in the catalog). None is a
+    # single process — the harness default. A signature whose shape
+    # projection is `collective` and that is not disabled must name it:
+    # otherwise a kernel that needs N ranks registers as the identity of
+    # one buffer. Declared here, not inferred from the signature, because
+    # the axis is an execution form of THIS kernel (HCCL on N dies) and
+    # a fused collective that is still disabled names the same axis
+    # without running.
+    world: Optional[str] = None
     # Why this kernel is registered but serves nothing. A kernel that measures
     # WRONG is disabled here rather than deleted: an empty gate leaves its cells
     # showing as a GAP in the coverage report, while deleting the registration
@@ -989,6 +1023,10 @@ class Provider:
         if self.disabled_reason:
             yield "disabled"
             return                 # a disabled kernel's scope is not the point
+        if self.world:
+            v = int(inv.dims.get(self.world, 0) or 0)
+            if v < 2:
+                yield f"world:{self.world}={v} needs a group"
         cell = inv.weight_granularity
         if cell is not None and cell not in self.weight_granularities:
             yield _not_served("weight_granularity", cell,
@@ -1024,6 +1062,8 @@ class Provider:
         if self.serves is None:
             return None
         out = self.serves.describe()
+        if self.world:
+            out["world"] = self.world
         if self.disabled_reason:
             out["disabled_reason"] = self.disabled_reason
         if self.unreached_reason:
@@ -1132,6 +1172,11 @@ class Provider:
     def unavailability(self, env: Env):
         """Why this kernel cannot run in `env` at all, clause by clause —
         `available` read for its reasons, as `refusals` is for `accepts`."""
+        if not self._device_ok(env):
+            want = self.lib.device
+            got = env.device or "no accelerator"
+            yield f"library device {want} does not run on {got}"
+            return
         if not env.has(self.import_name):
             yield f"{self.import_name} not importable"
             return
@@ -1173,6 +1218,21 @@ class Provider:
             return
         yield from self.refusals(inv, env)
 
+    def _device_ok(self, env: Env) -> bool:
+        """False when this library named an accelerator and the box is not it.
+
+        Unbound libraries (torch) allow on every box. An env that has not
+        named a device is unknown, not a mismatch — same as `_version_ok`
+        and `_sm_ok` on an unparseable `sm`: decline what is proven, do
+        not invent a skip. A CUDA-only library on an NPU env used to pass
+        because `_sm_ok` only refuses a stated `min_sm`, and flashinfer
+        states none.
+        """
+        want = self.lib.device
+        if want is None or env.device is None:
+            return True
+        return env.device == want
+
     def _sm_ok(self, env: Env) -> bool:
         """False only when this card is provably below the kernel's floor.
 
@@ -1180,7 +1240,18 @@ class Provider:
         harness declines what it can prove it cannot run, and does not invent
         a reason to skip otherwise.
         """
-        if self.min_sm is None or not env.sm:
+        if self.min_sm is None:
+            return True
+        # A kernel that states a compute-capability floor is a CUDA kernel:
+        # `sm` is CUDA's notion and only a CUDA env carries one. Off CUDA the
+        # floor cannot be met, so the provider is refused rather than let
+        # through by the gap — which is the direction that matters, since an
+        # unmet floor used to ADMIT (an Ascend box has no `sm` at all, so
+        # every CUDA-only kernel passed this gate and only the import gate
+        # stood between it and a measurement).
+        if env.device not in (None, "cuda"):
+            return False
+        if not env.sm:
             return True
         digits = "".join(c for c in str(env.sm) if c.isdigit())
         if not digits:
@@ -1306,7 +1377,39 @@ def register(p: Provider) -> None:
     _check_formats(p)
     _check_operand_enum(p)
     _check_closed_world(p)
+    _check_execution_world(p)
     _PROVIDERS.append(p)
+
+
+def _check_execution_world(p: Provider) -> None:
+    """A collective kernel names the axis it reduces over.
+
+    `world` is the process-group size as the cell states it. If the
+    kernel names one, it must be a structural axis of the signature —
+    inventing an axis here would be a second statement of the group.
+    A signature whose shape projection is `collective` and that is not
+    disabled must declare it: otherwise a kernel that needs N ranks
+    registers as the identity of one buffer. A disabled kernel may
+    still name it, so the reason it is off is the process model, not a
+    missing form.
+    """
+    from backend.inference.op_signatures import get_signature
+    sig = get_signature(p.signature)
+    if sig is None:
+        return
+    if p.world:
+        if p.world not in sig.structural_axes:
+            raise ValueError(
+                f"{p.library}:{p.kernel_impl} world={p.world!r} is not a "
+                f"structural axis of {sig.name!r} "
+                f"({list(sig.structural_axes)})")
+        return
+    if p.disabled_reason:
+        return
+    if sig.shape_projection == "collective":
+        raise ValueError(
+            f"{p.library}:{p.kernel_impl} serves collective {sig.name!r} "
+            f"and must declare `world` (the axis of the process group)")
 
 
 def _check_closed_world(p: Provider) -> None:
@@ -1573,10 +1676,12 @@ def discover() -> None:
     from . import quantise     # noqa: F401  (the activation cast, both ways)
     from . import compress_store  # noqa: F401  (the KV compressors' spans)
     from . import deepinfer  # noqa: F401  (DeepSeek's V4.1 runtime stack)
+    from . import ascend       # noqa: F401  (vLLM-Ascend on an Ascend NPU)
     _DISCOVERED = True
 
 
-def served_kv_block_sizes(signature: Optional[str] = None) -> Tuple[int, ...]:
+def served_kv_block_sizes(signature: Optional[str] = None,
+                          *, gpu: Optional[str] = None) -> Tuple[int, ...]:
     """Every paged-KV page some registered backend can serve, ascending —
     of `signature`'s backends when one is named. A page only another
     family's backend serves is no page this kernel runs at: vLLM forces an
@@ -1596,9 +1701,22 @@ def served_kv_block_sizes(signature: Optional[str] = None) -> Tuple[int, ...]:
     by the accident of another import pulling `indexer` in, and a page
     declared by a module added later would have been missed with nothing
     failing.
+
+    `gpu` is a sheet SKU. When named, only libraries that run on that
+    card's device contribute pages — otherwise the union of CUDA's 16/32/64
+    and Ascend's 128 is a page no deployment on either family allocates,
+    which is how 36 NPU rows were measured at FlashInfer's pages.
     """
+    device = None
+    if gpu:
+        from backend.inference.gpu_specs import get_gpu
+        spec = get_gpu(gpu)
+        if spec is None:
+            raise ValueError(f"unknown gpu {gpu!r}")
+        device = spec.device
     pages = {page for provider in all_providers()
              if signature is None or provider.signature == signature
+             if device is None or provider.lib.device in (None, device)
              for page in ((provider.serves.kv_block_sizes or ())
                           if provider.serves else ())}
     return tuple(sorted(pages))

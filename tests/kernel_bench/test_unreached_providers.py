@@ -39,7 +39,7 @@ from tools.unverified_providers import why
 
 def _env() -> Env:
     """Every library installed and an H100, so only SCOPE is under test."""
-    return Env(torch_version=None, cuda_available=True, device_name=None,
+    return Env(torch_version=None, device="cuda", device_name=None,
                gpu_sku="H100_SXM", peak_bw_gbps=None, sm="sm_90",
                libs={p.import_name: "0" for p in all_providers()})
 

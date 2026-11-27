@@ -486,6 +486,15 @@ def serialize_post_tree(post_tree, resolved_spec, *,
         # `<anchor>.<port>`. Mirrors the parallel case above.
         for absorbed_sid, port_name in match.get("absorbed_output_ports", ()):
             absorbed_to_port[absorbed_sid] = (_anchor(match), port_name)
+        # A member's SECONDARY output the launch publishes: keyed by the
+        # member and the origin port a pre-fusion ref names (`split.post`),
+        # so two tensors of one member reach two different ports.
+        for absorbed_sid, origin_port, port_name in match.get(
+                "absorbed_secondary_ports", ()):
+            absorbed_to_port[(absorbed_sid, origin_port)] = (
+                _anchor(match), port_name)
+    absorbed_sids = {key[0] if isinstance(key, tuple) else key
+                     for key in absorbed_to_port}
 
     # Per-template pre-fusion node index: {aggregation_id: pre SpecIRNode}.
     # Built per block for scope locality (each block's _expand_fused only
@@ -716,9 +725,16 @@ def serialize_post_tree(post_tree, resolved_spec, *,
                     new_inputs.append(f"{sid}/{inp}")
                     new_ports.append(port)
                     continue
-                pid_abs = _producer_id(inp, absorbed_to_port)
-                if pid_abs in absorbed_to_port:
-                    anchor_sid, anchor_port = absorbed_to_port[pid_abs]
+                pid_abs = _producer_id(inp, absorbed_sids)
+                origin_port = port or (
+                    inp[len(pid_abs) + 1:]
+                    if inp != pid_abs and inp.startswith(pid_abs + ".")
+                    else "")
+                key = ((pid_abs, origin_port)
+                       if (pid_abs, origin_port) in absorbed_to_port
+                       else pid_abs)
+                if key in absorbed_to_port:
+                    anchor_sid, anchor_port = absorbed_to_port[key]
                     new_inputs.append(
                         f"{anchor_sid}.{anchor_port}" if anchor_port
                         else anchor_sid)

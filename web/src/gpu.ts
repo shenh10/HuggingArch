@@ -10,7 +10,9 @@ export type GpuItem = {
   /** HBM bandwidth, GB/s. */
   mem_bw_gbps?: number;
   /** Per-direction link bandwidths, GB/s. */
-  nvlink_gbps?: number;
+  scaleup_gbps?: number;
+  /** The scale-up link's name (NVLink, HCCS, UB); set with `scaleup_gbps`. */
+  scaleup_fabric?: string;
   pcie_gbps?: number;
   rdma_gbps?: number;
   rdma_hop_latency_us?: number;
@@ -21,9 +23,9 @@ export function skuOf(g: GpuItem): string {
   return g.sku || g.name || g.id || "";
 }
 
-/** The intra-node link: NVLink when the SKU has one, else PCIe. */
+/** The intra-node link: the SKU's scale-up link when it has one, else PCIe. */
 export function intraNodeLink(g: GpuItem): string {
-  if (g.nvlink_gbps) return `NVLink ${g.nvlink_gbps} GB/s`;
+  if (g.scaleup_gbps) return `${g.scaleup_fabric} ${g.scaleup_gbps} GB/s`;
   if (g.pcie_gbps) return `PCIe ${g.pcie_gbps} GB/s`;
   return "—";
 }

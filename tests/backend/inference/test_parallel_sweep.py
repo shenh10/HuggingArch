@@ -30,6 +30,7 @@ from backend.inference.parallel_sweep import (
     layout_verdict, frontier_layouts, layout_label, config_for_degree,
     cloud_view, SweepCaps,
 )
+import backend.inference.framework_bindings as fb
 from backend.inference.sweep_grid import SWEEP_MAX_GPUS
 from backend.inference.card import Card
 from backend.inference.parallel_config import ParallelConfig
@@ -781,6 +782,49 @@ class TestSweepRobustness(unittest.TestCase):
         self.assertEqual(list(out["phases"]), ["decode"])
         self.assertTrue(out["phases"]["decode"])
 
+    def test_the_default_series_is_the_framework_s_own_device(self):
+        """The series a sweep defaults to is every card the framework runs
+        on — and only those. The sheet spans two devices; a default that
+        ignored `FrameworkBinding.devices` would walk vLLM onto an Ascend
+        card, which is `FrameworkNotOnDevice`, not a sweep point."""
+        import backend.inference.parallel_sweep as ps
+        from backend.inference.gpu_specs import get_gpu
+
+        ascend = [s for s in ps.DEFAULT_SWEEP_GPUS
+                  if get_gpu(s).device == "npu"]
+        self.assertTrue(ascend, "the sheet has no npu card to tell apart")
+
+        # vLLM-Ascend defaults to the npu cards, vLLM to none of them.
+        self.assertEqual(sorted(ps.default_sweep_gpus("vllm_ascend")),
+                         sorted(ascend))
+        self.assertFalse(set(ps.default_sweep_gpus("vllm")) & set(ascend))
+        # An absent framework reads as `DEFAULT_FRAMEWORK`, the same way
+        # the rest of the estimate reads it.
+        self.assertEqual(ps.default_sweep_gpus(),
+                         ps.default_sweep_gpus(fb.DEFAULT_FRAMEWORK))
+        # A framework off no device (`THEORY`) walks the whole sheet.
+        self.assertEqual(sorted(ps.default_sweep_gpus(fb.THEORY)),
+                         sorted(ps.DEFAULT_SWEEP_GPUS))
+
+    def test_an_explicit_off_device_card_is_still_refused(self):
+        """Filtering the DEFAULT does not forgive an explicit ask: naming
+        an Ascend card while running vLLM is the error it always was."""
+        import backend.inference.parallel_sweep as ps
+        from backend.inference.gpu_specs import get_gpu
+
+        ascend = next(s for s in ps.DEFAULT_SWEEP_GPUS
+                      if get_gpu(s).device == "npu")
+        llama = _cfg("meta-llama__Llama-3.2-1B.json")
+        payload = {
+            "config": llama, "model_id": "meta-llama/Llama-3.2-1B",
+            "gpu_skus": [ascend], "contexts": [1024],
+            "avg_output_tokens": 128, "parallel": ParallelConfig(),
+            "num_gpus": 1, "selection_mode": "theoretical_only",
+            "framework": "vllm",
+        }
+        with self.assertRaises(fb.FrameworkNotOnDevice):
+            ps._estimate_layout(payload)
+
     def test_a_layout_walks_once_per_card_class(self):
         """`_estimate_layout` over the default series walks each card CLASS
         once — on the class's roomiest card (`class_cards`) — and not once
@@ -794,7 +838,11 @@ class TestSweepRobustness(unittest.TestCase):
         from backend.inference.framework_bindings import card_class
         from backend.inference.gpu_specs import get_gpu
 
-        series = list(ps.DEFAULT_SWEEP_GPUS)
+        # The series a sweep that names no cards walks: the sheet is two
+        # devices now, and the default framework runs on one of them
+        # (`default_sweep_gpus`). Handing it the whole sheet instead would
+        # be an explicit off-device ask, which is `FrameworkNotOnDevice`.
+        series = ps.default_sweep_gpus()
         walked = []
         real = ps._capacity_preparation
 

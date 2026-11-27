@@ -28,7 +28,7 @@ def _provider(name):
 
 
 def _env():
-    return Env("2.13", True, "NVIDIA GeForce RTX 4090", "RTX-4090",
+    return Env("2.13", "cuda", "NVIDIA GeForce RTX 4090", "RTX-4090",
                1008.0, sm="sm_89", libs={"vllm": "0.32.0"})
 
 

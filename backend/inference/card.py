@@ -64,7 +64,8 @@ class CardPrice:
 
     Exhaustive over the sheet's price columns, which is why there is no
     third price type: `mem_gib` is `mem_total_bytes`, `mem_bw_gbps` and the
-    peak columns are `rooflines`, and `nvlink_gbps` / `pcie_gbps` /
+    peak columns are `rooflines`, and `scaleup_gbps` / `scaleup_fabric` /
+    `pcie_gbps` /
     `rdma_gbps` / `nvls` / `gpus_per_node` are `fabric`. `nvls` reaches
     only the fabric, which is why the memory-and-peaks half alone was never
     the whole price and every pricing site used to assemble the other half

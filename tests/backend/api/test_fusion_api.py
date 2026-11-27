@@ -57,7 +57,8 @@ class TestFusionRegistryEndpoint(unittest.TestCase):
         # Every shipped binding appears in the catalog, one per framework,
         # each labelled with the release it was audited at.
         by_fw = {b["framework"]: b for b in data["bindings"]}
-        self.assertEqual(sorted(by_fw), ["deepinfer", "sglang", "vllm"])
+        self.assertEqual(sorted(by_fw),
+                         ["deepinfer", "sglang", "vllm", "vllm_ascend"])
         for fw, b in by_fw.items():
             self.assertEqual(b["label"], f"{fw} (audited at {b['audited_at']['tag']})")
             self.assertTrue(b["binding_file"].endswith(f"{fw}.yaml"))

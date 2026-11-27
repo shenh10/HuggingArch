@@ -123,6 +123,11 @@ class DeploymentContext:
     #: dispatch audited only on the unsharded embedding path reads it; this
     #: is a request/deployment fact, not a graph-match condition.
     tensor_parallel: int = 1
+    #: The degree of the MoE expert-parallel world (`ParallelConfig.ep_moe`).
+    #: A framework that selects a different dispatch/combine kernel once the
+    #: experts are spread across ranks reads it. Same standing as
+    #: `tensor_parallel` — a deployment fact — and a separate world from it.
+    expert_parallel: int = 1
 
 
 @dataclass(frozen=True)
@@ -537,6 +542,13 @@ class _StoredRowIdentity(RowIdentity):
                  served: Mapping[str, int], dtype_env_json: str,
                  declined: str):
         self._served = dict(served)
+        # A stored row has no card beside it, so there is nothing to place
+        # its group against and `_reach_of` answers None — the key every
+        # collective row had before the reach axis existed. Stated rather
+        # than inherited: this class does not run `RowIdentity.__init__`,
+        # so an attribute it forgets is an attribute that does not exist.
+        self._ranks_per_host = None
+        self._ranks_per_scaleup_domain = None
         self._leaves = {}
         self._result = None
         self._program = None
@@ -676,7 +688,8 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         else binding.deployed(replace(
             binding.deployment,
             kv_block_size=deployment.kv_block_size,
-            tensor_parallel=deployment.tensor_parallel)))
+            tensor_parallel=deployment.tensor_parallel,
+            expert_parallel=deployment.expert_parallel)))
     bindings = op_bindings()
     op, shape_json, (shape_in, shape_out) = identity.of_event(row)
     signature = bindings.get(op)
@@ -777,11 +790,20 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
     binding = deployment.framework_binding
     served = (deployment.kv_block_size,
               None if binding is None else cell.analysis.program
-              .scan_chunk_size(binding.ssm_chunk_size_from))
+              .scan_chunk_size(binding.ssm_chunk_size_from),
+              None if binding is None else cell.analysis.program
+              .sinkhorn_iters(binding.hc_sinkhorn_iters_from))
+    # The card's domain sizes, for the collective cells that key on how far
+    # their group reaches. Part of the memo key beside the served choices:
+    # two deployments of one analysis on cards of different domain sizes
+    # place the same group differently, and must not share an identity.
+    served = served + _comm_domain_sizes(deployment.gpu_sku)
     identity = cell.identities.get(served)
     if identity is None:
         identity = cell.identities[served] = RowIdentity(
-            cell, kv_block_size=served[0], ssm_chunk_size=served[1])
+            cell, kv_block_size=served[0], ssm_chunk_size=served[1],
+            sinkhorn_iters=served[2], ranks_per_host=served[3],
+            ranks_per_scaleup_domain=served[4])
     return [point_row_of(row, identity, deployment, model_id=model_id,
                          spec_hash=spec_hash) for row in rows]
 
@@ -846,6 +868,7 @@ def build_deployment_context(
     """
     sig = parallel_signature(parallel)
     tp = 1 if parallel is None else parallel.tp_attention
+    ep = 1 if parallel is None else parallel.ep_moe
     return DeploymentContext(
         framework=framework,
         framework_binding=framework_binding,
@@ -853,7 +876,33 @@ def build_deployment_context(
         gpu_sku=gpu_sku,
         phase=phase,
         kv_block_size=deployment_kv_block_size(framework_binding, kv_block_size),
-        tensor_parallel=tp)
+        tensor_parallel=tp,
+        expert_parallel=ep)
+
+
+def _comm_domain_sizes(gpu_sku: Optional[str]
+                       ) -> Tuple[Optional[int], Optional[int]]:
+    """`(ranks_per_host, ranks_per_scaleup_domain)` for a SKU, for keying a
+    collective by how far its group reaches.
+
+    The second is None until a sheet row states a scale-up domain wider
+    than its chassis, and then `comm_reach` answers in two values exactly
+    as this module always has. An unknown SKU answers `(None, None)`: a
+    group whose placement nothing describes is keyed as every row before
+    the axis was, rather than on a guessed node size — the same refusal
+    `gpus_per_node` makes by raising rather than reading 8.
+    """
+    from .gpu_specs import get_gpu, gpus_per_node
+    if not gpu_sku:
+        return (None, None)
+    gpu = get_gpu(gpu_sku)
+    if gpu is None:
+        return (None, None)
+    try:
+        host = gpus_per_node(gpu)
+    except ValueError:
+        return (None, None)
+    return (host, None)
 
 
 def parallel_signature(parallel: Any) -> str:
@@ -910,7 +959,10 @@ def deployment_kv_block_size(framework_binding: Optional[Any],
 
     The request's value when it states one; otherwise the framework
     binding's own declared page, because the framework owns the cache
-    manager. `None` when neither says — sglang declares no page (it
+    manager. That declared page is the kernel page (`op_signatures.PAGE_AXIS`),
+    not the scheduler / KV-pool alignment a hybrid model may pick (640, or
+    2176/4352 under int8 KV on vLLM-Ascend): those numbers never key a
+    cell. `None` when neither says — sglang declares no page (it
     resolves one per attention backend) and `THEORY` has no binding and
     runs no kernels. A kernel that reads a paged cache then has no cell
     (the page is an axis of it, `op_signatures.PAGE_AXIS`) instead of one

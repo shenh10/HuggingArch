@@ -353,6 +353,72 @@ class TestModelIdValidation:
             assert "not a valid Hugging Face repo id" in resp.json()["detail"]
 
 
+class TestAscendSupernodeEdge:
+    """The Ascend 910C sheet row states the fabric inside its 768-die
+    supernode and leaves the NIC that leaves it empty -- that link has
+    never been observed. Driven through the route, not a hand-built
+    fabric: what has to hold is what an estimate answers."""
+
+    _MODEL = "zai-org/GLM-5.3-Flash"
+    _TP16: ClassVar[dict] = {
+        "tp_attention": 16, "tp_dense_ffn": 16, "tp_moe_expert": 16}
+
+    def _req(self, **kw):
+        snapshot_config(self._MODEL)  # missing snapshot -> skip
+        return InferenceEstimateRequest(
+            model_id=self._MODEL, gpu_sku="Ascend-910C-A3",
+            framework="vllm_ascend", avg_input_tokens=2048,
+            avg_output_tokens=128, selection_mode="theoretical_only", **kw)
+
+    def test_a_group_wider_than_the_supernode_is_refused_by_name(self):
+        """1024 ranks leave the 768-die domain over a link the row does not
+        describe. The answer is a refusal naming the column -- not a step
+        whose cross-domain bytes moved in zero seconds."""
+        from fastapi import HTTPException
+        wide = {name: 1024 for name in self._TP16}
+        with pytest.raises(HTTPException) as refused:
+            _run_route(self._req(parallel=wide))
+        assert refused.value.status_code == 400
+        assert "rdma_gbps" in refused.value.detail
+        assert "Ascend-910C-A3" in refused.value.detail
+
+    @pytest.mark.parametrize("world", [32, 8, 16, 64])
+    def test_a_group_inside_the_supernode_is_priced(self, world):
+        r = _run_route(self._req(parallel={n: world for n in self._TP16}))
+        for phase in ("prefill", "decode"):
+            assert r["phases"][phase]["t_comm_s"] > 0
+            assert not r["phases"][phase]["time_unpublished_reason"]
+        links = {row["comm_bw_label"]
+                 for row in r["per_op_timing_decode"] if row["comm_world"]}
+        assert links == {"HCCS"}
+
+    # Each case: prefill mesh, the request's stated link, and what the
+    # handoff must report (link, GB/s). The decode cluster is one chassis.
+    # First: the handoff that leaves the supernode with nothing stated --
+    # the one that would divide by an absent bandwidth.
+    @pytest.mark.parametrize("prefill_extra, stated, link, gbps", [
+        ({"dp_replicas": 48}, None, "RDMA", None),
+        ({}, None, "HCCS", 196.0),
+        ({}, 81.8, "stated", 81.8),
+        ({"dp_replicas": 48}, 25.0, "stated", 25.0),
+    ])
+    def test_the_kv_handoff_crosses_the_link_the_placement_gives(
+            self, prefill_extra, stated, link, gbps):
+        r = _run_route(self._req(
+            parallel={**self._TP16, **prefill_extra},
+            decode={"parallel": self._TP16}, kv_transfer_bw_gbps=stated))
+        kv = r["disagg_handoff"]["kv_transfer"]
+        assert (kv["link"], kv["link_bw_gbps"]) == (link, gbps)
+        if gbps is None:
+            assert r["prefill_deployment"]["cluster_size"] == 768
+            assert kv["handoff_latency_s"] is None
+            assert "rdma_gbps" in kv["unavailable_reason"]
+        else:
+            assert kv["handoff_latency_s"] == pytest.approx(
+                kv["per_request_kv_bytes"] / (gbps * 1e9))
+            assert kv["unavailable_reason"] == ""
+
+
 class TestDisaggregation:
     """Disaggregated serving: an optional `decode` deployment block runs
     estimate_capacity a SECOND time and stitches — prefill/TTFT from the

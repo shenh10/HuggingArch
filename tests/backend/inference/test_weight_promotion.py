@@ -194,7 +194,7 @@ def test_promoted_row_identity_resolves_to_the_torch_fp32_floor():
         "signature": signature, "op": op, "dims": json.loads(shape_json),
         "dtype_env": env, "phase": "prefill", "physical_key": [
             signature, shape_json, dtype_json, "prefill"]})
-    provider_env = Env("2.11", False, None, None, None,
+    provider_env = Env("2.11", None, None, None, None,
                        libs={"torch": "2.11"})
     providers = applicable(inv, provider_env)
     assert [(p.library, p.kernel_impl, p.impl_id(inv))

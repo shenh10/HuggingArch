@@ -29,6 +29,11 @@ audited_at:
   tag: v0.5.22
   commit: baa9befa381511cd4d56f83980951e5a45fffc6d
 
+# The devices sglang runs on (`gpu_specs.csv` `device`). A deployment on any
+# other device is refused (`FrameworkBinding.deployed`); per-entry
+# `when: device` only narrows inside this list.
+devices: [cuda]
+
 # The class sglang SERVES a checkpoint's declared architecture with, where
 # the two differ. sglang's V4.1 config normalizer rewrites `architectures:
 # ["DeepseekV41ForCausalLM"]` to `["DeepseekV4ForCausalLM"]`

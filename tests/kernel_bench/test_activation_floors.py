@@ -192,7 +192,7 @@ def test_a_measurable_activation_has_a_reference_and_a_floor_that_accepts():
     from kernel_bench.providers import all_providers
     from kernel_bench.refs import get_ref
 
-    env = Env(None, False, None, "H100-SXM", None)
+    env = Env(None, None, None, "H100-SXM", None)
     missing = {}
     for op in sorted(AUDITED_STANDALONE):
         signature = get_signature(op_signature(op))
@@ -227,7 +227,7 @@ def test_the_floors_run_the_frameworks_lowering_and_match_the_oracle():
     from kernel_bench.refs import get_ref
     from tests.kernel_bench._inputs import build_inputs
 
-    env = Env(None, False, None, "H100-SXM", None)
+    env = Env(None, None, None, "H100-SXM", None)
     for signature in sorted(AUDITED_STANDALONE):
         inv = _minimal_cell(signature)
         spec = get_ref(signature)

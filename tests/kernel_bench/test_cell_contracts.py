@@ -98,7 +98,7 @@ class TestTorchAsymmetricGqaFloor(unittest.TestCase):
                         if p.kernel_impl == "torch_sdpa")
         launched = provider.convert_inputs(inv, inputs)
         case = provider.build(
-            inv, Env("2.11", False, None, None, None,
+            inv, Env("2.11", None, None, None, None,
                      libs={"torch": "2.11"}), launched)
         with record() as traced:
             out = case.run()

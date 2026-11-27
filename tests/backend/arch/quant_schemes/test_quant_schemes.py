@@ -71,7 +71,7 @@ class TestSchemeRegistryLoad(unittest.TestCase):
     EXPECTED_SCHEMES = frozenset({"awq", "compressed-tensors", "fp4", "fp8", "fp8_ue8m0",
                                   "gptq", "modelopt", "mxfp4",
                                   "mxfp4-dot-suffix", "mxfp4-pack-quantized",
-                                  "nvfp4"})
+                                  "nvfp4", "modelslim-w8a8-dynamic"})
 
     def setUp(self):
         from backend.arch.quant_schemes import QUANT_SCHEMES

@@ -1,0 +1,49 @@
+# The hyper-connection PRE-mix as ONE launch — what vLLM-Ascend runs for
+# GLM-5.3-Flash (`torch.ops._C_ascend.npu_hc_pre_v2`, profiler `HcPre`).
+#
+# The component `hc_pre` walks as seven primitives: flatten the copies,
+# RMS-normalise the flat stream unscaled, project it onto the mix vector,
+# split that into `pre` / `post` / `comb` with the Sinkhorn projection on
+# the cross-mix, then weight the copies by `pre` and reduce them. The
+# device runs all seven in one kernel: 119.9 us at T=1024 on one 910C die,
+# against a launch floor near 35 us, so the eager chain is not what runs.
+#
+# What this launch does NOT absorb: the sublayer RMSNorm after it. The
+# plugin calls `torch_npu.npu_rms_norm` separately
+# (`vllm_ascend/models/glm5next/model.py:513`), and the profiler shows it
+# as its own `RmsNorm` kernel beside `HcPre`. It stays a billed node.
+#
+# THE SPLIT IS ABSORBED, and that is what this plan needed the port keying
+# for. `hc_split_sinkhorn` writes three tensors: `pre`, read by the reduce
+# inside this very component, and `post` / `comb`, read by the post-mix
+# OUTSIDE it. A launch that takes the whole pre-mix has to publish the
+# last two — one member, two ports. `FusedNode.output_ports` keyed a port
+# by its member alone until `secondary_ports` existed, so the second port
+# overwrote the first and the match was refused as a cut edge. The GPU
+# bindings leave the split outside for that reason
+# (`mhc_pre_big_fuse.yaml`); on Ascend it is inside the kernel, and the
+# estimate says so.
+
+fused_op: mhc_pre
+
+naive_pattern:
+  nodes:
+    flat:       { op: view_merge,             inputs: [external.residual] }
+    norm:       { op: rmsnorm_unscaled,       inputs: [flat.out] }
+    mixes:      { op: linear_external_weight, inputs: [norm.out, external.mix_weight] }
+    split:      { op: hc_split_sinkhorn,      inputs: [mixes.out, external.scale, external.base] }
+    w_expanded: { op: broadcast,              inputs: [split.out] }
+    weighted:   { op: mul,                    inputs: [external.residual, w_expanded.out] }
+    reduced:    { op: sum_reduce,             inputs: [weighted.out] }
+  io_mapping:
+    residual:   external.residual
+    mix_weight: external.mix_weight
+    scale:      external.scale
+    base:       external.base
+    output:     reduced.out
+    # The two coefficient sets the closing post-mix reads. Named `*_out`
+    # like every other secondary port in the registry, and both sit on ONE
+    # member — the split writes `pre` for the reduce inside this launch and
+    # these two for outside it.
+    post_out:   split.post
+    comb_out:   split.comb

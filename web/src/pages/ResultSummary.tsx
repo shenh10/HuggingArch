@@ -573,8 +573,10 @@ export type Estimate = {
   disagg_handoff?: {
     kv_transfer?: {
       per_request_kv_bytes?: number;
-      link_bw_gbps?: number;
-      handoff_latency_s?: number;
+      // Null where the card states no bandwidth for the link the handoff
+      // crosses (`unavailable_reason` says which): absent, not 0 GB/s.
+      link_bw_gbps?: number | null;
+      handoff_latency_s?: number | null;
     };
     rate_match?: {
       decode_to_prefill_time_ratio?: number;
@@ -583,6 +585,13 @@ export type Estimate = {
     };
   };
 };
+
+/** A link bandwidth in GB/s, or "—" where there is none to show: a link the
+ *  card does not state is not a link of 0 GB/s. */
+function fmtLinkBw(gbps: number | null | undefined): string {
+  if (gbps == null || !Number.isFinite(gbps) || gbps <= 0) return "—";
+  return gbps.toFixed(0) + " GB/s";
+}
 
 function fmtLatency(s: number | null | undefined): string {
   if (s == null || !Number.isFinite(s)) return "—";
@@ -640,7 +649,7 @@ export function ResultSummary({ result }: { result: Estimate }) {
             <ul className="list-disc list-inside space-y-0.5">
               <li>
                 KV transfer: <span className="font-mono">{formatGiB(kv.per_request_kv_bytes || 0)}</span> / request
-                {" "}over <span className="font-mono">{(kv.link_bw_gbps || 0).toFixed(0)} GB/s</span> link
+                {" "}over <span className="font-mono">{fmtLinkBw(kv.link_bw_gbps)}</span> link
                 {" "}→ <span className="font-mono">{fmtLatency(kv.handoff_latency_s)}</span> latency
               </li>
               <li>

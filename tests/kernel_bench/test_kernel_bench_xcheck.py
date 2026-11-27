@@ -671,7 +671,7 @@ class TestTorchGemmProviderEndToEnd:
     is rejected."""
 
     def test_torch_gemm_measured_and_passes_xcheck(self):
-        env = Env("cpu", cuda_available=False, device_name=None, gpu_sku="CPU",
+        env = Env("cpu", device=None, device_name=None, gpu_sku="CPU",
                   peak_bw_gbps=None, libs={"torch": torch.__version__})
         job = {
             "signature": "gemm", "op": "linear",
@@ -709,7 +709,7 @@ class TestTorchGemmProviderEndToEnd:
             "physical_key": ["gemm", _shape_key(dims), dtype_key,
                              "prefill"],
         }
-        env = Env("cpu", cuda_available=False, device_name=None,
+        env = Env("cpu", device=None, device_name=None,
                   gpu_sku="CPU", peak_bw_gbps=None,
                   libs={"torch": torch.__version__})
         res = run_jobs([job], env=env, date="2026-10-29", contributor="@t")
@@ -727,7 +727,7 @@ class TestTorchGemmProviderEndToEnd:
         # like the torch GEMM baseline); the provider reshapes the feature-last
         # grid to [B, C_in, H, W] and matches its own fp32 reference.
         # s_conv_grid=144 → H=12 grid; 3×3 stride-2 pad-1 → 6×6 output.
-        env = Env("cpu", cuda_available=False, device_name=None, gpu_sku="CPU",
+        env = Env("cpu", device=None, device_name=None, gpu_sku="CPU",
                   peak_bw_gbps=None, libs={"torch": torch.__version__})
         job = {
             "signature": "conv2d", "op": "conv2d",
@@ -851,7 +851,7 @@ class TestTheHyperConnectionSplitIsTheFrameworksFunction:
         assert [p.library for p in providers] == ["torch"], (
             "still the only provider: when a framework kernel is added, this "
             "span's agreement check becomes evidence rather than a tautology")
-        env = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+        env = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
         case = providers[0].build(inv, env, inputs)
         assert torch.allclose(case.to_canonical(case.run()).float(),
                               out.float(), atol=1e-5)

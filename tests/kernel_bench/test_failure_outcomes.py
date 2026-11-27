@@ -57,7 +57,7 @@ def _job(**over) -> dict:
     return job
 
 
-ENV = Env("2.11", False, None, None, None, libs={"torch": "2.11"})
+ENV = Env("2.11", None, None, None, None, libs={"torch": "2.11"})
 
 
 def _provider(build, impl="t_fail") -> Provider:
@@ -482,7 +482,7 @@ def test_report_counts_every_cell_and_implementation_in_nine_classes(
     assert report_statuses() == (
         "passed", "unverified", "oom", "mismatch", "error", "crash", "timeout",
         "not_supported", "pending")
-    env = Env(None, False, None, "H100-SXM", None)
+    env = Env(None, None, None, "H100-SXM", None)
     a, b = _provider(_right, impl="t_a"), _provider(_right, impl="t_b")
     declined = Provider(library="torch", signature="gemm", kernel_impl="t_no",
                         import_name="torch", build=_right,

@@ -248,8 +248,8 @@ def _tensor_bytes(dims, bytes_per_element):
 def _port_bpe(node, port, precision, program) -> float:
     """Width of one published tensor: the member that emits that port."""
     from backend.arch.eval.launch import FusedNode
-    ports = node.output_ports if isinstance(node, FusedNode) else {}
-    for origin, name in ports.items():
+    publishers = node.publishers() if isinstance(node, FusedNode) else ()
+    for origin, _origin_port, name in publishers:
         if (name or "out") == (port or "out"):
             member = program.by_uid(origin)
             if member is None:

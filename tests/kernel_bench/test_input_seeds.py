@@ -44,7 +44,7 @@ KERNEL_BENCH = PROJECT_ROOT / "kernel_bench"
 def _env(gpu_sku: str = "H100-SXM"):
     """A stated env: this file measures nothing, so the card is a label."""
     from kernel_bench.env import Env
-    return Env(torch_version="2.9.0", cuda_available=False,
+    return Env(torch_version="2.9.0", device=None,
                device_name=gpu_sku, gpu_sku=gpu_sku, peak_bw_gbps=3350.0)
 
 
@@ -265,6 +265,9 @@ class TestOneBatchOfInputsPerCell:
                 "library": "lib", "kernel_impl": tag, "signature": "gemm",
                 # The kernel computes at the cell's own precision.
                 "computes_at": None,
+                # A local kernel, not a collective: the driver reads `world`
+                # to decide whether a cell needs a process per rank.
+                "world": None,
                 "actual_computes_at": lambda self, inv: {},
                 "weight_group": None, "weight_scale": None,
                 "impl_id": lambda self, i: tag,

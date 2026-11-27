@@ -26,7 +26,8 @@ from backend.arch.eval.transforms import Deployment
 from backend.arch.ops import OP_REGISTRY
 from backend.arch.validate._rotary_positions import (
     config_position_axes, config_rotation, run_rotary_position_check)
-from backend.inference.framework_bindings import ServingDeployment, get_binding
+from backend.inference.framework_bindings import (
+    FrameworkNotOnDevice, ServingDeployment, get_binding)
 from backend.inference.fusion_plans import FUSION_SCHEMES
 from tests.snapshots import shared_loader
 
@@ -144,17 +145,21 @@ def test_output_gated_qwen_attention_runs_one_prologue_kernel():
 
 
 def test_the_gated_prologue_kernel_is_cuda_only():
-    """Off CUDA neither framework takes the prologue kernel; the mrope pair
-    is the multimodal rotary kernel again."""
-    program = Program.of(_resolved("Qwen__Qwen3.8-27B"))
-    binding = get_binding("vllm").deployed(
-        ServingDeployment.of(activation_dtype="BF16", device="rocm"))
-    analysis = Deployment(program).at(input_tokens=128).analyze()
-    fused, _ = Framework.of(binding, FUSION_SCHEMES).rewrite(
-        analysis.program, analysis)
-    ops = {n.op for n in fused.nodes() if not n.children}
-    assert "fused_qk_mrope" in ops
-    assert "fused_qk_rmsnorm_rope_gate" not in ops
+    """The prologue kernel is CUDA's, and two layers now say so.
+
+    The entry still states the device its dispatch asks, so a `when:` that
+    lost it goes red here. Above that, vLLM declares the devices it runs on
+    at all (`FrameworkBinding.devices`), so a deployment off them is
+    refused before any kernel is matched — which is why this no longer
+    walks a rocm deployment to see which rotation it takes."""
+    entries = get_binding("vllm").implementations_for(
+        "fused_qk_rmsnorm_rope_gate")
+    assert entries
+    for impl in entries:
+        assert all(when.device == ("cuda",) for when in impl.whens), impl
+    with pytest.raises(FrameworkNotOnDevice):
+        get_binding("vllm").deployed(
+            ServingDeployment.of(activation_dtype="BF16", device="rocm"))
 
 
 def test_minimax_m3_norms_and_rotates_q_and_k_in_one_launch():
