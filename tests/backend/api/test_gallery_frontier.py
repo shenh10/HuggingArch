@@ -189,19 +189,25 @@ def test_a_layout_draws_the_batches_that_fit_and_max_once():
     res = f._restamp_layout(
         _serving_law_record(max_batch=100), "B200", ParallelConfig(tp_attention=2))
     pts = _theory_at(res, GALLERY_SEQ_LENS[0])
-    assert sorted(_batch(p) for p in pts) == [1, 2, 4, 8, 16, 32, 64, 100]
+    # The max resolves to the rung: 100 -> 64 (`docs/sweep_card_class.md`
+    # §2.C). It coincides with b64, so the one point is named by the `max`
+    # display alias.
+    assert sorted(_batch(p) for p in pts) == [1, 8, 16, 32, 64]
+    assert [p["batch_key"] for p in pts if _batch(p) == 64] == ["max"]
     assert all(p["parallel"] == ParallelConfig(tp_attention=2).to_dict()
                for p in pts)
     assert _theory_at(res, GALLERY_SEQ_LENS[-1]) == []
-    assert len(FRONTIER_BATCH_GRID) == 12
+    assert len(FRONTIER_BATCH_GRID) == 10
 
 
 def test_a_batch_that_does_not_fit_is_not_drawn():
-    """62 requests fit per GPU: 64 and above are absent, max is 62 once."""
+    """62 requests fit per GPU: 64 and above are absent; max is the rung
+    (62 -> 32), coinciding with b32, so the one point is named `max`."""
     res = f._restamp_layout(
         _serving_law_record(max_batch=62), "B200", ParallelConfig(tp_attention=2))
     pts = _theory_at(res, GALLERY_SEQ_LENS[0])
-    assert sorted(_batch(p) for p in pts) == [1, 2, 4, 8, 16, 32, 62]
+    assert sorted(_batch(p) for p in pts) == [1, 8, 16, 32]
+    assert [p["batch_key"] for p in pts if _batch(p) == 32] == ["max"]
 
 
 def test_a_layout_with_no_room_for_a_request_draws_nothing():
@@ -317,17 +323,20 @@ def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
     entry = {"model_id": "m", "layouts": [], "error": None,
              "draft_unavailable": None}
     entry["_theory"] = f._restamp_layout(
-        _serving_law_record(max_batch=2, draft_max_batch=3,
+        _serving_law_record(max_batch=8, draft_max_batch=17,  # rung 16, above plain rung 8
                             speculative=True),
         "B200", ParallelConfig(tp_attention=2))["theory"]
     by_batch = {point["sol"]["phases"]["decode"]["batch"]: point
                 for point in entry["_theory"] if point["seq"] == sk}
-    assert 3 in by_batch and by_batch[3]["sol"]["phases"]["decode"][
+    assert 16 in by_batch and by_batch[16]["sol"]["phases"]["decode"][
         "binding"]["speculative_draft_tokens"] == 1
+    # The draft-only max rung coincides with b16, so the one point is named
+    # by the display alias every surface uses.
+    assert by_batch[16]["batch_key"] == "max"
     plain = f._read_entry(entry, f.FrontierView("B200"))
-    assert sorted(point["batch"] for point in plain["frontier"][sk]) == [2]
+    assert sorted(point["batch"] for point in plain["frontier"][sk]) == [8]
     k1 = f._read_entry(entry, f.FrontierView("B200", draft_tokens=1))
-    assert sorted(point["batch"] for point in k1["frontier"][sk]) == [3]
+    assert sorted(point["batch"] for point in k1["frontier"][sk]) == [16]
     for point in entry["_theory"]:
         at_k1 = f._at_view(point, f.FrontierView("B200", draft_tokens=1))
         if at_k1 is not None:
@@ -344,8 +353,8 @@ def test_a_plain_view_omits_a_batch_served_only_by_the_draft(monkeypatch):
             _fold_into(item["sol"]["phases"]["decode"], t_measured=0.02)
 
     monkeypatch.setattr(f, "measure_points", fold)
-    for view, want in ((f.FrontierView("B200"), {1, 2}),
-                       (f.FrontierView("B200", draft_tokens=1), {1, 2, 3})):
+    for view, want in ((f.FrontierView("B200"), {1, 8}),
+                       (f.FrontierView("B200", draft_tokens=1), {1, 8, 16})):
         folded.clear()
         rates = f._measured_rates(
             entry, lambda _i, _point: {"any": 1}, view, None)
@@ -786,7 +795,8 @@ def _built_entry(monkeypatch, cards=("B200",), calls=None):
     to constant points; these tests own Gallery's cache and fold behavior."""
     monkeypatch.setattr(f, "draft_refusal", lambda mid: None)
 
-    def restamp(_walked, _gpu_sku, cfg, _walk_key=None, _view=None):
+    def restamp(_walked, _gpu_sku, cfg, _walk_key=None, _view=None,
+                recordDigest=None):
         return {
             "theory": [
                 _timed_item(str(seq), measure_record="test-record",

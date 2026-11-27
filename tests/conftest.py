@@ -24,9 +24,25 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Trace bodies a test session records (`backend.code_trace.provider.TRACES`)
-# stay out of the user's cache; set before anything under `backend` imports.
-os.environ.setdefault("HA_CODE_TRACE_DIR",
-                      tempfile.mkdtemp(prefix="ha-code-traces-"))
+# and the sweep cache's machine-local projection tier stay out of the user's
+# caches. Set unconditionally: an inherited production directory must not make
+# tests read, write, or clear real entries. Tests that need a directory of
+# their own monkeypatch it after this.
+os.environ["HA_CODE_TRACE_DIR"] = tempfile.mkdtemp(prefix="ha-code-traces-")
+os.environ["HA_SWEEP_CACHE_DIR"] = tempfile.mkdtemp(prefix="ha-sweep-cache-")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_projection_cache():
+    """Keep one test's projected rows from answering another's fake record.
+
+    Production keys a projection by its canonical record identity. Tests also
+    replace the pool with hand-built records under that same identity, so the
+    durable tier is emptied around every test rather than trusted to be absent.
+    """
+    yield
+    from backend.inference.serving_projection import SERVING_PROJECTION
+    SERVING_PROJECTION.clear()
 
 
 class _ParsedYaml:
@@ -226,6 +242,19 @@ def resolved(spec_loader):
         return resolve_snapshot(model_id, spec_loader)
 
     return _resolve
+
+
+@pytest.fixture(autouse=True)
+def _fresh_class_overlays():
+    """The class overlay cache (`capacity._CLASS_OVERLAYS`) shares walks
+    across same-class SKUs within a process; a test that walks a model
+    would leave the next test reading that walk. Each test starts with
+    no shared overlay — the cache is a warm-time and serving-time
+    optimisation, not a test premise."""
+    import backend.inference.capacity as _capacity
+    _capacity._CLASS_OVERLAYS.clear()
+    yield
+    _capacity._CLASS_OVERLAYS.clear()
 
 
 @pytest.fixture(autouse=True)

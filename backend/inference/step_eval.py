@@ -217,10 +217,14 @@ def sampled_logit_positions(phase: str, s_verify: int = 1) -> int:
 #: How many readings of one cell's walk it keeps, per kind of reader
 #: (`Cell.serving`, `Cell.liveness`): the least recently read one goes
 #: first, and is built again if asked again.
-READINGS_KEPT = 32
+READINGS_KEPT = 64
 
 #: How many cells one registry keeps (`StepCells.cell`), the same way.
-CELLS_KEPT = 8
+#: A family's own cells are its phases and stack/media variants — two for
+#: a plain decode family — so a registry cap is a mis-keyed knob before it
+#: is a memory one; a walk family's true size is measured at the registry
+#: above (`walk_registry._family_size`).
+CELLS_KEPT = 16
 
 
 def _kept(table: "OrderedDict[Any, Any]", key: Any, build: Any) -> Any:

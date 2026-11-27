@@ -184,8 +184,8 @@ def _law_at(read: Mapping[str, Any], law: Any) -> Any:
 
 
 def _access_at(access: Optional[Mapping[str, Any]],
-               terms: Optional[List[Mapping[str, Any]]], read: Mapping[str, Any],
-               at: Any, cnt: int,
+               terms: Optional[List[Mapping[str, Any]]],
+               read: Mapping[str, Any], at: Any, cnt: int,
                written: Optional[List[Mapping[str, Any]]] = None
                ) -> Optional[Mapping[str, Any]]:
     """A row's access facts at a point: the walk's, except what moves with
@@ -197,11 +197,17 @@ def _access_at(access: Optional[Mapping[str, Any]],
     — which are one instance's share of the row law's weight read there."""
     if not access:
         return access
+
+    def share(value: int) -> Any:
+        """One instance's share, whole where the step's is."""
+        return (value // max(cnt, 1) if value % max(cnt, 1) == 0
+                else value / max(cnt, 1))
+
     # The cache read and the operand conversion are one instance's share of
     # the row law's at this point, like a gathered table's weight read.
     out = {**access,
-           "kv_bytes": at.kv_read / max(cnt, 1),
-           "convert_bytes": at.convert / max(cnt, 1)}
+           "kv_bytes": share(at.kv_read),
+           "convert_bytes": share(at.convert)}
     if terms is not None:
         out["in_terms"] = [
             [index, float(_law_at(read, term["fanout"])), width,
@@ -216,7 +222,7 @@ def _access_at(access: Optional[Mapping[str, Any]],
             for (width, _elements), term
             in zip(access["out_terms"], written, strict=True)]
     if access.get("weight_gathered") and access.get("weight_bytes") is not None:
-        out["weight_bytes"] = int(at.weight_read // max(cnt, 1))
+        out["weight_bytes"] = share(at.weight_read)
     return out
 
 
@@ -338,7 +344,8 @@ def _point_laws(row: Mapping[str, Any], *, breakdown: bool) -> Iterator[Any]:
 def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
             peak_flops: Optional[float], peak_bw: Optional[float],
             fabric: Fabric, breakdown: bool,
-            launch_s: float = 0.0, costs: bool = True) -> List[Dict[str, Any]]:
+            launch_s: float = 0.0, costs: bool = True,
+            _bared: bool = False) -> List[Dict[str, Any]]:
     """Each row read at the point `point` moves it to — the workload counts
     it sets by name (`{"B": 8}`, `{"s_input": 4096, "B": 1}`), the rest the
     row's own — on the card `peak_*`, `fabric` and `launch_s` describe: its
@@ -392,8 +399,14 @@ def rows_at(rows: List[Dict[str, Any]], point: Point, *, cell: Any,
         moved = point_at != point["point"]
         read = reading(point_at) if ask else None
         # Without breakdown, what the row showed at the walked point is not
-        # this point's.
-        row = dict(r) if breakdown else bare_row(r)
+        # this point's. `_bared`: the caller already holds the rows bare
+        # (`_point_rows` caches them per preparation — bare is
+        # point-independent and its filtering is the cost), so the copy a
+        # point starts from is `dict` of the cached one, never the cached
+        # one itself — the per-point columns below would otherwise write
+        # into the cache every point.
+        row = (dict(r) if breakdown
+               else dict(r) if _bared else bare_row(r))
         if costs:
             card = RowCard.of(r, peak_flops=peak_flops, peak_bw=peak_bw,
                               fabric=fabric, launch_s=launch_s)
@@ -461,6 +474,52 @@ def _stage_row(book: LawBook, law: Mapping[str, Any],
             "t_op_s": at.times.t_op}
 
 
+def pipeline_step_at(
+        pipeline: Mapping[str, Any], point_rows: List[Dict[str, Any]],
+        point: Point, peak_flops: Optional[float],
+        peak_bw: Optional[float], fabric: Fabric, *, cell: Any,
+        launch_s: float = 0.0,
+        draft_rows: Sequence[Mapping[str, Any]] = (),
+        draft_forwards: int = 0) -> tuple[Any, Dict[str, Any]]:
+    """A pipeline step at a point and on a card.
+
+    The one derivation every reader of `pipeline_time` takes: the bound
+    stage's rows are the rows already read there; every other stage is its
+    law read there (`_stage_row`); the step is their `StepSum`. A counted
+    draft joins the same sum when the caller has read its rows too. Returns
+    that sum and the `pipeline_time` record the phase publishes.
+    """
+    book, counts = cell.laws.book, point.counts
+    stages = [
+        point_rows if stage == pipeline["stage"] else
+        [_stage_row(book, law, counts,
+                    RowCard.of(law, peak_flops=peak_flops,
+                               peak_bw=peak_bw, fabric=fabric,
+                               launch_s=launch_s))
+         for law in laws]
+        for stage, laws in enumerate(pipeline["stage_laws"])]
+    step = StepSum.of(point_rows, stages=stages,
+                      rank_stage=pipeline["stage"],
+                      draft_rows=draft_rows,
+                      draft_forwards=draft_forwards)
+
+    def total(key: str) -> Any:
+        return step.total(lambda t: t.row[key])
+
+    by_bound = step.by_bound(lambda t: RowTimes.of_row(t.row))
+    priced = {
+        **dict(pipeline),
+        "t_compute": total("t_compute_s"),
+        "t_memory": total("t_memory_s"),
+        "t_comm": total("t_comm_s"),
+        "t_sol": total("t_op_s"),
+        "per_stage": [StepSum.of(stage_rows).total(
+            lambda t: t.row["t_op_s"]) for stage_rows in stages],
+        "t_sol_by_bound": dict(by_bound),
+    }
+    return step, priced
+
+
 def _speculation_of(binding: Dict[str, Any]) -> Speculation:
     """The speculation a phase's binding states, read the way the phase
     itself read it.
@@ -506,17 +565,6 @@ def phase_at(phase: Dict[str, Any], point_rows: List[Dict[str, Any]],
     # stays withheld here: its bytes and FLOPs re-price, its time does not.
     withheld = phase.get("time_unpublished_reason") or ""
 
-    stages = None
-    if pipeline is not None:
-        stages = [
-            point_rows if s == pipeline["stage"] else
-            [_stage_row(book, law, counts,
-                        RowCard.of(law, peak_flops=peak_flops,
-                                   peak_bw=peak_bw, fabric=fabric,
-                                   launch_s=launch_s))
-             for law in laws]
-            for s, laws in enumerate(pipeline["stage_laws"])]
-
     # A counted speculative draft is part of the step at every batch: its one
     # forward's rows rescale at the draft's own tokens per sequence, and the
     # step runs `forwards` of them.
@@ -529,10 +577,20 @@ def phase_at(phase: Dict[str, Any], point_rows: List[Dict[str, Any]],
                 "were not passed to the rescale")
         draft = SpeculativeDraft.from_wire(draft_wire)
         draft_cost = draft.price(draft_rows)
-    step = StepSum.of(point_rows, stages=stages,
-                      rank_stage=pipeline["stage"] if pipeline else None,
-                      draft_rows=draft_cost.rows if draft_cost else (),
-                      draft_forwards=draft_cost.draft.forwards if draft_cost else 0)
+    priced_pipeline = None
+    if pipeline is not None:
+        step, priced_pipeline = pipeline_step_at(
+            pipeline, point_rows, point, peak_flops, peak_bw, fabric,
+            cell=cell, launch_s=launch_s,
+            draft_rows=draft_cost.rows if draft_cost else (),
+            draft_forwards=(draft_cost.draft.forwards
+                            if draft_cost else 0))
+    else:
+        step = StepSum.of(
+            point_rows,
+            draft_rows=draft_cost.rows if draft_cost else (),
+            draft_forwards=(draft_cost.draft.forwards
+                            if draft_cost else 0))
 
     def column(key: str, *, account: bool = False) -> Any:
         return step.total(lambda t: t.row[key], account=account)
@@ -545,9 +603,6 @@ def phase_at(phase: Dict[str, Any], point_rows: List[Dict[str, Any]],
     total_comm = column("t_comm_s")
     total_op = column("t_op_s")
     by_bound = step.by_bound(lambda t: RowTimes.of_row(t.row))
-    per_stage = ([StepSum.of(stage_rows).total(lambda t: t.row["t_op_s"])
-                  for stage_rows in stages] if stages is not None else [])
-
     # Nothing is measured here: every term of the step waits for the
     # point's measured fold (`apply_measured`), which states the track.
     measured = MeasuredTrack.unread(len(step.terms))
@@ -673,12 +728,8 @@ def phase_at(phase: Dict[str, Any], point_rows: List[Dict[str, Any]],
                     "effective_tokens_formula": effective_formula},
         # The sums the times were published from, at this batch / card —
         # draft included, as at the anchor.
-        **({"pipeline_time": {
-            **pipeline, "per_stage": per_stage,
-            "t_compute": total_compute, "t_memory": total_memory,
-            "t_comm": total_comm, "t_sol": total_op,
-            "t_sol_by_bound": dict(by_bound)}}
-           if pipeline is not None else {}),
+        **({"pipeline_time": priced_pipeline}
+           if priced_pipeline is not None else {}),
         # The popovers the walk writes, written at this point by the same
         # function; the module table's expansion below fills the FLOPs and
         # t_sol lines as it does at the walk.
@@ -993,19 +1044,29 @@ def fold_chunk_point_measures(chunk_map: Mapping[str, Any],
     contexts, sol = [], []
     # Match each result back to the first source record.  Unsafe groups retain
     # their own records term-for-term; safe groups intentionally collapse to
-    # the first graph-row provenance.
+    # the first graph-row provenance.  The records are bucketed by key (in
+    # append order, so "first" means what it did when every output scanned
+    # every record) and each chunk's measure is parsed once — the scan was
+    # measured at a tenth of a sweep cell's time on chunked prefills.
+    by_key: Dict[Any, List[Any]] = {}
+    for record in records:
+        by_key.setdefault(record[0].key, []).append(record)
+    parsed: Dict[int, PointMeasure] = {}
     used = set()
     for out_index, out in enumerate(merged):
         source = next(
-            (record for record in records
-             if id(record) not in used and record[0].key == out.key
+            (record for record in by_key.get(out.key, ())
+             if id(record) not in used
              and _same_fold_law(record[0], out)),
             None)
         if source is None:
             raise ValueError("a merged chunk term lost its source provenance")
         used.add(id(source))
         _term, measure_chunk, measure_term, _record_index = source
-        measure = PointMeasure.from_json(measure_chunk["measure"])
+        measure = parsed.get(id(measure_chunk))
+        if measure is None:
+            measure = parsed[id(measure_chunk)] = PointMeasure.from_json(
+                measure_chunk["measure"])
         keys.append(None if measure.keys[measure_term] is None else out.key)
         launches.append(out.launches)
         unkeyed.append(measure.unkeyed[measure_term])

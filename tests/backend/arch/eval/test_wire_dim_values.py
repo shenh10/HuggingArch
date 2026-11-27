@@ -155,12 +155,17 @@ class TestTheEstimateResponseEncodes(unittest.TestCase):
 
     def setUp(self):
         snapshot_config(MOE.name)
+        # An explicit non-power-of-two batch: the `max` sentinel now
+        # resolves to the rung (a power of two), which makes every
+        # expert-token axis whole — the fractional encoding this test
+        # guards against rotting is exercised by a batch that divides
+        # unevenly (`docs/sweep_card_class.md` §2.C).
         self.result = estimate_capacity(
              config=json.loads(MOE.read_text())["config"],
             resolved=_resolved_moe(),
             gpu_sku="H100-SXM", num_gpus=8,
             avg_input_tokens=4096, avg_output_tokens=256,
-            parallel=ParallelConfig(),
+            parallel=ParallelConfig(), decode_batch_size=100,
         )
 
     def _axes(self):

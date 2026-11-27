@@ -191,6 +191,21 @@ def _max_workers() -> int:
     return max(0, min(16, cpu - 2))
 
 
+def _max_tasks_per_child() -> Optional[int]:
+    """How many jobs a worker runs before it is replaced.
+
+    A long warm keeps process-local derivation registries; without a bound
+    each worker's RSS grows with every model it has touched. Replacing a
+    worker releases all of that at once, while the pool keeps the other
+    workers and their warm loader state.
+    """
+    raw = os.environ.get("HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", "").strip()
+    if not raw:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
 def worker_count() -> int:
     """How many workers the pool runs (or would run)."""
     return _max_workers()
@@ -256,6 +271,7 @@ def _get_pool(min_workers: int = 2,
                 max_workers=workers, mp_context=ctx, initializer=_init_worker,
                 initargs=(_worker_imports, _worker_prepare,
                           default_loader_generation(), queue),
+                max_tasks_per_child=_max_tasks_per_child(),
             )
             _progress_q = queue
         except Exception:

@@ -97,7 +97,7 @@ from backend.api.offload import (
 from backend.arch.eval.precision import AS_SHIPPED
 from backend.arch.snapshots import iter_snapshot_ids
 from backend.inference.batch_sweep import measure_points
-from backend.inference.capacity import point_served
+from backend.inference.capacity import max_batch_rung, point_served
 from backend.inference.card import Card
 from backend.measure import lookup as _measure_lookup
 from backend.measure.auto_sweep import DECLINED, STATES, blend
@@ -144,6 +144,7 @@ from backend.inference.sol_data import (
 )
 from backend.inference.sol_data import sharedSolPool
 from backend.code_trace.provider import recording, run_recorded
+from backend.measure.timing import log_timing
 from backend.inference.sol_law import (
     draftForwardsLaw,
     servingLawCapacity,
@@ -387,7 +388,8 @@ def draft_refusal(model_id: str) -> Optional[str]:
 
 def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                     walk_key: Optional[ServingWalkKey] = None,
-                    view: Optional[FrontierView] = None) -> dict:
+                    view: Optional[FrontierView] = None,
+                    recordDigest: str = "unverified-record") -> dict:
     """One layout's serving law on `gpu_sku`, one of the class's
     cards: `{"theory": [point…], "draft_errors": […]}` — each point served
     on the card, its decode step as a function of the floors there, and for
@@ -422,7 +424,9 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                     servedOnly=True, floorForms=True)
             request = view.servingLawRequest(
                 walk_key, record["parallel"], draft_tokens=draft_tokens)
-            return projectServingLawPoints(record, request, floorForms=True)
+            return projectServingLawPoints(
+                record, request, floorForms=True, publicEnvelope=True,
+                recordDigest=recordDigest)
 
         def form(served: dict) -> dict:
             """The point's decode step as a function of the floors, moved
@@ -444,9 +448,15 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                         beyond_max_context=served["beyond_max_context"],
                         requests=batchPoint["decode_batch_size"] or 1):
                     continue
+                seen = byPoint.get((str(seq), served["phases"]["decode"]["batch"]))
+                if seen is not None:
+                    if batchPoint["key"] != "max":
+                        continue
+                    # A `max` rung that coincides with a `bN` rung is that
+                    # point once, named by the display alias readers filter on.
+                    theory.remove(seen)
                 item = _theory_item(
-                    str(seq), cfg,
-                    _batch_key(served["phases"]["decode"]["batch"]), served,
+                    str(seq), cfg, str(batchPoint["key"]), served,
                     measureRecord, form(served))
                 theory.append(item)
                 byPoint[(str(seq), served["phases"]["decode"]["batch"])] = item
@@ -482,7 +492,11 @@ def _restamp_layout(walked: dict, gpu_sku: str, cfg: ParallelConfig,
                         # A batch only the draft's capacity admits: a
                         # K-step point, with no plain step (`_at_view`).
                         item = _theory_item(
-                            str(seq), cfg, _batch_key(batch), served,
+                            str(seq), cfg,
+                            ("max" if batch == max_batch_rung(
+                                served["max_decode_batch_per_gpu"])
+                             else _batch_key(batch)),
+                            served,
                             None, None)
                         theory.append(item)
                         byPoint[(str(seq), batch)] = item
@@ -509,8 +523,12 @@ def _restamp(model_id: str, walk: dict, gpu_sku: str,
     (one serving-law record per layout any card of the class prices): the
     layouts a frontier on this card prices (`frontier_layouts`), each
     priced on it (`_restamp_layout`) and folded (`_fold`). No walk."""
-    walked = {json.dumps(w["parallel"], sort_keys=True): w["walk"]
-              for w in walk["layouts"]}
+    walked: Dict[str, dict] = {}
+    digests: Dict[str, str] = {}
+    for w in walk["layouts"]:
+        layout = json.dumps(w["parallel"], sort_keys=True)
+        walked[layout] = w["walk"]
+        digests[layout] = str(w.get("recordDigest", "unverified-record"))
     layouts = [ParallelConfig.from_dict(p)
                for p in walk["layoutsByCard"][gpu_sku]]
     walk_key = (
@@ -518,7 +536,10 @@ def _restamp(model_id: str, walk: dict, gpu_sku: str,
         if view is not None and view.keeps_walk() else None)
     results = [_restamp_layout(
                    walked[json.dumps(cfg.to_dict(), sort_keys=True)],
-                   gpu_sku, cfg, walk_key, view) for cfg in layouts]
+                   gpu_sku, cfg, walk_key, view,
+                   recordDigest=digests[
+                       json.dumps(cfg.to_dict(), sort_keys=True)])
+              for cfg in layouts]
     entry = _fold(model_id, layouts, results)
     if walk_key is not None:
         entry["_measurePool"] = walk_key.identity.key
@@ -1041,7 +1062,7 @@ class _Stored(NamedTuple):
         return self.serving_key(view).identity
 
     def keep_walk(self, view: FrontierView, walk: dict,
-                  traces: Optional[List[Any]] = None) -> None:
+                  traces: Optional[List[Any]] = None) -> bool:
         """Keep a model's class walk, when the view's is the kept one; each
         layout's record with the trace of the job that walked it (`traces`,
         in layout order)."""
@@ -1050,7 +1071,7 @@ class _Stored(NamedTuple):
         walk_key = self.serving_key(view)
         names = [StepLawKey.of_layout(walk_key, item["parallel"]).record_name
                  for item in walk["layouts"]]
-        return sharedSolPool.write(
+        wrote = sharedSolPool.write(
             walk_key.identity,
             zip(names, walk["layouts"], strict=True),
             traces=(dict(zip(names, traces, strict=True))
@@ -1062,6 +1083,17 @@ class _Stored(NamedTuple):
                 "facts": ServingWalkFacts.producer().to_json(),
                 "recordSchema": walkRecordSchema,
             })
+        if not wrote:
+            return False
+        # The fresh walk and a later pool reader must name the same projected
+        # rows. Attach the digests the pool just wrote before the entry is
+        # priced from the in-memory records.
+        for item, name in zip(walk["layouts"], names, strict=True):
+            digest = sharedSolPool.record_digest(
+                walk_key.identity.key, name)
+            if digest is not None:
+                item["recordDigest"] = digest
+        return True
 
     def shared_walk(self, view: FrontierView) -> Optional[dict]:
         """The class walk from the local SOL pool, or None on any miss.
@@ -1091,10 +1123,11 @@ class _Stored(NamedTuple):
         for record_name in recordIds:
             if record_name not in wantedNames:
                 continue
-            item = sharedSolPool.record(bundle_key, record_name)
-            if item is None:
+            record = sharedSolPool.record_with_digest(bundle_key, record_name)
+            if record is None:
                 return None
-            layouts.append(item)
+            value, digest = record
+            layouts.append({**value, "recordDigest": digest})
         return {**metadata, "layouts": layouts}
 
     def entry_key(self, view: FrontierView) -> str:
@@ -1564,6 +1597,7 @@ class _WarmLayoutWork:
     """One offline layout job, with the cost that ordered it in the queue."""
 
     model_id: str
+    gpu: str
     layout_index: int
     cost: int
     item: tuple[Any, ...]
@@ -1584,7 +1618,7 @@ def _warm_layout_works(
         for index, layout in enumerate(plan["layouts"]):
             gpus = ParallelConfig.from_dict(layout).cluster_size
             out.append(_WarmLayoutWork(
-                model_id=model_id, layout_index=index,
+                model_id=model_id, gpu=view.gpu_sku, layout_index=index,
                 cost=max(1, params) * int(gpus),
                 item=(model_id, plan["cards"],
                       float(view.gpu_memory_fraction),
@@ -1595,10 +1629,15 @@ def _warm_layout_works(
 
 def _layout_job(work: _WarmLayoutWork) -> tuple[dict, Any]:
     """One offline layout walk, isolated to that layout's own answer."""
+    started = time.perf_counter()
     try:
         return run_recorded(None, _layout_law, work.item)
     except Exception as exc:
         return ({"error": str(exc)}, None)
+    finally:
+        log_timing("layout_compute", model_id=work.model_id, gpu=work.gpu,
+                   layout_index=work.layout_index,
+                   elapsed_s=time.perf_counter() - started)
 
 
 async def warm_frontier(view: FrontierView,
@@ -1612,6 +1651,7 @@ async def warm_frontier(view: FrontierView,
     walk and Gallery entry the interactive path stores.
     """
     generation = spec_generation()
+    overall_started = time.perf_counter()
     model_ids = sorted(iter_snapshot_ids())
     head = _frontier_head(view)
     report_partial(head=head)
@@ -1622,8 +1662,17 @@ async def warm_frontier(view: FrontierView,
     track = await run_ranked(_view_scope, view)
 
     read_slots = asyncio.Semaphore(_model_concurrency())
+    reads_done = 0
+    reads_started = 0
 
     async def read_one(model_id: str) -> dict:
+        nonlocal reads_done, reads_started
+        reads_started += 1
+        read_started = time.perf_counter()
+        if reads_started <= 10 or reads_started % 10 == 0:
+            print(f"frontier {view.gpu_sku}: start read "
+                  f"{reads_started}/{len(model_ids)} · {model_id}",
+                  flush=True)
         async with read_slots:
             try:
                 return await run_ranked(
@@ -1632,6 +1681,16 @@ async def warm_frontier(view: FrontierView,
                 return {"drawn": _draw(
                     {"model_id": model_id, "layouts": [], "error": str(exc)},
                     view, "none", None)}
+            finally:
+                reads_done += 1
+                elapsed = time.perf_counter() - read_started
+                log_timing("read", model_id=model_id, gpu=view.gpu_sku,
+                           elapsed_s=elapsed)
+                if (reads_done <= 10 or reads_done % 10 == 0
+                        or elapsed >= 30):
+                    print(f"frontier {view.gpu_sku}: done read "
+                          f"{reads_done}/{len(model_ids)} · {model_id} · "
+                          f"{elapsed:.1f}s", flush=True)
 
     reads = list(await asyncio.gather(*[read_one(mid) for mid in model_ids]))
     drawings: dict[str, dict] = {}
@@ -1643,8 +1702,15 @@ async def warm_frontier(view: FrontierView,
             walks.append((model_id, got["walk"]))
 
     works = _warm_layout_works(walks, view, model_params)
+    started_at = time.perf_counter()
+    log_timing("gpu_start", gpu=view.gpu_sku, models=len(walks),
+               layouts=len(works))
+    top_works = ", ".join(
+        f"{work.model_id}#{work.layout_index}({work.cost:,})"
+        for work in works[:5])
     print(f"frontier {view.gpu_sku}: {len(walks)} models to walk · "
-          f"{len(works)} layouts · largest first", flush=True)
+          f"{len(works)} layouts · largest first · top {top_works}",
+          flush=True)
     outcomes: dict[str, list[tuple[dict, Any] | None]] = {
         model_id: [None] * len(plan["layouts"])
         for model_id, plan in walks
@@ -1653,7 +1719,20 @@ async def warm_frontier(view: FrontierView,
     finish_tasks: dict[str, Any] = {}
     layouts_done = 0
     models_done = 0
+    layout_seconds: dict[str, float] = {
+        model_id: 0.0 for model_id, _plan in walks}
     report_progress(0, len(works))
+
+    async def heartbeat() -> None:
+        """Say where the queue is even while a long layout owns a worker."""
+        while True:
+            await asyncio.sleep(60)
+            elapsed = time.perf_counter() - started_at
+            print(f"frontier {view.gpu_sku}: {layouts_done}/{len(works)} "
+                  f"layouts · {models_done}/{len(walks)} models · "
+                  f"{elapsed / 60:.1f}m", flush=True)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
 
     async def finish_one(model_id: str, plan: dict) -> dict:
         if outcomes[model_id]:
@@ -1662,15 +1741,27 @@ async def warm_frontier(view: FrontierView,
         else:
             answers, traces = [], []
         try:
+            finish_started = time.perf_counter()
             out = await run_ranked(
                 _finish_frontier, model_id, view, plan, answers,
                 track, traces, name=model_id)
+            finish_elapsed = time.perf_counter() - finish_started
             nonlocal models_done
             models_done += 1
+            log_timing(
+                "model", model_id=model_id, gpu=view.gpu_sku,
+                wall_s=time.perf_counter() - overall_started,
+                finish_s=finish_elapsed, layouts=len(plan["layouts"]),
+                layout_s=layout_seconds[model_id])
             print(f"frontier {view.gpu_sku}: {models_done}/{len(walks)} · "
                   f"{model_id}", flush=True)
             return out
         except Exception as exc:
+            log_timing(
+                "model", model_id=model_id, gpu=view.gpu_sku,
+                wall_s=time.perf_counter() - overall_started,
+                finish_s=0.0, layouts=len(plan["layouts"]),
+                layout_s=layout_seconds[model_id], error=str(exc))
             return _draw({"model_id": model_id, "layouts": [],
                           "error": str(exc)}, view, "none", None)
 
@@ -1684,6 +1775,7 @@ async def warm_frontier(view: FrontierView,
 
     async def layout(work: _WarmLayoutWork) -> None:
         nonlocal layouts_done
+        layout_started = time.perf_counter()
         try:
             outcomes[work.model_id][work.layout_index] = await run_ranked(
                 _layout_job, work, name=work.model_id)
@@ -1692,19 +1784,43 @@ async def warm_frontier(view: FrontierView,
                 {"error": str(exc)}, None)
         remaining[work.model_id] -= 1
         layouts_done += 1
+        elapsed = time.perf_counter() - layout_started
+        layout_seconds[work.model_id] += elapsed
+        log_timing(
+            "layout", model_id=work.model_id, gpu=view.gpu_sku,
+            layout_index=work.layout_index, elapsed_s=elapsed)
+        if layouts_done <= 10 or layouts_done % 10 == 0 or elapsed >= 30:
+            print(f"frontier {view.gpu_sku}: done layout "
+                  f"{layouts_done}/{len(works)} · {work.model_id}#"
+                  f"{work.layout_index} · {elapsed:.1f}s", flush=True)
         report_progress(layouts_done, len(works))
         for model_id, plan in walks:
             if model_id == work.model_id:
                 maybe_finish(model_id, plan)
                 break
 
-    await asyncio.gather(*[asyncio.create_task(layout(work))
-                           for work in works])
+    try:
+        await asyncio.gather(*[asyncio.create_task(layout(work))
+                               for work in works])
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
     finished = (await asyncio.gather(
         *(finish_tasks[model_id] for model_id in sorted(finish_tasks)))
         if finish_tasks else [])
     by_model = dict(zip(sorted(finish_tasks), finished, strict=True))
     models = [drawings.get(mid) or by_model[mid] for mid in model_ids]
+    for model_id in model_ids:
+        if model_id in drawings:
+            log_timing("model", model_id=model_id, gpu=view.gpu_sku,
+                       kept=True, wall_s=0.0, finish_s=0.0, layouts=0,
+                       layout_s=0.0)
+    log_timing("gpu_end", gpu=view.gpu_sku, models=len(walks),
+               layouts=len(works),
+               elapsed_s=time.perf_counter() - overall_started)
     ensure_spec_generation(generation)
     return {
         **head,

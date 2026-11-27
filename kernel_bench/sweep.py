@@ -234,7 +234,12 @@ def _per_gpu_ceiling(cap: Any, phase: str) -> int:
     `max_batch_per_gpu`, for decode; `max_prefill_batch` for prefill) — the
     same fields an estimate's `max` point runs at (`capacity._direct_batches`).
     `max_batch_total` (the cluster's count) never resolves a point."""
-    return int((cap.max_prefill_batch if phase == "prefill" else cap.max_batch) or 0)
+    # The `max` sentinel resolves through the one rule
+    # (`max_batch_rung`): the shape a measurement is built at is the
+    # rung, the exact ceiling a capacity fact.
+    from backend.inference.capacity import max_batch_rung
+    return max_batch_rung(cap.max_prefill_batch if phase == "prefill"
+                          else cap.max_batch)
 
 
 def _feasible_batches(

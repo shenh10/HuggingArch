@@ -929,10 +929,30 @@ that whole digest, and only then installs the archive. Smaller artifacts
 remain one `.tar.gz` object, and a pinned logical path finds its transport
 plan in `<artifact>.parts.json`.
 
-Gallery and Scaling project a serving-law record in-process. The compiled CSE
-graph is memoized by its law content for the process's lifetime; there is no
-durable projection cache or remote tier. Only the serving-law pool above is
-bootstrapped as an immutable artifact.
+Gallery and Scaling project a serving-law record through one projection owner
+(`serving_projection.projectServingLawPoints`). A whole public request widens
+to one envelope — every shared context and every public decode rung — and
+each surface narrows that envelope to the axes it serves (the Gallery's
+curated contexts and the public batch grid; Scaling's shared contexts and cloud
+ladder). A custom context or batch never widens. The richer floor-form row is
+the stored shape; a caller that did not ask for forms gets them stripped from
+its private copy.
+
+Those rows are kept in a bounded machine-local tier under
+`HA_SWEEP_CACHE_DIR/projection` (64 MiB in memory per process, and three
+eighths of `HA_SWEEP_CACHE_BYTES` on disk, beside the finished answers and
+unfinished steps that share the directory's one budget). The key carries the
+record's content digest plus only the substitution axes the projection reads
+(card, contexts, paired batches, prefixes, verify widths, draft tokens and law
+inputs). The record half is the pool slot digest the caller read the record
+with — never a second serialization of the record on a cache hit — and the
+same point set in a different request order is one entry, read back in each
+caller's order. This is below both response caches and is never
+published: it is an acceleration of the canonical law, not a second datum or a
+finished Gallery/Scaling answer. Installing a published sweep-answer artifact
+clears this machine-local tier with the directory's other derived tiers; the
+SOL pool can rebuild it. Only the serving-law pool above is bootstrapped as an
+immutable artifact.
 
 ### 8.3 Runtime warm
 
@@ -944,7 +964,7 @@ one minute, so the API opens first; the landing warm still runs before the
 full grid and folds the current measurement overlay onto the shared H100
 entries. The full warm materializes the public
 Scaling request matrix (`warm.scaling_jobs`: per featured model one parallel
-sweep over all modes and every routine context, and Context × Batch over
+sweep over all modes and every shared context, and Context × Batch over
 cards × modes × degrees) from the canonical laws, and folds the Gallery's measured tracks
 under the lake's real scope. The server process never warms itself: a warm
 inside it would compete with user requests for the GIL and the sweep pool.

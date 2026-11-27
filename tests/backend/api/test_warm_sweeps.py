@@ -113,15 +113,14 @@ def _frontend_first_visitor_body(model_id: str) -> dict:
     from web/src/pages/ScalingPanel.tsx (fetch body) + Inference.tsx (seeded
     defaults: frac 0.9, selection 'envelope', and Plan's output length
     `outTok` = 256, the routine grid's; precision as shipped, which the panel sends as no
-    `precision` at all). Its contexts are the routine grid (`SWEEP_SEQ_LENS`),
+    `precision` at all). Its contexts are the shared grid (`GALLERY_SEQ_LENS`),
     whichever context its dropdown shows. The panel does NOT send gpu_skus;
     framework defaults to '' → not sent. gpu_sku is a real SKU but is dropped
     from the parallel key."""
     return {
         "model_id": model_id,
         "gpu_sku": "H100-SXM",
-        "contexts": [1024, 2048, 4096, 8192, 16384, 32768, 131072, 262144,
-                     1048576],
+        "contexts": [1024, 4096, 16384, 131072, 262144, 1048576],
         "modes": ["dp_ep", "cp_ep", "tp_ep", "tp_tp"],
         "gpu_memory_fraction": 0.9,
         "avg_output_tokens": 256,
@@ -133,13 +132,13 @@ def _frontend_first_visitor_body(model_id: str) -> dict:
 def _frontend_batch_body(model_id: str, gpu: str, mode: str, degree: int) -> dict:
     """Literal Context × Batch SOL POST from ScalingPanel.tsx + compare.ts grids."""
     from backend.inference.sweep_grid import (
-        ROUTINE_SEQ_LENS,
+        GALLERY_SEQ_LENS,
         SCALING_PANEL_BATCH_GRID,
     )
     return {
         "model_id": model_id,
         "gpu_sku": gpu,
-        "seq_lens": list(ROUTINE_SEQ_LENS),
+        "seq_lens": list(GALLERY_SEQ_LENS),
         "batch_grid": [dict(bp) for bp in SCALING_PANEL_BATCH_GRID],
         "avg_output_tokens": 256,
         "parallel_preset": {"mode": mode, "degree": degree},
@@ -247,19 +246,19 @@ def test_a_long_tail_post_does_not_stop_the_next_post(isolated, monkeypatch):
     long-tail cell left every other worker idle.
     """
     _inf, warm, _calls = isolated
-    second_started = asyncio.Event()
+    parallel_started = asyncio.Event()
 
     async def fake_parallel(_req):
-        try:
-            await asyncio.wait_for(second_started.wait(), timeout=1)
-        except TimeoutError:
-            raise AssertionError(
-                "the second POST waited for the long tail") from None
-        return {"results": ["slow"]}
+        parallel_started.set()
+        return {"results": ["parallel"]}
 
     async def fake_batch(_req):
-        second_started.set()
-        return {"results_by_batch": ["next"]}
+        try:
+            await asyncio.wait_for(parallel_started.wait(), timeout=1)
+        except TimeoutError:
+            raise AssertionError(
+                "the next POST waited for the long tail") from None
+        return {"results_by_batch": ["batch"]}
 
     monkeypatch.setattr(warm, "compute_parallel_sweep_cached", fake_parallel)
     monkeypatch.setattr(warm, "compute_estimate_sweep_cached", fake_batch)
@@ -269,6 +268,32 @@ def test_a_long_tail_post_does_not_stop_the_next_post(isolated, monkeypatch):
     ])
 
     assert asyncio.run(warm.warm_sweeps(models=[MODEL])) == 2
+
+
+def test_batch_jobs_start_before_the_parallel_projection(isolated, monkeypatch):
+    """The warm's own order: panel batch cells first, the parallel response's
+    projection second. The order is an optimisation, not a correctness
+    dependency, so it is pinned here rather than inferred from pool timing."""
+    _inf, warm, _calls = isolated
+    started: list[str] = []
+
+    async def fake_parallel(_req):
+        started.append("parallel")
+        return {"results": ["parallel"]}
+
+    async def fake_batch(_req):
+        started.append("batch")
+        return {"results_by_batch": ["batch"]}
+
+    monkeypatch.setattr(warm, "compute_parallel_sweep_cached", fake_parallel)
+    monkeypatch.setattr(warm, "compute_estimate_sweep_cached", fake_batch)
+    monkeypatch.setattr(warm, "scaling_jobs", lambda *_args, **_kwargs: [
+        ("parallel", "projection", object()),
+        ("batch", "panel", object()),
+    ])
+
+    assert asyncio.run(warm.warm_sweeps(models=[MODEL])) == 2
+    assert started == ["batch", "parallel"]
 
 
 def test_pool_only_warm_bakes_laws_without_response_documents(isolated, monkeypatch):
@@ -285,25 +310,27 @@ def test_pool_only_warm_bakes_laws_without_response_documents(isolated, monkeypa
     assert calls.get("sweep", 0) == 0
 
 
-def test_parallel_jobs_include_default_model_once_with_every_context(monkeypatch):
-    """The default landing model (DeepSeek-V3) is warmed even if it is not in
-    the featured set — the single most common first hit — with ONE parallel
-    sweep that prices the routine context grid (the decode cloud's contexts,
-    `ROUTINE_SEQ_LENS`), not one sweep per dropdown context."""
+def test_parallel_jobs_sweep_every_model_once_default_first(monkeypatch):
+    """The sweeps cover EVERY model the Gallery warms — a swept model costs
+    no extra walk, its projections read the frontier's canonical one — with
+    the default landing model (DeepSeek-V3) first, and ONE parallel sweep
+    per model that prices the shared context grid (the decode cloud's
+    contexts, `GALLERY_SEQ_LENS`), not one sweep per dropdown context."""
     import backend.api.warm as warm
-    from backend.inference.sweep_grid import DEFAULT_INFER_MODEL, ROUTINE_SEQ_LENS
+    from backend.inference.sweep_grid import DEFAULT_INFER_MODEL, GALLERY_SEQ_LENS
 
     monkeypatch.setattr(
-        "backend.api.gallery_overview.featured_examples",
-        lambda *a, **k: ["org/Featured-A", DEFAULT_INFER_MODEL, "org/Featured-B"],
+        "backend.api.warm.iter_snapshot_ids",
+        lambda: iter(["org/Featured-A", DEFAULT_INFER_MODEL, "org/Featured-B"]),
     )
     jobs = [(label, req) for kind, label, req in warm.scaling_jobs(
         gpus=["B200"], modes=["dp_ep"], degrees=[8]) if kind == "parallel"]
     models = [req.model_id for _, req in jobs]
     assert models[0] == DEFAULT_INFER_MODEL              # default first
     assert models.count(DEFAULT_INFER_MODEL) == 1        # deduped (once)
+    assert len(models) == 3                              # every model, once
     for _, req in jobs:
-        assert req.contexts == list(ROUTINE_SEQ_LENS)
+        assert req.contexts == list(GALLERY_SEQ_LENS)
         assert 65536 not in req.contexts                 # no unmeasured 64K rung
         assert 1048576 in req.contexts                   # upper bound is 1M
 

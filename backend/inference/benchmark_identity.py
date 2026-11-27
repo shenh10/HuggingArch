@@ -42,7 +42,7 @@ import math
 import json
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import (Any, Dict, FrozenSet, List, Mapping, Optional, Tuple,
+from typing import (Any, Dict, FrozenSet, List, Mapping, NamedTuple, Optional, Tuple,
                     TYPE_CHECKING)
 from backend.code_trace.memo import memo_property, memoize
 
@@ -588,6 +588,18 @@ def _contract_identity(op: str, shape_in: Any, shape_out: Any,
                 dims[axis] = val
         return json.dumps(dims, separators=(",", ":"), sort_keys=True)
     return None
+
+
+class _KeyedAs(NamedTuple):
+    """What a row is keyed AS, decided once: the op, its leaf variants,
+    the signature and the operand ports. `RowIdentity.keyed_shape`
+    re-reads the row's shapes at every point against these — the values
+    half of `_keyed`, which is the structure half's only other reader
+    (the capture in `calibration_overlay`)."""
+    op: str
+    leaf: Dict[str, Any]
+    signature: Optional[Any]
+    ports: Any
 
 
 @dataclass(frozen=True)
@@ -1481,6 +1493,19 @@ class RowIdentity:
         self._node_by_sid: Dict[str, Any] = {}
         for node in self._program.nodes():
             self._node_by_sid.setdefault(str(node.aggregation_id), node)
+        #: What a row is keyed AS, decided once and replayed at every
+        #: point (`_RowTemplate` in calibration_overlay, which owns the
+        #: composition). Keyed by (row, deployment): a row's structure is
+        #: the walk's and the key's provenance is the deployment's.
+        self._row_templates: Dict[Tuple[Tuple[Any, ...], Tuple[Any, ...]], Any] = {}
+        #: The shape projection's own arguments, as one key: two
+        #: row-points that hand `identity_shape_from_shape_in` the same
+        #: shapes, spec dims and launch facts are the same cell — 6,124
+        #: distinct identities over 38,714 keyed calls on the probe job —
+        #: so the projection runs once per identity, not once per
+        #: row-point. A memo of this one function, not a second spelling
+        #: of it.
+        self._shape_json: Dict[Any, Optional[str]] = {}
 
     def _node_of(self, row: Dict[str, Any]) -> Optional[Any]:
         """The row's node, or None for a row that is not one (a template
@@ -1495,6 +1520,28 @@ class RowIdentity:
                 f"per-op row {sid!r} has no node in the program it was "
                 "produced from; refusing to key it")
         return node
+
+    def row_template(self, row: Mapping[str, Any],
+                     deployment_key: Tuple[Any, ...]) -> Optional[Any]:
+        """This row's structure half for that deployment, if it has been
+        captured (`calibration_overlay._RowTemplate`); None until then."""
+        return self._row_templates.get((self._row_key(row), deployment_key))
+
+    def remember_row_template(self, row: Mapping[str, Any],
+                              deployment_key: Tuple[Any, ...],
+                              template: Any) -> bool:
+        """Hold the row's captured structure half (`row_template`).
+        Whether one was already held: the production road cannot (the
+        lookup and the store use one key), so a caller's counter of it is
+        a tripwire, not a metric."""
+        key = (self._row_key(row), deployment_key)
+        replaced = key in self._row_templates
+        self._row_templates[key] = template
+        return replaced
+
+    @staticmethod
+    def _row_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+        return (row.get("uid"), str(row.get("aggregation_id") or ""))
 
     def leaf_of(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """This leaf's kernel variants (`s_window`, `sinks`), or empty.
@@ -1892,36 +1939,54 @@ class RowIdentity:
     def _keyed(self, row: Dict[str, Any], node: Optional[Any]
                ) -> Tuple[str, Optional[str], Tuple[Any, Any]]:
         op = self.op_of(row, node)
-        leaf = self.leaf_of(row)
-        walked, shape_out = self.one_event(row)
         signature = get_signature(op_signature(op))
-        ports = operand_ports_of(row, node, signature)
+        return self.keyed_shape(row, _KeyedAs(
+            op, self.leaf_of(row), signature,
+            operand_ports_of(row, node, signature)))
+
+    def keyed_shape(self, row: Mapping[str, Any], keyed_as: _KeyedAs
+                    ) -> Tuple[str, Optional[str], Tuple[Any, Any]]:
+        """The key half of `_keyed` at this point: the row's shapes as the
+        launch runs them, the identity they key and the operand form it is
+        read from — `keyed_as` deciding what does not move with the point
+        (`_KeyedAs`), the shapes re-read off the row here. This is the
+        values half `point_row_of` replays; `_keyed` (the capture road)
+        is the same composition with a freshly decided `keyed_as`."""
+        walked, shape_out = self.one_event(row)
         forms = stored_operands(
-            None if signature is None
-            else signature.at_ports(ports, op=op), walked,
-                                _fanouts(row), _headless_stores(row))
+            None if keyed_as.signature is None
+            else keyed_as.signature.at_ports(keyed_as.ports,
+                                             op=keyed_as.op),
+            walked, _fanouts(row), _headless_stores(row))
         for shape_in in forms:
-            shape_json = self._identity(op, row, leaf, shape_in, shape_out,
-                                        exact=shape_in is walked, ports=ports)
+            shape_json = self._identity(keyed_as.op, row, keyed_as.leaf,
+                                        shape_in, shape_out,
+                                        exact=shape_in is walked,
+                                        ports=keyed_as.ports)
             if shape_json is not None:
                 break
         else:
             shape_in = walked
-        return op, attach_gqa_sinks(shape_json, bool(leaf.get("sinks"))), (
-            shape_in, shape_out)
+        return keyed_as.op, attach_gqa_sinks(
+            shape_json, bool(keyed_as.leaf.get("sinks"))), (shape_in, shape_out)
 
     def _identity(self, op: str, row: Dict[str, Any], leaf: Dict[str, Any],
                   shape_in: Any, shape_out: Any, *, exact: bool,
                   ports: Any = None) -> Optional[str]:
         """The identity shape of `row` read off `shape_in` — the walk's
         shapes (`exact`: their exact extents apply) or a stored form of
-        them (`stored_operands`)."""
+        them (`stored_operands`). The projection is memoised by its own
+        arguments on the identity: a row-point that hands it the shapes,
+        spec dims and launch facts of an identity already derived is that
+        identity, measured at 6,124 of them over 38,714 keyed calls on
+        the probe job — a memo of this one function, not a second
+        spelling of it, and off for an argument that carries nothing
+        hashable."""
         # A launch on a routed buffer runs its own geometry (`one_event`),
         # not the law's extents: the experts that receive rows, padded. The
         # law's exact extents would put every expert the rank holds back.
         launched = routed_launch(row) is not None
-        return identity_shape_from_shape_in(
-            op, shape_in,
+        args = dict(
             shape_out=shape_out,
             shape_in_exact=(row.get("shape_in_exact")
                             if exact and not launched else None),
@@ -1950,6 +2015,38 @@ class RowIdentity:
             # Which port each operand fills (`operand_ports_of`).
             operand_ports=ports,
         )
+        key = _memo_key(op, shape_in, args)
+        if key is not None:
+            hit = self._shape_json.get(key, _MEMO_MISS)
+            if hit is not _MEMO_MISS:
+                return hit
+        out = identity_shape_from_shape_in(op, shape_in, **args)
+        if key is not None:
+            self._shape_json[key] = out
+        return out
+
+
+#: The memo's absent-value marker: a projection that refused (`None`) is a
+#: result, not a miss.
+_MEMO_MISS = object()
+
+
+def _memo_key(op: str, shape_in: Any,
+              args: Mapping[str, Any]) -> Optional[str]:
+    """One projection call's own arguments as one key: the repr of their
+    fixed-order tuple. The arguments are plain data — numbers, strings,
+    tuples, frozen dataclasses — built the same way at every call, so
+    their repr is deterministic and distinguishes values; a structure
+    whose repr raises is simply not memoised. (A hashable-tuple key was
+    measured at ten times this cost over one probe job — the recursive
+    conversion, not the dictionary, was the price.)"""
+    try:
+        return repr((op, shape_in, args["shape_out"],
+                     args["shape_in_exact"], args["shape_out_exact"],
+                     args["spec_dims"], args["comm"], args["routed_rows"],
+                     args["operand_ports"]))
+    except Exception:
+        return None
 
 
 # Rotary embedding, fused over Q and K. The engine hands the two rotated

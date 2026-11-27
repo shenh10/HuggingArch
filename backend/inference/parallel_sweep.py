@@ -69,6 +69,7 @@ from backend.measure.lookup import MeasurementsUnavailable
 from .weight_breakdown import shard_degrades
 from .batch_sweep import measure_points
 from .capacity import (
+    max_batch_rung,
     CapacityKnobs,
     ContextAnchors,
     _capacity_walk,
@@ -611,12 +612,18 @@ def decode_rungs(ladder: Sequence[int], *, ceiling: Any) -> Dict[str, int]:
     extrapolates rather than dropping it. So this asks `capacity.fits`, not
     `point_served`. The one statement for both roads a layout's ladder is
     priced on: the direct walk (`_decode_ladder`) and a canonical record's
-    projection (`sweep_runtime._sharedWalkResults`)."""
+    projection (`sweep_runtime._sharedWalkResults`). A `max` rung that
+    coincides with a `bN` rung is one point, named by the display alias."""
     ceiling = int(ceiling or 0)
+    max_rung = max_batch_rung(ceiling)
     out = {f"b{int(b)}": int(b) for b in ladder
-           if fits(max_batch_per_gpu=ceiling, requests=int(b))}
+           if fits(max_batch_per_gpu=ceiling, requests=int(b))
+           and int(b) != max_rung}
     if ceiling >= 1:
-        out["max"] = ceiling
+        # The `max` rung resolves through the one rule
+        # (`max_batch_rung`): the point the panels draw is the rung,
+        # the exact ceiling stays a capacity fact.
+        out["max"] = max_rung
     return out
 
 

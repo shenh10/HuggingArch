@@ -9,7 +9,8 @@ and absence constructors.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Mapping,
+                    Optional, Sequence)
 
 from .frontier import POINT_DIMS, PointRefusal, absent_point, cloud_point
 
@@ -129,7 +130,7 @@ def estimate_records(
     *,
     seq_lens: Sequence[int],
     verify_widths: Sequence[int],
-    batch_points: Sequence[tuple[Optional[str], Optional[int]]],
+    batch_points: Sequence[tuple[Optional[str], Optional[int], Optional[int]]],
     estimates: Sequence[Sequence[Any]],
     gpu_sku: str,
     parallel: Any,
@@ -144,12 +145,41 @@ def estimate_records(
     to keep this module below capacity's preparation layer: a point whose
     requests do not fit is capacity-refused; one that fits past the model's
     published context keeps its values, flagged — the parallel cloud's rule
-    (`parallel_sweep.decode_rungs`).
+    (`parallel_sweep.decode_rungs`). A `max` point whose rung is an explicit
+    `bN` point is that point once, named by the display alias (`max`), not
+    two coordinates for one step.
     """
+
+    def displayed(points: Sequence[Any]) -> Iterator[int]:
+        """One index per resolved (prefill, decode) batch; `max` names it.
+
+        The request's grid is display vocabulary. What exists is the batch
+        the estimate ran, and a `max` whose rung equals a `bN` rung is that
+        rung — one cloud point, with the alias a reader filters on.
+        """
+        groups: Dict[Any, List[int]] = {}
+        for index, est in enumerate(points):
+            phases = (est or {}).get("phases") or {}
+            def resolved(name: str, requested: Any) -> Any:
+                if requested is not None and int(requested) > 0:
+                    return int(requested)
+                value = (phases.get(name) or {}).get("batch")
+                return value if value is not None else (name, index)
+
+            batch = (("error", index) if not est else
+                     (resolved("prefill", batch_points[index][1]),
+                      resolved("decode", batch_points[index][2])))
+            groups.setdefault(batch, []).append(index)
+        for indices in groups.values():
+            yield next((index for index in indices
+                        if batch_points[index][0] in (None, "max")),
+                       indices[0])
+
     for seq, verify, points in zip(seq_lens, verify_widths, estimates,
                                    strict=True):
-        for (key, _prefill, decode), est in zip(batch_points, points,
-                                                strict=True):
+        for index in displayed(points):
+            key, _prefill, decode = batch_points[index]
+            est = points[index]
             coordinates = point_coordinates(
                 parallel=parallel, num_gpus=num_gpus, gpu_sku=gpu_sku,
                 context=seq,

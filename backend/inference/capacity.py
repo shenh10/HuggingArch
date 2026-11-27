@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
 from typing import (Callable, FrozenSet, Any, Dict, Iterable, Iterator, List,
                     Literal, Mapping, NamedTuple, Optional, Tuple, Union)
@@ -56,7 +57,7 @@ from .intensity import arithmetic_intensity
 from .prefill_geometry import PrefillChunkSchedule, PrefillEndpointGeometry
 from .batch_sweep import (measure_points, phase_at, point_measures,
                           fold_chunk_point_measures, rows_at, step_measure)
-from .row_roofline import (PHASE, ROW, CardForm, FloorForm, LawBook,
+from .row_roofline import (PHASE, ROW, CardForm, FloorForm, LawBook, bare_row,
                            RowRoofline, StepSum, column_names)
 from backend.measure.auto_sweep import Cell
 from .speculative_draft import ForwardFull, SpeculativeDraft
@@ -645,12 +646,17 @@ def _point_batches(ceilings: CapacityCeilings, *,
     card's own ceiling (None / "max"). Without the override every point used
     to rescale to the max, so `estimate-parallel-sweep` returned identical
     throughput for a fixed batch and "max"."""
+    # A caller-pinned batch clamps to the card's exact capacity (its own
+    # semantics); the `max` sentinel resolves through `max_batch_rung` —
+    # the one rule (`docs/sweep_card_class.md` §2.C).
     pre_cap = max(1, int(ceilings.max_prefill_batch or 1))
     dec_cap = max(1, int(ceilings.max_batch or 1))
+    pre_max, dec_max = (max_batch_rung(ceilings.max_prefill_batch),
+                        max_batch_rung(ceilings.max_batch))
     pre_b = (min(pre_cap, max(1, int(prefill_batch_override)))
-             if prefill_batch_override else pre_cap)
+             if prefill_batch_override else pre_max)
     dec_b = (min(dec_cap, max(1, int(decode_batch_override)))
-             if decode_batch_override else dec_cap)
+             if decode_batch_override else dec_max)
     return {"per_op_timing": pre_b, "per_op_timing_decode": dec_b,
             "per_op_timing_draft": dec_b}
 
@@ -662,11 +668,12 @@ def _direct_batches(ceilings: CapacityCeilings, *,
     (`_capacity_pending`), by row list: prefill the override (`-1` its
     activation-bound ceiling) or 1; decode the override or the KV-bound
     ceiling; a phase is never walked below one request."""
-    pre = (ceilings.max_prefill_batch if prefill_batch_override == -1
+    pre = (max_batch_rung(ceilings.max_prefill_batch)
+           if prefill_batch_override == -1
            else int(prefill_batch_override) if prefill_batch_override is not None
            else 1)
     dec = (int(decode_batch_override) if decode_batch_override is not None
-           else ceilings.max_batch)
+           else max_batch_rung(ceilings.max_batch))
     pre, dec = max(1, int(pre or 1)), max(1, int(dec or 1))
     return {"per_op_timing": pre, "per_op_timing_decode": dec,
             "per_op_timing_draft": dec}
@@ -757,23 +764,45 @@ def _point_rows(base: dict, p_dst: _CapacityPreparation, batches: Mapping[str, i
             # A row list the estimate has none of (no draft is counted).
             out[key] = []
             continue
-        rows = []
-        for r in base.get(key) or []:
-            adt = r.get("act_dtype")
-            peak = (leaf_peak(p_dst.gpu, adt)
-                    if adt and p_dst.gpu is not None else None)
-            # A point's rows are keyed at the point (another card, another
-            # batch): they carry no measurement until the sweep's lookup.
-            rows.append({**{k: v for k, v in r.items()
-                            if k not in ("measured_state", "measured_key",
-                                         "measured_reason")},
-                         "t_measured_s": None,
-                         "peak_flops_per_sec_for_op": float(peak) if peak else 0.0})
+        # The copy below the point: every point of one preparation moves the
+        # SAME base rows on the SAME card, and the copy a point starts from
+        # (measurement columns dropped, the leaf's peak stamped) reads
+        # nothing of the point — a sweep asks a hundred and thirty points
+        # off one pending, each of which re-copied them. Cached on the
+        # pending by preparation, with the bare row beside it (what
+        # `rows_at` computes for a reading with no breakdown — also
+        # point-independent, also re-computed per point).
+        cache = pending._point_rows_pre
+        entry = cache.get((id(p_dst), key))
+        if entry is None or entry[0] is not p_dst:
+            rows = []
+            for r in base.get(key) or []:
+                adt = r.get("act_dtype")
+                peak = (leaf_peak(p_dst.gpu, adt)
+                        if adt and p_dst.gpu is not None else None)
+                # A point's rows are keyed at the point (another card,
+                # another batch): they carry no measurement until the
+                # sweep's lookup.
+                rows.append({**{k: v for k, v in r.items()
+                                if k not in ("measured_state", "measured_key",
+                                             "measured_reason")},
+                             "t_measured_s": None,
+                             "peak_flops_per_sec_for_op": (float(peak)
+                                                           if peak else 0.0)})
+            # The bare row for a no-breakdown reading: `bare_row` of the
+            # copy above equals `bare_row` of the base row (the columns it
+            # drops and these share none), and it is idempotent, so
+            # `rows_at`'s own pass over it strips nothing more.
+            entry = cache[(id(p_dst), key)] = (p_dst, rows,
+                                                [bare_row(r) for r in rows])
+        bared = not breakdown
+        moved_from = entry[2] if bared else entry[1]
         out[key] = rows_at(
-            rows, Point({**point.counts, "B": batch, "s_verify": widths[key]}),
+            moved_from, Point({**point.counts, "B": batch,
+                               "s_verify": widths[key]}),
             cell=pending.walk_of_rows[key].analysis, peak_flops=p_dst.peak_flops,
             peak_bw=p_dst.peak_bw, fabric=fabric, breakdown=breakdown,
-            launch_s=launch_s, costs=costs)
+            launch_s=launch_s, costs=costs, _bared=bared)
     return out
 
 #: The row and phase columns that add across repeated launches, derived from
@@ -2355,9 +2384,17 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
         # loop would need) — so no point can be served another width's or
         # another card's fold.
         endpoints: Dict[Any, Dict[str, Any]] = {}
+        by_batches: Dict[Tuple[int, int], dict] = {}
         for (_key, pb, db) in cell.points:
             batches = _direct_batches(ceilings, prefill_batch_override=pb,
                                       decode_batch_override=db)
+            signature = (int(batches["per_op_timing"]),
+                         int(batches["per_op_timing_decode"]))
+            if signature in by_batches:
+                # A `max` whose rung is a `bN` is that point's display
+                # alias, not a second substitution, fold or measurement.
+                points.append(by_batches[signature])
+                continue
             rows = _point_rows(base, pw, batches, pending, at.point,
                                breakdown=False)
             rows, keys = pending.keyed_at(rows, gpu_sku=pw.gpu_sku)
@@ -2371,11 +2408,13 @@ def _sweep_cell(p: _CapacityPreparation, cell: Cell,
             if not point.get("infeasibility_reason"):
                 point = _fold_chunked_prefill_sol(
                     point, pw, pending, endpoint_schedule, endpoints)
-            points.append({"sol": point, "measures": {}
-                           if keys is None or point.get("infeasibility_reason")
-                           else _point_measures_with_chunks(
-                               rows, keys, pw, pending, point["phases"],
-                               schedule=endpoint_schedule, endpoints=endpoints)})
+            entry = {"sol": point, "measures": {}
+                     if keys is None or point.get("infeasibility_reason")
+                     else _point_measures_with_chunks(
+                         rows, keys, pw, pending, point["phases"],
+                         schedule=endpoint_schedule, endpoints=endpoints)}
+            by_batches[signature] = entry
+            points.append(entry)
         yield index, points
 
 
@@ -2450,6 +2489,26 @@ def estimate_capacity_sweep(
         prefill_chunk_size=prefill_chunk_size, batch_grid=batch_grid, **kwargs)
     measure_points([pt for cell in walked for pt in cell], **plan.measurement())
     return plan.shape([[pt["sol"] for pt in cell] for cell in walked])
+
+
+def max_batch_rung(ceiling: Optional[int]) -> int:
+    """The `max` sentinel's resolution — THE one rule, for both phases.
+
+    The largest power-of-two rung at or below the ceiling (the batch
+    grids' own keys), 1 when nothing above it fits: a class's SKUs
+    converge on the same rungs (measured: H100-SXM and H20 identical,
+    H200 agreeing on 7 of 8), so the cell a `max` point names is
+    class-shareable. The ceiling itself still ARITHMETICALLY decides
+    feasibility — `max_batch_per_gpu` keeps reporting it exactly — and
+    only the point the panels draw moves: the claimed max understates
+    the true ceiling by a median 20%, worst 49% of batch (measured over
+    the corpus's capacity facts), the product decision
+    `docs/sweep_card_class.md` §2.C records. Prefill's `-1` sentinel
+    and decode's `None`/`"max"` resolve through this same rule — one
+    semantics, no key that means two things.
+    """
+    c = int(ceiling or 1)
+    return 1 if c < 1 else 1 << (c.bit_length() - 1)
 
 
 @dataclass
@@ -3180,6 +3239,148 @@ def _capacity_fields(p: _CapacityPreparation, _c: "CapacityCeilings",
     }
 
 
+#: One overlay per (class, phase, model, context, config): the walk's structure
+#: is a class property — 54 of the overlay rows' 60 fields measured
+#: card-invariant across same-class SKUs, the six priced columns
+#: substituting at read time. The first SKU of a class walks; its
+#: siblings read the same overlay and price per SKU at each point
+#: (`rows_at`, where the card enters as values). The anchor's own priced
+#: columns carry the walking SKU's card — the roomiest, per
+#: `class_cards`' ordering — and are re-derived per SKU at each point
+#: by the same road. Measured on Qwen3-30B's families: the overlay is
+#: 1.14s a call, and 15 SKUs on 5 classes pay it 5 times, not 15.
+#: The registry is an LRU, not an unbounded dict: a warm touches every model,
+#: and overlays for models already finished are garbage, not reusable state.
+#: 64 entries cover a model's live class/phase/context/config working set.
+_CLASS_OVERLAYS: "OrderedDict[Tuple, Any]" = OrderedDict()
+_CLASS_OVERLAYS_MAX = 64
+_CLASS_OVERLAYS_LOCK = threading.RLock()
+
+
+def _remember_class_overlay(key: Tuple, walk: Any) -> None:
+    """Keep one class overlay, dropping the least recently used."""
+    with _CLASS_OVERLAYS_LOCK:
+        _CLASS_OVERLAYS[key] = walk
+        _CLASS_OVERLAYS.move_to_end(key)
+        while len(_CLASS_OVERLAYS) > _CLASS_OVERLAYS_MAX:
+            _CLASS_OVERLAYS.popitem(last=False)
+
+
+def _class_overlay(
+    p: _CapacityPreparation, phase: str, parallel_str: str,
+    anchor_batch: int, context: int, *,
+    overlay_kwargs: Dict[str, Any],
+) -> Any:
+    """`overlay_walk` for one (class, phase, model, context, config), walked once.
+
+    The key names the card CLASS, not the SKU: same-class SKUs share the
+    walk (the probe-measured card-invariant structure), and price at
+    their own points. The first caller — the roomiest card, by
+    `class_cards`' ordering — walks; the rest read.
+    """
+    from .card import Card
+    class_key = Card.of(p.gpu_sku).klass.key()
+    # The comm latency and launch floor are REQUEST parameters (a caller
+    # can override them per request, as the step-sum tests do with every
+    # floor pair): they price the overlay's t_comm_s and t_launch_s, so
+    # they name the walk as much as the class does.
+    key = (class_key, phase, parallel_str, context,
+           p.s_verify, p.s_prefix_cached,
+           p.comm_latency_s, p.launch_floor_s,
+           p.ep_load_factor, p.precision, p.kv_block_size,
+           p.framework, p.model_id,
+           overlay_kwargs.get("stage"),
+           overlay_kwargs.get("pipeline_stages", 1),
+           hash(p.framework_binding) if p.framework_binding is not None else None,
+           p.resolved.identity_hash(),
+           overlay_kwargs.get("avg_output_tokens"),
+           overlay_kwargs.get("breakdown"),
+           overlay_kwargs.get("want_module_rows", True))
+    # A code-trace recording names every function the result depends on;
+    # a cache hit skips the walk, so its trace would be short of the
+    # producer's. Bypass the cache while a recording is active beyond the
+    # import recording — the oracle's road, not the warm's.
+    from backend.code_trace.provider import provider as _trace_provider
+    _recording = _trace_provider().traced
+    if not _recording:
+        with _CLASS_OVERLAYS_LOCK:
+            cached = _CLASS_OVERLAYS.get(key)
+            if cached is not None:
+                _CLASS_OVERLAYS.move_to_end(key)
+                anchored = (cached.analysis.per_op_timing
+                            or cached.analysis.pre_per_op_timing)
+                origin = (anchored[0]["point_law"]["point"]
+                          if anchored else {})
+                target = {**origin,
+                          "B": max(1, int(anchor_batch or 1)),
+                          "s_input": int(context)}
+                if (cached.deployment.gpu_sku == p.gpu_sku
+                        and origin == target):
+                    return cached
+                # The walk is the class's; the point and priced columns are
+                # the caller's. Read the one walk there through `rows_at`,
+                # the road every moved point takes.
+                return _reprice_overlay(cached, p, target, overlay_kwargs)
+    walk = overlay_walk(phase=phase, **overlay_kwargs)
+    if not _recording:
+        _remember_class_overlay(key, walk)
+    return walk
+
+def _reprice_overlay(walk: Any, p: _CapacityPreparation,
+                     target: Mapping[str, Any],
+                     overlay_kwargs: Mapping[str, Any]) -> Any:
+    """A class's cached overlay walk on this SKU.
+
+    The probe measured 54 of the overlay rows' 60 fields card-invariant
+    across same-class SKUs. The columns that differ are not re-derived here:
+    `rows_at` reads the walk's own laws at `target` on this SKU's card,
+    exactly as it reads a moved point, so one road prices both.
+    """
+    from .batch_sweep import pipeline_step_at, rows_at
+
+    point = Point(target)
+
+    def on_card(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        stamped = []
+        for row in rows:
+            peak = leaf_peak(p.gpu, row.get("act_dtype"))
+            stamped.append({**row,
+                            "peak_flops_per_sec_for_op": (
+                                float(peak) if peak else 0.0)})
+        if not stamped:
+            return stamped
+        return rows_at(
+            stamped, point, cell=walk.analysis,
+            peak_flops=p.peak_flops, peak_bw=p.peak_bw, fabric=p.fabric(),
+            breakdown=bool(overlay_kwargs.get("breakdown")),
+            launch_s=p.launch_floor_s)
+
+    rows = on_card(walk.analysis.per_op_timing)
+    analysis = replace(
+        walk.analysis,
+        point=dict(target),
+        per_op_timing=rows,
+        pre_per_op_timing=on_card(walk.analysis.pre_per_op_timing))
+    pipeline = walk.pipeline_time
+    if pipeline is not None:
+        def law_on_card(law: Mapping[str, Any]) -> Dict[str, Any]:
+            peak = leaf_peak(p.gpu, law.get("act_dtype"))
+            return {**law,
+                    "point": dict(target),
+                    "peak_flops_per_sec_for_op": (
+                        float(peak) if peak else 0.0)}
+
+        laws = {**pipeline,
+                "stage_laws": [[law_on_card(law) for law in stage]
+                               for stage in pipeline["stage_laws"]]}
+        _step, pipeline = pipeline_step_at(
+            laws, rows, point, p.peak_flops, p.peak_bw, p.fabric(),
+            cell=walk.analysis, launch_s=p.launch_floor_s)
+    deployment = replace(walk.deployment, gpu_sku=p.gpu_sku)
+    return replace(walk, analysis=analysis, pipeline_time=pipeline,
+                   model_id=p.model_id, deployment=deployment)
+
+
 def _capacity_pending(
     p: _CapacityPreparation,
     *,
@@ -3295,8 +3496,11 @@ def _capacity_pending(
     # (175.65 GB of weights against 72.00 GB usable) withholds both phases'
     # times against that reason, rather than having this line shrink the batch
     # to 0 so the phase can infer the same verdict back out of it.
+    # The anchor the overlay is materialized at resolves its sentinel
+    # through the rung like every other `max` point — the class-shared
+    # overlay of `docs/sweep_card_class.md` §2.A anchors here.
     eff_prefill_batch = (
-        max_prefill_batch
+        max_batch_rung(max_prefill_batch)
         if prefill_batch_override == -1
         else int(prefill_batch_override)
         if prefill_batch_override is not None
@@ -3305,7 +3509,7 @@ def _capacity_pending(
     eff_decode_batch = (
         int(decode_batch_override)
         if decode_batch_override is not None
-        else max_batch
+        else max_batch_rung(max_batch)
     )
     prefill_chunk_schedule = prefill_chunk_schedule.with_endpoint_batch(
         eff_prefill_batch)
@@ -3432,6 +3636,7 @@ def _capacity_pending(
         # The stage the memory picture above describes (`_c.stage`), so the
         # per-op rows are that rank's.
         stage=_c.pp_stage,
+        pipeline_stages=parallel.pp,
         breakdown=breakdown,
     )
     # Per-phase overlay anchors: decode at its KV-bound max (or user
@@ -3447,10 +3652,13 @@ def _capacity_pending(
     # inside CalibrationOverlay; any exception here rejects the estimate
     # analysis and must abort the request rather than publish a communication-
     # free closed form.
-    prefill_walk = overlay_walk(
-        phase="prefill", pipeline_stages=parallel.pp, **prefill_overlay_kwargs)
-    decode_walk = overlay_walk(
-        phase="decode", pipeline_stages=parallel.pp, **decode_overlay_kwargs)
+    parallel_str = str(parallel)
+    prefill_walk = _class_overlay(
+        p, "prefill", parallel_str, eff_prefill_batch, avg_input_tokens,
+        overlay_kwargs=prefill_overlay_kwargs)
+    decode_walk = _class_overlay(
+        p, "decode", parallel_str, eff_decode_batch, avg_input_tokens,
+        overlay_kwargs=decode_overlay_kwargs)
 
     # The speculative draft, when counted: one forward through the MTP stack,
     # priced on the step it runs — a K-token decode step for a parallel
@@ -3712,6 +3920,11 @@ class PendingEstimate:
     #: The encode phase's plan (its stacks' walks and `PointRow`s), or None.
     encode: Any = None
     #: The card this walk was TAKEN on — one card per walk class, the
+    #: A point's starting rows, by (preparation, row list): every point
+    #: of one preparation moves the SAME base rows, and the copy a point
+    #: starts from reads nothing of the point — cached so a sweep's
+    #: many points don't re-copy them (`_point_rows`).
+    _point_rows_pre: Dict[Tuple, Tuple] = field(default_factory=dict)
     #: class's representative (`parallel_sweep.class_cards` picks the
     #: roomiest). A fact about the walk, not a leak: the walk's laws keep
     #: the card's symbols unsubstituted, and naming the card it was taken

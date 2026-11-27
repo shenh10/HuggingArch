@@ -1246,6 +1246,20 @@ class FrameworkBinding:
     #: vLLM backend's `get_supported_kernel_block_sizes()`) and is declined
     #: at the provider.
     kv_block_size: Optional[int] = None
+
+    def __hash__(self) -> int:
+        """Computed once per object, not per key: hashing the
+        implementation list is measured at ~130 µs, and a cache that keys
+        on the binding (the measure template's deployment key) asks for it
+        once per row-point — 63,836 times on one probe job. Equality stays
+        the dataclass's structural one; only the repeat work is cached.
+        Bypassing frozenness for a derived value nothing reads."""
+        cached = self.__dict__.get("_hash_once")
+        if cached is None:
+            cached = self.__dict__["_hash_once"] = hash(tuple(
+                getattr(self, field.name)
+                for field in fields(self)))
+        return cached
     #: Where this framework reads the chunk length it hands
     #: `mamba_chunk_scan_combined(chunk_size=...)` for a Mamba-2 mixer: the
     #: checkpoint-config fields it consults, in order, the first one present

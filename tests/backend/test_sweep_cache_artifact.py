@@ -133,6 +133,36 @@ def _warm(root, n=40):
     return keys
 
 
+def test_projection_entries_never_enter_the_release_artifact(tmp_path):
+    """The shared rows are a machine-local derived tier, not an answer file."""
+    source = tmp_path / "warm"
+    keys = _warm(source, n=1)
+    projection = DiskBackend(source / "projection", compress=True)
+    projection.put("rows", {"points": keys})
+
+    files = SWEEP_CACHE.files(source)
+
+    assert (source / "projection" / "rows.json.gz").is_file()
+    assert all(file.relative_to(source).parts[0] != "projection"
+               for file in files)
+
+
+def test_installing_an_artifact_clears_the_machine_local_projection(
+        tmp_path, monkeypatch, storage):
+    source = tmp_path / "warm"
+    _warm(source, n=1)
+    path = SWEEP_CACHE.publish(source)
+    assert path.startswith("sweep-cache-v1/")
+
+    root = _fresh_machine(tmp_path, monkeypatch, "projection-fresh")
+    projection = SWEEP_CACHE.disk("projection")
+    projection.put("rows", {"points": []})
+    assert (root / "projection" / "rows.json.gz").is_file()
+
+    assert SWEEP_CACHE.pull(timeout=30) == 0
+    assert not (root / "projection" / "rows.json.gz").exists()
+
+
 def _fresh_machine(tmp_path, monkeypatch, name):
     """An empty cache directory and a trace store that has never seen the
     publishing machine's traces."""

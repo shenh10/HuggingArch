@@ -25,6 +25,7 @@ from backend.measure.auto_sweep import (
 )
 
 from .capacity import (
+    max_batch_rung,
     CapacityKnobs,
     capacity_ceilings,
     _restamp_gpu,
@@ -852,7 +853,12 @@ def _measurePointTables(pending: Any, preparation: Any,
             wanted = {int(batchPoint["decode_batch_size"])
                       for batchPoint in batchGrid
                       if batchPoint["decode_batch_size"] is not None}
-            wanted.update(int(pair[1]["max_decode_batch"]) for pair in cardFacts)
+            # The `max` public point resolves through the rung like every
+            # other max shape (`max_batch_rung`, docs/sweep_card_class.md
+            # §2.C): the stored table's max point is the rung the panels
+            # draw, and the exact ceiling stays a capacity fact.
+            wanted.update(max_batch_rung(pair[1]["max_decode_batch"])
+                          for pair in cardFacts)
             phase = plain_phase if k == 0 else {
                 **draft_phase,
                 "speculative_draft": {
@@ -1178,10 +1184,13 @@ def _servingLawPoint(record: Mapping[str, Any], *, facts: Mapping[str, Any],
                      draftTokens: int, acceptanceRate: float,
                      prefillTimes: dict[tuple[int, int, int, int], float],
                      floorForms: bool = False) -> dict:
+    # The `max` sentinel resolves through the rung like every other max
+    # shape (`max_batch_rung`): the point the panels draw is the rung,
+    # the exact ceiling stays a capacity fact.
     decodeB = (int(decodeBatch) if decodeBatch is not None
-               else int(facts["max_decode_batch"]))
+               else max_batch_rung(facts["max_decode_batch"]))
     prefillB = (int(prefillBatch) if prefillBatch is not None
-               else int(facts["max_prefill_batch"]))
+               else max_batch_rung(facts["max_prefill_batch"]))
     phases = {}
     parallel = ParallelConfig.from_dict(record["parallel"])
     groups = parallel.dp_attention * parallel.dp_replicas
@@ -1370,7 +1379,7 @@ def servingLawPoints(record: Mapping[str, Any], *, card: Card,
             decodePoints.append(_lawPoint(
                 cardValues,
                 batch=(int(decodeBatch) if decodeBatch is not None
-                       else int(facts["max_decode_batch"])),
+                       else max_batch_rung(facts["max_decode_batch"])),
                 context=int(context), outputTokens=outputTokens,
                 prefixCached=int(prefixes[context_index]),
                 verifyWidth=int(widths[context_index])))

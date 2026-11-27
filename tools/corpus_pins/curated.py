@@ -301,6 +301,10 @@ CURATED_OUT_OF_SCOPE: Tuple[CuratedSet, ...] = (
                'checked is not the walk card; not a corpus sweep '
                '(registered with the branch that folded it into the '
                'manifest, a9d78a4de added the list)'),
+    CuratedSet('tests/backend/inference/test_point_row_template.py', 'CASES',
+               'the point-row oracle’s chosen structure cases: a MoE, a '
+               'dense model, the widest DSA model, and the two warm-time '
+               'majors; not the corpus'),
     CuratedSet('tests/backend/inference/test_route_dedup_oracle.py',
                'ONE_NODE',
                'route groups that fit inside one node, where the whole '

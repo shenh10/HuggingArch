@@ -227,8 +227,8 @@ export function patchRow(
   return next;
 }
 
-/** Same 9 seq points as vanilla `IC_SEQ_POINTS`. Bodies still come from `row.cfg`. */
-export const SWEEP_SEQ_LENS = [1024, 2048, 4096, 8192, 16384, 32768, 131072, 262144, 1048576];
+/** Same shared 6 seq points as the Gallery plus 256K. Bodies still come from `row.cfg`. */
+export const SWEEP_SEQ_LENS = [1024, 4096, 16384, 131072, 262144, 1048576];
 
 /** The serving grid: prefill stays at one request while decode concurrency
  * sweeps. Paired-phase batch requests remain a measurement-campaign shape. */
@@ -240,17 +240,21 @@ export type SweepBatchPoint = {
 
 export const SWEEP_BATCH_GRID: SweepBatchPoint[] = [
   { key: "b1", prefill_batch_size: 1, decode_batch_size: 1 },
+  { key: "b8", prefill_batch_size: 1, decode_batch_size: 8 },
   { key: "b16", prefill_batch_size: 1, decode_batch_size: 16 },
+  { key: "b32", prefill_batch_size: 1, decode_batch_size: 32 },
   { key: "b64", prefill_batch_size: 1, decode_batch_size: 64 },
+  { key: "b128", prefill_batch_size: 1, decode_batch_size: 128 },
+  { key: "b256", prefill_batch_size: 1, decode_batch_size: 256 },
+  { key: "b512", prefill_batch_size: 1, decode_batch_size: 512 },
+  { key: "b1024", prefill_batch_size: 1, decode_batch_size: 1024 },
   { key: "max", prefill_batch_size: 1, decode_batch_size: null },
 ];
 
-/** What the Scaling panel's Context × Batch body asks of the grid
- *  (`sweep_grid.SCALING_PANEL_BATCH_GRID`): one request (prefill vs context)
- *  and each card's ceiling (KV storage). Its decode chart is a view of the
- *  parallel sweep's cloud; Compare keeps the whole grid. */
-export const SCALING_PANEL_BATCH_GRID: SweepBatchPoint[] = SWEEP_BATCH_GRID.filter(
-  (p) => p.decode_batch_size === 1 || p.decode_batch_size === null);
+/** The panel's Context × Batch body asks the whole grid
+ *  (`sweep_grid.SCALING_PANEL_BATCH_GRID`): one prefill request and every
+ *  decode rung the cloud draws, with `max` as the ceiling's display alias. */
+export const SCALING_PANEL_BATCH_GRID: SweepBatchPoint[] = SWEEP_BATCH_GRID;
 
 /** The routine grid's decode length (`sweep_grid.ROUTINE_OUTPUT_TOKENS`); also the
  *  Inference page's seeded `outTok`. */

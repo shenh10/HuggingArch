@@ -296,8 +296,10 @@ def test_the_warm_runs_its_jobs_in_its_pool(monkeypatch):
     monkeypatch.setattr(offload, "run_off_process",
                         lambda: seen.setdefault("offline", True))
     monkeypatch.setattr(offload, "stop_serving", lambda: seen.setdefault("stopped", True))
+    monkeypatch.delenv("HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", raising=False)
     with warm.WarmProcess(nice=0, workers=2, pidfile=None):
-        pass
+        import os
+        assert os.environ["HA_SWEEP_POOL_MAX_TASKS_PER_CHILD"] == "16"
     # It answers no request: offline, not a server's footing.
     assert seen["offline"] and seen["stopped"]
 

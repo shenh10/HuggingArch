@@ -29,9 +29,11 @@ Stage placement in the pipeline:
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from fractions import Fraction
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import (Any, Dict, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple, TYPE_CHECKING)
 
 if TYPE_CHECKING:
     from backend.arch.loader import ResolvedSpec
@@ -40,8 +42,11 @@ if TYPE_CHECKING:
 from backend.arch.eval.dim import as_extent, as_number
 from backend.arch.sharding import ENCODE
 from backend.arch.eval.analysis import Point
+from backend.arch.eval.refusal import node_context
 from .benchmark_identity import (
+    _KeyedAs,
     RowIdentity,
+    operand_ports_of,
     routed_launch,
 )
 from .framework_bindings import (DEFAULT_FRAMEWORK, THEORY,
@@ -51,7 +56,7 @@ from .framework_bindings import (DEFAULT_FRAMEWORK, THEORY,
 # pipeline/phases (which is why the pipeline import below stays lazy).
 from .module_rows import physical_module_rows
 from .row_roofline import RowRoofline, RowTimes, StepSum, StepTerm, row_law
-from .op_signatures import get_signature, op_bindings
+from .op_signatures import get_signature, op_bindings, op_signature
 from .op_calibration import (
     BenchmarkKey,
     PhysicalKey,
@@ -194,6 +199,7 @@ class CalibrationOverlay:
         # has one, a view the timing exit drew no row for included.
         laws = analysis.laws
         pre_law_shapes = laws.pre_shapes if laws is not None else None
+        point = Point(dict(analysis.point))
         for match in matches:
             fused_sid = match["fused_aggregation_id"]
             fused_op_by_sid[fused_sid] = match["fused_op"]
@@ -201,6 +207,17 @@ class CalibrationOverlay:
             for uid in match["matched_uids"]:
                 node = pre_program.by_uid(uid) if pre_program is not None else None
                 shape = pre_shapes.values.get(uid) if pre_shapes is not None else None
+                law_shape = (pre_law_shapes.values.get(uid)
+                             if pre_law_shapes is not None else None)
+                shape_out = None
+                if law_shape is not None and law_shape.out is not None:
+                    axes = laws.book.axes(law_shape.out)
+                    read = point.laws(laws.book, axes)
+                    shape_out = [as_extent(read[axis], rounding="floor")
+                                 for axis in axes]
+                elif shape is not None and shape.out is not None:
+                    shape_out = [as_extent(axis, rounding="floor")
+                                 for axis in shape.out]
                 items.append({
                     "name": node.name if node is not None else "",
                     "op": node.op if node is not None else "",
@@ -209,17 +226,10 @@ class CalibrationOverlay:
                     # shape evolutions (input → intermediate → output)
                     # so the reader can see what the kernel internally
                     # avoids materializing.
-                    "shape_out": (
-                        [as_extent(axis, rounding="floor")
-                         for axis in shape.out]
-                        if shape is not None and shape.out is not None
-                        else None
-                    ),
+                    "shape_out": shape_out,
                     "shape_out_law": (
-                        laws.book.axes(law.out)
-                        if pre_law_shapes is not None
-                        and (law := pre_law_shapes.values.get(uid)) is not None
-                        and law.out is not None
+                        laws.book.axes(law_shape.out)
+                        if law_shape is not None and law_shape.out is not None
                         else None),
                 })
             absorbed_by_sid[fused_sid] = items
@@ -662,14 +672,54 @@ def _at_geometry(row: Mapping[str, Any], *, billed: float,
     return f, a
 
 
-def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
-                 deployment: DeploymentContext, *, model_id: str,
-                 spec_hash: str,
-                 dispatch_override: Optional[DispatchDecision] = None
-                 ) -> PointRow:
-    """One row's PointRow — the single key derivation.
-
+class _RowTemplate(NamedTuple):
+    """`point_row_of`'s structure half: what one row is keyed as, and the
+    decisions that read no moved value — the op, its signature and dtype
+    environment, its launch count, its dispatch — decided once per row and
+    deployment (`_capture_row_template`) and replayed at every point.
+    What a point moves — the shapes, the routed rows, the cadence, the
+    numerators — is re-read by `point_row_of` itself; the projection of
+    the shapes is memoised by its own arguments on the identity
+    (`RowIdentity._identity`). The two halves composed are `point_row_of`;
+    there is no second road beside it, and the oracle that proves it is
+    `tests/backend/inference/test_point_row_template.py`.
     """
+    keyed_as: Any
+    signature: Optional[str]
+    dtype_env: Tuple[str, str]
+    launches: int
+    carries_state: bool
+    declared: Optional[Any]
+    dispatch: Optional[DispatchDecision]
+    #: The row's node, as a refusal raised while keying it names it
+    #: (`of`'s contract, kept through the factored road).
+    node_path: Optional[str]
+
+
+def _deployment_key(deployment: DeploymentContext) -> Tuple[Any, ...]:
+    """What a deployment the key and the dispatch read: the six request
+    fields, and the binding itself — a binding's `when:` conditions read
+    its own deployment (server flags, activation dtype, device, compute
+    capability) that no request field names, and two requests that differ
+    only there must not replay one another's dispatch. The binding is a
+    frozen dataclass, so it keys by structure, and `None` (no binding) is
+    a value like any other."""
+    return (deployment.framework, deployment.parallel_signature,
+            deployment.gpu_sku, deployment.phase,
+            deployment.kv_block_size, deployment.tensor_parallel,
+            deployment.framework_binding)
+
+
+def _capture_row_template(row: Mapping[str, Any], identity: RowIdentity,
+                          deployment: DeploymentContext, *,
+                          override: Optional[DispatchDecision]
+                          ) -> _RowTemplate:
+    """Decide one row's structure half, at whatever point the row first
+    arrives: the op it is keyed under, its signature and ports, its dtype
+    environment, its launch count, its dispatch. Every one of these reads
+    the walk's own facts; the point moves none of them — the probe
+    measured 0 of 399 rows whose op, signature, dtype environment or
+    launch count changes across points, and the oracle re-proves it."""
     binding = deployment.framework_binding
     dispatched_binding = (
         None if binding is None
@@ -677,32 +727,91 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
             binding.deployment,
             kv_block_size=deployment.kv_block_size,
             tensor_parallel=deployment.tensor_parallel)))
-    bindings = op_bindings()
-    op, shape_json, (shape_in, shape_out) = identity.of_event(row)
-    signature = bindings.get(op)
+    node = identity._node_of(row)
+    op = identity.op_of(row, node)
+    signature = get_signature(op_signature(op))
+    keyed_as = _KeyedAs(op, identity.leaf_of(row), signature,
+                        operand_ports_of(row, node, signature))
+    dtype_env = identity.leaf_dtype_env(row)
+    analysis = (None if identity._result is None
+                else identity._result.analysis)
+    bound = op_bindings().get(op)
+    declared = get_signature(bound) if bound is not None else None
+    resolved_launch = ResolvedLaunch.from_dtype_env_json(dtype_env[0])
+    dispatch = (
+        override if override is not None else None
+        if binding is None or analysis is None else
+        dispatched_binding.dispatch_for(
+            op, analysis.program, analysis, resolved_launch))
+    return _RowTemplate(
+        keyed_as=keyed_as, signature=bound, dtype_env=dtype_env,
+        launches=identity.launches(row),
+        carries_state=identity.carries_state(row),
+        declared=declared, dispatch=dispatch,
+        node_path=None if node is None else node.display_path)
+
+
+def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
+                 deployment: DeploymentContext, *, model_id: str,
+                 spec_hash: str,
+                 dispatch_override: Optional[DispatchDecision] = None,
+                 _dkey: Optional[Tuple[Any, ...]] = None
+                 ) -> PointRow:
+    """One row's PointRow — the single key derivation.
+
+    The derivation is factored into a structure half that no point moves
+    (`_RowTemplate`, captured at the row's first point and replayed) and
+    this, the values half, which re-reads the row at every point: its
+    shapes, its routed rows, its cadence, its numerators. The composition
+    of the two is this function — `of_event` and a capture-per-point are
+    the same composition written the long way, which is what the oracle
+    diffs.
+    """
+    # `_dkey`, not `_deployment_key`: a parameter by the module function's
+    # own name would shadow it, and the default call would then be
+    # `None(deployment)` — the re-review's regression, held by the plain
+    # road of the oracle, which strips the precomputed key.
+    dkey = (_deployment_key(deployment) if _dkey is None else _dkey)
+    # A row is templated only as the walk identifies it — uid and
+    # aggregation id. A row that states neither (a contributor stub's,
+    # keyed off its shapes alone) is not stably identified across points,
+    # and replaying another row's structure on it would key it as that
+    # row: it keeps the whole road, per point (`test_benchmarks`' stub
+    # rows are the case that caught this).
+    identified = (row.get("uid") is not None
+                  and str(row.get("aggregation_id") or ""))
+    template = (None if dispatch_override is not None or not identified
+                else identity.row_template(row, dkey))
+    if template is None:
+        template = _capture_row_template(
+            row, identity, deployment, override=dispatch_override)
+        if dispatch_override is None and identified:
+            identity.remember_row_template(row, dkey, template)
+    op = template.keyed_as.op
+    signature = template.signature
     if signature is not None and row.get("shape_at_batch") is False:
         raise NoShapeLaw(
             f"{row.get('aggregation_id')}: no shape law to read at this batch")
     sid = str(row.get("aggregation_id", "") or "")
-    dtype_env_json, declined = identity.leaf_dtype_env(row)
+    dtype_env_json, declined = template.dtype_env
+    # A refusal raised while keying the row names its node, as the
+    # unfactored road's `of_event` did (`of`'s contract).
+    with (node_context(template.node_path) if template.node_path is not None
+          else nullcontext()):
+        op, shape_json, (shape_in, shape_out) = identity.keyed_shape(
+            row, template.keyed_as)
     placement_reason = (
         ZERO_LAUNCH if zero_cost(row) else
         DECLINED_REASON if declined else
         MISSING_SIGNATURE if signature is None else
         MISSING_PROJECTION if shape_json is None else "")
-    launches = identity.launches(row)
+    launches = template.launches
     cadence = identity.cadence(row)
     billed = float(max(launches, 1) * cadence)
     flops, access = row.get("flops_per_rank"), row.get("access_bytes_per_rank")
-    declared = get_signature(signature) if signature is not None else None
-    resolved_launch = ResolvedLaunch.from_dtype_env_json(dtype_env_json)
-    analysis = (None if identity._result is None
-                else identity._result.analysis)
-    dispatch = (
-        dispatch_override if dispatch_override is not None else None
-        if binding is None or analysis is None else
-        dispatched_binding.dispatch_for(
-            op, analysis.program, analysis, resolved_launch))
+    declared = template.declared
+    dispatch = (dispatch_override if dispatch_override is not None
+                else template.dispatch)
     padded_rows, exact_rows = identity.launch_rows(row)
     # Padding is a routed buffer's and no other tensor's
     # (`RoutedLaunch`): a grouped launch wants whole rows per expert,
@@ -735,7 +844,7 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         placement_reason=placement_reason,
         t_sol_s=float(row.get("t_sol_s") or 0.0),
         launch_shape_in=shape_in,
-        operand_ports=identity.operand_ports(row),
+        operand_ports=template.keyed_as.ports,
         launch_shape_out=shape_out or row.get("shape_outs"),
         shape_weight=identity.launch_weight(row),
         flops_per_launch=None if flops is None else float(flops) / billed,
@@ -746,8 +855,8 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         geometry_flops=at_geometry[0],
         geometry_access_bytes=at_geometry[1],
         kernel_params=declared.params_from_row(row) if declared is not None else {},
-        leaf=identity.leaf_of(row),
-        carries_state=identity.carries_state(row),
+        leaf=template.keyed_as.leaf,
+        carries_state=template.carries_state,
         dispatch=dispatch,
     )
 
@@ -782,8 +891,13 @@ def point_keys(cell: Any, rows: Sequence[Mapping[str, Any]],
     if identity is None:
         identity = cell.identities[served] = RowIdentity(
             cell, kv_block_size=served[0], ssm_chunk_size=served[1])
+    # The deployment key once per point, not once per row: keying the
+    # binding by structure means hashing it, measured at 130 µs — fine
+    # per point, eight seconds per job per row.
+    dkey = _deployment_key(deployment)
     return [point_row_of(row, identity, deployment, model_id=model_id,
-                         spec_hash=spec_hash) for row in rows]
+                         spec_hash=spec_hash, _dkey=dkey)
+            for row in rows]
 
 
 # ---------------------------------------------------------------------------

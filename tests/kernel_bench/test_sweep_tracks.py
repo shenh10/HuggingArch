@@ -496,7 +496,7 @@ def test_frontier_tracks_are_the_dense_decode_ladder():
     t = FRONTIER_TRACKS[0]
     assert t.phase == "decode"
     assert t.batch_keys == tuple(bp["key"] for bp in FRONTIER_BATCH_GRID)
-    assert "b2" in t.batch_keys and "b1024" in t.batch_keys
+    assert "b8" in t.batch_keys and "b1024" in t.batch_keys
 
 
 def test_sweep_surfaces_are_scaling_and_the_frontier():
@@ -540,7 +540,8 @@ class TestTheFrontierTableAsksTheDenseDecodeLadder:
         assert len(calls) == 1
         batches = tuple(sorted({p.batch for p in calls[0]["points"]}))
         assert calls[0]["phase"] == "decode"
-        assert batches == (1, 2, 4, 8, 16, 32, 64, 100)
+        # The max point is the rung (max_batch_rung): 100 -> 64
+        assert batches == (1, 8, 16, 32, 64)
 
 
 MIMO = "XiaomiMiMo/MiMo-7B-RL"     # dense, with an MTP stack

@@ -34,6 +34,7 @@ from backend.measure.auto_sweep import (
 )
 from backend.inference.defaults import (COMM_LATENCY_US_DEFAULT,
                                        LAUNCH_FLOOR_US_DEFAULT)
+from backend.inference.capacity import max_batch_rung
 from backend.inference.sol_law import (
     FloorCard,
     LawGraph,
@@ -310,12 +311,15 @@ def test_stored_measure_points_are_point_keys_after_json():
             if (ceiling <= 0 or fact.get("infeasibility_reason")
                     or fact.get("beyond_max_context")):
                 continue
+            # The `max` public point is the rung (`max_batch_rung`,
+            # docs/sweep_card_class.md §2.C): the stored table's max point is
+            # the rung the panels draw, the exact ceiling a capacity fact.
             expected = {
                 (int(fact["context"]), int(item["decode_batch_size"]), 0)
                 for item in FRONTIER_BATCH_GRID
                 if item["decode_batch_size"] is not None
                 and int(item["decode_batch_size"]) <= ceiling
-            } | {(int(fact["context"]), ceiling, 0)}
+            } | {(int(fact["context"]), max_batch_rung(ceiling), 0)}
             if record.get("speculative"):
                 draftFacts = record.get("draft_capacity") or []
                 draftCeiling = next(
@@ -330,7 +334,7 @@ def test_stored_measure_points_are_point_keys_after_json():
                         for item in FRONTIER_BATCH_GRID
                         if item["decode_batch_size"] is not None
                         and int(item["decode_batch_size"]) <= draftCeiling
-                    } | {(int(fact["context"]), draftCeiling, k)
+                    } | {(int(fact["context"]), max_batch_rung(draftCeiling), k)
                          for k in FRONTIER_DRAFT_TOKENS}
             missing = expected - publicPoints
             assert not missing, (model, fact["gpu_sku"], fact["context"],

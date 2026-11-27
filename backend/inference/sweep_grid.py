@@ -82,29 +82,12 @@ ROUTINE_BATCH_GRID: List[Dict[str, Any]] = [
     {"key": "max", "prefill_batch_size": -1, "decode_batch_size": None},
 ]
 
-# The serving page's batch grid: prefill is one interactive request, while
-# decode concurrency sweeps. Paired prefill batching remains a measurement
-# campaign shape and is outside the serving-law anchor.
-SCALING_BATCH_GRID: List[Dict[str, Any]] = [
-    {"key": "b1",  "prefill_batch_size": 1, "decode_batch_size": 1},
-    {"key": "b16", "prefill_batch_size": 1, "decode_batch_size": 16},
-    {"key": "b64", "prefill_batch_size": 1, "decode_batch_size": 64},
-    {"key": "max", "prefill_batch_size": 1, "decode_batch_size": None},
-]
-
-# What the Scaling panel's Context × Batch body still asks of that grid now
-# that its decode chart is a view of the parallel sweep's cloud: one request
-# (the prefill-vs-context chart) and each card's KV-bound ceiling (the KV
-# storage chart) — the rungs whose decode batch is one request or the
-# ceiling. Compare keeps the whole grid.
-SCALING_PANEL_BATCH_GRID: List[Dict[str, Any]] = [
-    bp for bp in SCALING_BATCH_GRID if bp["decode_batch_size"] in (1, None)
-]
-
-# The curated context subset: every other decade. The Gallery renders an
-# N-model matrix at it, and the Scaling dropdown offers it. 64K is not on the
-# measured grid, so no page may offer it until a campaign adds the measurement.
-CURATED_CONTEXTS: Tuple[int, ...] = (1024, 4096, 16384, 131072, 1048576)
+# The curated context subset: every other decade plus 256K. The Gallery renders
+# an N-model matrix at it, and the Scaling dropdown offers it. 64K is not on
+# the measured grid, so no page may offer it until a campaign adds the
+# measurement.
+CURATED_CONTEXTS: Tuple[int, ...] = (
+    1024, 4096, 16384, 131072, 262144, 1048576)
 GALLERY_SEQ_LENS: List[int] = list(CURATED_CONTEXTS)
 
 # The Scaling panel's context dropdown (the Prefill-vs-GPUs chart's context
@@ -119,7 +102,7 @@ SCALING_CONTEXTS: List[int] = list(CURATED_CONTEXTS)
 # degrees a model admits is the layout's answer (`parallel_sweep.
 # legal_parallel_degrees`); a degree past the bound is reported as not
 # enumerated, never as refused.
-SWEEP_MAX_GPUS: int = 512
+SWEEP_MAX_GPUS: int = 256
 GPU_COUNT_GRID: Tuple[int, ...] = tuple(
     1 << shift for shift in range(SWEEP_MAX_GPUS.bit_length())
     if (1 << shift) <= SWEEP_MAX_GPUS
@@ -127,8 +110,12 @@ GPU_COUNT_GRID: Tuple[int, ...] = tuple(
 
 # GPU-count ladder the Scaling panel's Context × Batch / KV dropdowns offer,
 # shipped the same way (`/inference/defaults`).
+# The batch warm's degree coverage: the parallel cloud enumerates to
+# SWEEP_MAX_GPUS, and the batch cells the cloud projects over must span
+# the same range (`docs/sweep_card_class.md` §2.B — the grid grew with
+# the class machinery, which made each rung one class-shared pass).
 SCALING_DEGREES: List[int] = [
-    degree for degree in GPU_COUNT_GRID if degree <= 128
+    degree for degree in GPU_COUNT_GRID if degree <= SWEEP_MAX_GPUS
 ]
 
 # The Inference tab's default landing model — the single most common first hit.
@@ -139,13 +126,14 @@ DEFAULT_INFER_MODEL: str = "deepseek-ai/DeepSeek-V3"
 # The Gallery's decode Pareto frontier: every layout up to
 # `FRONTIER_MAX_GPUS` (one GPU, then each Scaling-panel mode at 2 … 64 GPUs;
 # past a node the collectives cross the inter-node fabric), each at these
-# per-GPU decode batches (1, 2, 4, … 1024, then the KV-bound max) at every
+# per-GPU decode batches (1, 8, 16, … 1024, then the KV-bound max) at every
 # Gallery context. A point is (tokens/s one request sees, tokens/s per GPU);
 # the frontier is the points no other point beats on both.
 FRONTIER_MAX_GPUS: int = 64
 FRONTIER_BATCH_GRID: List[Dict[str, Any]] = [
-    *({"key": f"b{1 << i}", "prefill_batch_size": 1, "decode_batch_size": 1 << i}
-      for i in range(11)),
+    *({"key": f"b{batch}", "prefill_batch_size": 1,
+       "decode_batch_size": batch}
+      for batch in (1, 8, 16, 32, 64, 128, 256, 512, 1024)),
     {"key": "max", "prefill_batch_size": 1, "decode_batch_size": None},
 ]
 
@@ -156,6 +144,22 @@ SCALING_DECODE_LADDER: Tuple[int, ...] = tuple(
     if isinstance(bp["decode_batch_size"], int)
     and (bp["decode_batch_size"] == 1 or bp["decode_batch_size"] >= 8)
 )
+
+# The serving page's batch grid: prefill is one interactive request, while
+# decode concurrency sweeps the cloud's own ladder. Paired prefill batching
+# remains a measurement-campaign shape and is outside the serving-law anchor.
+SCALING_BATCH_GRID: List[Dict[str, Any]] = [
+    *({"key": f"b{batch}", "prefill_batch_size": 1,
+       "decode_batch_size": batch}
+      for batch in SCALING_DECODE_LADDER),
+    {"key": "max", "prefill_batch_size": 1, "decode_batch_size": None},
+]
+
+# The panel's Context × Batch body asks that whole grid: the trim to a few
+# rungs was a cost decision the class machinery dissolved, and the batch
+# answer is the same cloud the parallel sweep draws (`docs/sweep_card_class.
+# md` §2.B).
+SCALING_PANEL_BATCH_GRID: List[Dict[str, Any]] = list(SCALING_BATCH_GRID)
 
 # The frontier's speculative-decoding view, for a model with an MTP draft
 # (`speculative_draft.SpeculativeDraft`): the draft lengths K its entry is
