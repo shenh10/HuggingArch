@@ -122,3 +122,74 @@ class TestTheGemmWeightPredicateIsGone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestANumeratorBelongsToItsDeployment(unittest.TestCase):
+    """A cell says what was measured; it does not say under which deployment.
+
+    That is deliberate — a physical key is library- and model-agnostic so one
+    model's measurement can serve another's identical cell — but the
+    numerator is not. It depends on how many launches of the node the step
+    bills and on how the deployment shards. On 2026-11-27 a 4090 row for
+    Qwen3.8-2.4T-A95B (tp=256, count_per_step=69) was priced by an H100 job
+    for Qwen3-Coder-Next (ep=64, count_per_step=36) because their cells
+    matched; 276,824,320 / 12,582,912 = exactly 22.0, and the restated
+    bandwidth came out at 1510% of the card's peak with nothing in the row
+    or the job to say the two were not the same measurement.
+    """
+
+    def _job(self, **over):
+        job = {"physical_key": ["silu_and_mul",
+                                '{"B":1,"d_ffn":2048,"s_query":1}',
+                                '{"activation":"bf16","output":"bf16"}',
+                                "decode"],
+               "flops_per_rank": 4096.0, "access_bytes_per_rank": 24576.0,
+               "count_per_step": 36, "parallel": "tp_attention=4"}
+        job.update(over)
+        return job
+
+    def _row(self, **over):
+        row = {"op": "silu_and_mul", "phase": "decode",
+               "shape_json": '{"B":1,"d_ffn":2048,"s_query":1}',
+               "dtype_env_json": '{"activation":"bf16","output":"bf16"}',
+               "p50_us": "10.0", "achieved_tflops": "0.1000",
+               "achieved_bw_gbps": "1.0000",
+               "count_per_step": "36", "parallel": "tp_attention=4"}
+        row.update(over)
+        return row
+
+    def test_a_job_from_another_deployment_does_not_price_this_row(self):
+        from kernel_bench.emit import restamp_rows
+
+        for field, theirs in (("count_per_step", 69),
+                              ("parallel", "tp_attention=256")):
+            with self.subTest(field=field):
+                result = restamp_rows([self._row()],
+                                      [self._job(**{field: theirs})])
+                self.assertEqual(result.changed, 0,
+                                 "the row was restated by another "
+                                 "deployment's numerator")
+                self.assertEqual(len(result.unmatched), 1)
+                self.assertIn(field, result.unmatched[0].reason)
+                self.assertEqual(result.rows[0]["achieved_bw_gbps"], "1.0000")
+
+    def test_the_same_deployment_still_prices_it(self):
+        """The control: without this the test above would pass on a restamp
+        that refused everything."""
+        from kernel_bench.emit import restamp_rows
+
+        result = restamp_rows([self._row()], [self._job()])
+        self.assertEqual(result.unmatched, [])
+        self.assertEqual(result.changed, 1)
+        self.assertNotEqual(result.rows[0]["achieved_bw_gbps"], "1.0000")
+
+    def test_a_plan_that_states_neither_field_still_prices_it(self):
+        """An older plan carries neither field. Refusing those rows would
+        retire measurements over a fact the plan that priced them never had."""
+        from kernel_bench.emit import restamp_rows
+
+        job = self._job()
+        del job["count_per_step"], job["parallel"]
+        result = restamp_rows([self._row()], [job])
+        self.assertEqual(result.unmatched, [])
+        self.assertEqual(result.changed, 1)

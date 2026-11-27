@@ -298,11 +298,13 @@ class TestOnlyTheRoutedBufferIsPadded:
                         access_bytes_per_rank=40 * 4 * 7168 + 1000 + 2000,
                         weight_read_bytes_per_rank=2000,
                         weight_bytes_total_per_rank=3200)
-        flops, access = _at_geometry(row, billed=1.0)
+        flops, access, delta = _at_geometry(row, billed=1.0)
         assert flops == 64 * 10
         # The buffer at 64 rows, the token side unmoved, and the touched
         # experts' weights (all 32 here) instead of the walk's read.
         assert access == 64 * 4 * 7168 + 1000 + 3200
+        # The padding it added, stated rather than left to subtraction.
+        assert delta == access - (40 * 4 * 7168 + 1000 + 2000)
 
     def test_a_fractional_decode_launch_reads_the_experts_it_touches(self):
         from backend.inference.calibration_overlay import _at_geometry
@@ -316,14 +318,16 @@ class TestOnlyTheRoutedBufferIsPadded:
                    access_bytes_per_rank=640 + 250,
                    weight_read_bytes_per_rank=250,
                    weight_bytes_total_per_rank=3200)
-        _flops, access = _at_geometry(row, billed=1.0)
+        _flops, access, delta = _at_geometry(row, billed=1.0)
         assert access == 3 * 256 + 3 * 100
+        assert delta == access - (640 + 250)
 
     def test_a_row_on_no_routed_buffer_keeps_the_walks_numerators(self):
         from backend.inference.calibration_overlay import _at_geometry
         row = {"flops_per_rank": 12, "access_bytes_per_rank": 34,
                "shape_in": [[1, 1, 8]], "shape_in_exact": [[1, "3/2", 8]]}
-        assert _at_geometry(row, billed=2.0) == (6.0, 17.0)
+        # Nothing padded: the walk's numerators and a zero delta.
+        assert _at_geometry(row, billed=2.0) == (6.0, 17.0, 0.0)
 
 
 @pytest.mark.parametrize("experts,mean,rows", [

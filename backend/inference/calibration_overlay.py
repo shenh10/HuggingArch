@@ -426,6 +426,23 @@ class PointRow:
     #: `*_per_launch` wherever nothing is padded (`padding` is 1).
     geometry_flops: Optional[float]
     geometry_access_bytes: Optional[float]
+    #: What `geometry_access_bytes` adds to `access_bytes_per_launch`: the
+    #: routed padding, 0 wherever nothing is padded. Stated rather than left
+    #: to be recovered by subtraction, so a reader can add the terms up and
+    #: land on the number instead of inferring the difference.
+    geometry_access_delta: float
+    #: The terms `access_bytes_per_rank` is the sum of
+    #: (`ACCESS_TERM_COLUMNS`), read off the row's own columns and never
+    #: recomputed. Two of them — the weight read and its metadata — are the
+    #: reason this exists: between a shape and those bytes sits a rule that
+    #: lives in `OP_REGISTRY` and `dims.yaml`, not in the job.
+    #:
+    #: A measured row records only the RATIO its numerator produced
+    #: (`achieved_bw_gbps`), so "is this row's numerator the one today's
+    #: engine states?" cannot be asked of the row. It needs the plan cell,
+    #: and the physical key names neither the model nor the parallel layout
+    #: while the numerator depends on both and on `count_per_step`.
+    access_terms: Mapping[str, float]
     #: The scalars the signature's kernels take beside their operands, read
     #: off the row (`OpSignature.params_from_row`).
     kernel_params: Mapping[str, float]
@@ -605,8 +622,14 @@ def key_columns(rows: Sequence[Mapping[str, Any]], cell: Any
 
 
 def _at_geometry(row: Mapping[str, Any], *, billed: float,
-                 ) -> Tuple[Optional[float], Optional[float]]:
-    """One launch's `(flops, access_bytes)` at the geometry it RUNS.
+                 ) -> Tuple[Optional[float], Optional[float], float]:
+    """One launch's `(flops, access_bytes, access_delta)` at the geometry it RUNS.
+
+    `access_delta` is what this adds to the walk's per-launch access — 0
+    wherever nothing is padded. It is returned rather than left to a reader's
+    subtraction because a plan job states its numerator's parts, and a part
+    recovered by difference is the one thing in that sum that cannot be
+    checked against anything.
 
     The walk's numerators are the law at the rows the law states, and a
     launch on a routed buffer runs more than that: the experts that receive
@@ -637,12 +660,13 @@ def _at_geometry(row: Mapping[str, Any], *, billed: float,
     a = None if access is None else float(access) / billed
     launch = routed_launch(row)
     if launch is None or not launch.routed_rows:
-        return f, a
+        return f, a, 0.0
     routed, launched = launch.routed_rows, Fraction(launch.launch_rows)
     if f is not None:
         f *= float(launched / routed)
     if a is None:
-        return f, a
+        return f, a, 0.0
+    before = a
     per_row = Fraction(str(row["routed"]["bytes_per_row"]))
     a += float(per_row * (launched - routed))
     weight_rows = row["routed"].get("weight_rows_per_row")
@@ -659,7 +683,67 @@ def _at_geometry(row: Mapping[str, Any], *, billed: float,
         walked = ((row.get("weight_read_bytes_per_rank") or 0)
                   + (row.get("metadata_bytes_per_rank") or 0))
         a += float(at_launch.weight + at_launch.metadata - walked) / billed
-    return f, a
+    return f, a, a - before
+
+
+#: The terms of `access_bytes_per_rank` a reader CANNOT get from the shapes
+#: the plan already exports: term name -> the column
+#: (`row_roofline.COLUMNS`) it is read from.
+#:
+#: The activation terms are deliberately absent. `shape_in` / `shape_out`
+#: are exported, they are per-rank throughout (every op's output shards
+#: exactly where the tensor does), and element count x the slot's dtype
+#: reproduces `act_in` / `act_out` / `convert` — so carrying them would
+#: restate what the shapes already say, which is the one thing §1.4 asks a
+#: new field not to do.
+#:
+#: These two it does not say. Between a shape and these bytes sits a rule
+#: that lives in `OP_REGISTRY` and `dims.yaml` and not in the job: how many
+#: rows a gather actually touches (`OpSpec.gather_source`), which axis the
+#: parallelism cut (`dims.yaml`'s `kind`), and the saturating
+#: `min(rows x read_per_row, total)` over the rows the leaf runs on. A
+#: reader applying those rules itself is building the second derivation path
+#: §1.2 forbids, and getting them wrong is not hypothetical: Qwen3-8B's
+#: embedding reads 4,194,304 bytes at tp=2 where `shape_weight` x dtype says
+#: 622,329,856, because the embedding is VOCAB-parallel — each rank holds
+#: `n_vocab/tp` rows and a token's vector is on exactly one of them, so a
+#: rank gathers half the rows. `rows x d_model/tp x dtype` lands on the same
+#: number by coincidence and for the wrong reason.
+ACCESS_TERM_COLUMNS: Mapping[str, str] = {
+    # The two the shapes cannot give, and the reason this field exists.
+    "weight_read": "weight_read_bytes_per_rank",
+    "metadata": "metadata_bytes_per_rank",
+    # The three the shapes CAN give, carried anyway and only until an oracle
+    # replaces them. They are here because the closure gate in
+    # `plan._numerator` has to add up to the number being written using
+    # carried values alone; a sum with a term the job does not state cannot
+    # refuse anything. Measured on Qwen3-8B TP2 prefill: element count x the
+    # slot's dtype over `shape_in` / `shape_out` reproduces the activation
+    # side exactly for 15 of 19 ops, and the 4 misses are both explained by
+    # facts already declared elsewhere — `fused_add_rmsnorm` comes out at
+    # exactly 0.750 because it writes two outputs and `shape_out` exports
+    # one (`OpSpec.secondary_outputs` names the other), and `embedding`
+    # misses by 2,048 bytes, its 1,024 indices at their own dtype rather
+    # than the activation's. Teach `_numerator` those two rules and these
+    # three terms become a restatement of the shapes, which is what §1.4
+    # asks a field not to be.
+    "act_in": "act_in_bytes_per_rank",
+    "act_out": "act_out_bytes_per_rank",
+    "convert": "convert_bytes_per_rank",
+}
+
+
+def _access_terms(row: Mapping[str, Any]) -> Mapping[str, float]:
+    """The parts of this row's access, per rank per STEP, carried not derived.
+
+    A term the row does not publish is absent rather than zero: a zero is a
+    claim that nothing moved there, and an omission is the honest reading of
+    a column this row never had. A caller adding these up gets the row's
+    `access_bytes_per_rank` only when every term is present, which is what
+    `plan` checks before it writes a job.
+    """
+    return {name: float(row[column]) for name, column in ACCESS_TERM_COLUMNS.items()
+            if row.get(column) is not None}
 
 
 def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
@@ -745,6 +829,8 @@ def point_row_of(row: Mapping[str, Any], identity: RowIdentity,
         routed=row.get("routed"),
         geometry_flops=at_geometry[0],
         geometry_access_bytes=at_geometry[1],
+        geometry_access_delta=at_geometry[2],
+        access_terms=_access_terms(row),
         kernel_params=declared.params_from_row(row) if declared is not None else {},
         leaf=identity.leaf_of(row),
         carries_state=identity.carries_state(row),

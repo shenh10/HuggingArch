@@ -159,6 +159,51 @@ def _rounded_axes(row: Dict[str, Any]) -> List[str]:
             if extent > 1 and extent.denominator != 1]
 
 
+#: How far the carried terms may miss the numerator and still be called the
+#: same number. Floats divided by a launch count and added back do not land
+#: bit for bit; anything past this is a term that is not in the sum.
+NUMERATOR_TOLERANCE = 1e-9
+
+
+class NumeratorDoesNotClose(ValueError):
+    """The carried terms do not add up to the numerator being written."""
+
+
+def _numerator(point: Any, access_bytes: Optional[float]) -> Dict[str, Any]:
+    """How `access_bytes_per_rank` was arrived at, as the parts it is a sum of.
+
+    `Σ terms / billed + geometry_delta` is the number, and this states all
+    three so a reader reproduces it in place. Nothing here computes traffic:
+    the terms are the row's own published columns, the divisor is the launch
+    count the step bills, the delta is what the routed padding added.
+
+    It REFUSES rather than writing a job whose parts contradict its number —
+    the same stance `scripts/dump_sol_surface.py` takes on the same partition.
+    A formula that is not checked against the figure beside it is decoration,
+    and the reason this field exists is that a figure with no checkable
+    derivation already cost three wrong answers to one question.
+    """
+    terms = dict(point.access_terms or {})
+    billed = point.billed or 1.0
+    delta = float(point.geometry_access_delta or 0.0)
+    out: Dict[str, Any] = {"access_terms": terms, "billed": float(billed),
+                           "geometry_delta": delta}
+    if access_bytes is None or not terms:
+        # Nothing to check against, or no terms published for this row: say
+        # so instead of claiming a closure that was never tested.
+        out["closes"] = False
+        return out
+    rebuilt = sum(terms.values()) / float(billed) + delta
+    scale = max(abs(float(access_bytes)), 1.0)
+    if abs(rebuilt - float(access_bytes)) / scale > NUMERATOR_TOLERANCE:
+        raise NumeratorDoesNotClose(
+            f"{point.op} [{point.aggregation_id}]: carried terms rebuild "
+            f"{rebuilt:.6e} where the job states {float(access_bytes):.6e} "
+            f"(terms {terms}, billed {billed}, delta {delta})")
+    out["closes"] = True
+    return out
+
+
 def _unpadded_axes(row: Dict[str, Any]) -> List[Tuple[str, Fraction]]:
     """`(expr=value, extent)` for every per-rank axis of `row` the launch may
     NOT pad, once each: every axis but the rows of a routed buffer — the
@@ -1053,6 +1098,23 @@ def _build_jobs_over_points(
                             **({"sinks": True} if point.leaf.get("sinks") else {})),
                         "flops_per_rank": b_flops,
                         "access_bytes_per_rank": b_bytes,
+                        # HOW that numerator was arrived at, so a reader can
+                        # add it up instead of rebuilding a plan to guess it.
+                        # A measured row records only the ratio the numerator
+                        # produced (`achieved_bw_gbps`), and the physical key
+                        # names neither the model nor the parallel layout
+                        # while the numerator depends on both and on
+                        # `count_per_step` — so asking "is this row's figure
+                        # the one the engine states today" of a row alone is
+                        # not possible, and asking it of a key gives a
+                        # different wrong answer each time it is tried.
+                        #
+                        # Every part is carried, none recomputed: the terms
+                        # are the row's own published columns
+                        # (`calibration_overlay.ACCESS_TERM_COLUMNS`), the
+                        # divisor is the launch count the step bills, and the
+                        # delta is the routed padding `_at_geometry` applied.
+                        "numerator": _numerator(point, b_bytes),
                         # How many rows the launch above runs, and how many
                         # the walk's law states for it. They differ on a
                         # routed cell, where `M` is a MEAN and every expert

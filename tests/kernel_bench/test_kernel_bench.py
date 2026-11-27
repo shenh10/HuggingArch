@@ -2530,12 +2530,12 @@ class TestGroupedGemmMoE:
             "routed": {"dispatch": 1, "source_rows": 3, "routed_rows": 3,
                        "local_experts": 2, "bytes_per_row": 900.0},
         }
-        assert _at_geometry(row, billed=1.0) == (4000.0, 1900.0)
+        assert _at_geometry(row, billed=1.0) == (4000.0, 1900.0, 900.0)
         # Whole rows over both experts pad nothing: the walk's numerators.
         assert _at_geometry(
             {**row, "flops_per_rank": 3000.0,
              "routed": {**row["routed"], "routed_rows": 4,
-                        "source_rows": 4}}, billed=1.0) == (3000.0, 1000.0)
+                        "source_rows": 4}}, billed=1.0) == (3000.0, 1000.0, 0.0)
 
     def test_the_route_exchange_keeps_the_rows_it_really_moves(self):
         """A route all_to_all is NOT padded, and the statement is explicit.

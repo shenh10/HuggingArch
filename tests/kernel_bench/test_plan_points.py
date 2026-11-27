@@ -167,3 +167,82 @@ def test_the_anchor_is_canonical_not_caller_order(monkeypatch):
     assert walked == [anchor]
     assert out[anchor][0] == [{"rows": ()}]
     assert out[high][0] == [{"rows": {"counts": high.counts("prefill")}}]
+
+
+class TestTheJobStatesHowItsNumeratorWasReached:
+    """A job carries the parts `access_bytes_per_rank` is the sum of.
+
+    A measured row records only the RATIO its numerator produced
+    (`achieved_bw_gbps`), so asking "is this row's figure the one the engine
+    states today" of the row alone is impossible, and asking it of the
+    physical key gives a different wrong answer each time: the key is
+    `(signature, shape, dtype_env, phase)` and names neither the model nor
+    the parallel layout, while the numerator depends on both and on
+    `count_per_step`. The parts make a job reproduce its own number.
+    """
+
+    #: EP8 decode at this batch is the discriminating case and therefore
+    #: first: it is the only one where the routed padding is non-zero, so a
+    #: closure that forgot `geometry_delta` passes everywhere else.
+    @pytest.mark.parametrize("phase, batch, seq, parallel", [
+        ("decode", 17, 512, ParallelConfig(tp_attention=8, tp_dense_ffn=8,
+                                           ep_moe=8)),
+        ("prefill", 1, 2048, TP2),
+    ])
+    def test_the_carried_terms_rebuild_the_numerator(self, phase, batch, seq,
+                                                     parallel):
+        model = "Qwen/Qwen3-30B-A3B"
+        jobs, _unplaced = build_jobs(
+            model_id=model, phase=phase, avg_output_tokens=256,
+            parallel=parallel, resolved=resolve_snapshot(model),
+            batch_size=batch, seq_len=seq)
+        assert jobs, "nothing planned; this asserts about jobs"
+        checked = padded = 0
+        for job in jobs:
+            carried = job.get("numerator") or {}
+            access = job.get("access_bytes_per_rank")
+            assert carried, f"{job['op']}: job states no numerator parts"
+            if not carried.get("closes") or access is None:
+                continue
+            rebuilt = (sum(carried["access_terms"].values())
+                       / carried["billed"] + carried["geometry_delta"])
+            assert rebuilt == pytest.approx(access, rel=1e-9), (
+                f"{job['op']} [{job['node_spec_id']}]: parts rebuild "
+                f"{rebuilt} where the job states {access}")
+            checked += 1
+            padded += bool(carried["geometry_delta"])
+        assert checked, "no job's parts were checkable"
+        if phase == "decode":
+            assert padded, ("this point was chosen because the routed "
+                            "padding is non-zero here; it no longer is, so "
+                            "the delta term is no longer under test")
+
+    def test_a_job_whose_parts_miss_its_number_is_refused(self):
+        """The closure is a gate, not a note beside the figure.
+
+        Without this, a job could state parts that do not add up and a reader
+        trusting them would be back to guessing — which is the whole reason
+        the parts are carried.
+        """
+        from kernel_bench.plan import NumeratorDoesNotClose, _numerator
+
+        point = SimpleNamespace(
+            op="silu_and_mul", aggregation_id="layers.0.mlp.act",
+            access_terms={"act_in": 200.0, "act_out": 100.0},
+            billed=2.0, geometry_access_delta=0.0)
+        assert _numerator(point, 150.0)["closes"] is True
+
+        with pytest.raises(NumeratorDoesNotClose) as caught:
+            _numerator(point, 300.0)
+        assert "rebuild" in str(caught.value)
+        assert "act_in" in str(caught.value), "the parts belong in the refusal"
+
+    def test_a_row_with_no_published_parts_says_so(self):
+        """Absent is not zero: a job that cannot state its parts says
+        `closes: false` rather than claiming a sum nothing tested."""
+        from kernel_bench.plan import _numerator
+
+        point = SimpleNamespace(op="all_reduce", aggregation_id="layers.0.ar",
+                                access_terms={}, billed=1.0,
+                                geometry_access_delta=0.0)
+        assert _numerator(point, 4096.0)["closes"] is False

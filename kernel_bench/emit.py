@@ -13,7 +13,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, Mapping, Optional, Tuple
 
 from backend.inference import benchmarks as _benchmarks
 from backend.inference.benchmark_identity import (
@@ -222,6 +222,30 @@ def _miss_reason(cell: PhysicalCell, cells: dict[PhysicalCell, Any],
     return "no_plan"
 
 
+def _deployment_disagreement(row: Mapping[str, Any],
+                             job: Optional[Mapping[str, Any]]) -> str:
+    """Why this job's numerator is not this row's, or "".
+
+    The two facts a physical cell does not carry and the numerator depends
+    on: how many launches of the node the step bills (`count_per_step`) and
+    how the deployment shards (`parallel`). Compared only where the job
+    states them.
+    """
+    if not job:
+        return ""
+    for field_name in ("count_per_step", "parallel"):
+        theirs = job.get(field_name)
+        if theirs in (None, ""):
+            continue
+        mine = row.get(field_name)
+        if mine in (None, ""):
+            continue
+        if str(mine) != str(theirs):
+            return (f"{field_name} {mine!r} measured, plan priced it at "
+                    f"{theirs!r}: a numerator for another deployment")
+    return ""
+
+
 def restamp_rows(rows: list, jobs: list) -> RestampRowsResult:
     """Apply plan numerators to measured rows' physical cells.
 
@@ -233,8 +257,15 @@ def restamp_rows(rows: list, jobs: list) -> RestampRowsResult:
     reported, and every such row is left unchanged.
     """
     pairs_by_cell: dict[PhysicalCell, set[NumeratorPair]] = {}
+    job_by_cell: dict[PhysicalCell, Dict[str, Any]] = {}
     for job in jobs:
-        pairs_by_cell.setdefault(_physical_key_cell(job), set()).add(_pair(job))
+        cell_key = _physical_key_cell(job)
+        pairs_by_cell.setdefault(cell_key, set()).add(_pair(job))
+        # Kept to read the deployment the numerator was priced under. Safe to
+        # keep only one: a cell whose jobs disagree on the numerator is
+        # already refused as ambiguous below, so where this is used the jobs
+        # on this cell priced it the same way.
+        job_by_cell.setdefault(cell_key, job)
 
     ambiguous = [
         RestampAmbiguity(cell, tuple(sorted(pairs, key=repr)))
@@ -267,6 +298,27 @@ def restamp_rows(rows: list, jobs: list) -> RestampRowsResult:
         if pair is None or not pair:
             unmatched.append(replace(detail, reason=_miss_reason(
                 cell, pairs_by_cell, op_shapes_phases, op_dtypes_phases)))
+            out.append(row)
+            continue
+
+        # The cell says WHAT was measured; it does not say under which
+        # deployment, and the numerator depends on that. A physical key is
+        # `(signature, shape, dtype_env, phase)` by design — library- and
+        # model-agnostic, which is what lets one model's measurement serve
+        # another's identical cell — so two jobs can share a cell and carry
+        # different numerators because they bill a different number of
+        # launches per step, or shard differently. Both facts are already on
+        # the row and on the job, so they are checked rather than assumed:
+        # a 4090 row at tp=256 billing 69 launches was once priced by an
+        # H100 job at ep=64 billing 36, and the figure came out 22x high
+        # with nothing to say so.
+        #
+        # Only checked where the job states them. An older plan carries
+        # neither, and refusing those rows would retire measurements over a
+        # field the plan that priced them never had.
+        disagreement = _deployment_disagreement(row, job_by_cell.get(cell))
+        if disagreement:
+            unmatched.append(replace(detail, reason=disagreement))
             out.append(row)
             continue
 
