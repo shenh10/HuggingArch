@@ -876,6 +876,18 @@
   },
   {
     "identifiers": [
+      "Qwen/Qwen3-30B-A3B",
+      "Qwen/Qwen3.8-Flash-Next",
+      "deepseek-ai/DeepSeek-V3",
+      "deepseek-ai/DeepSeek-V4.1-Flash",
+      "meta-llama/Llama-3.2-3B"
+    ],
+    "kind": "curated",
+    "module": "tests/backend/inference/test_point_row_template.py",
+    "name": "CASES"
+  },
+  {
+    "identifiers": [
       "XiaomiMiMo__MiMo-V2-Flash",
       "deepseek-ai__DeepSeek-V3",
       "google__gemma-2-9b",

@@ -59,6 +59,25 @@ def test_a_reader_seeks_one_record_without_parsing_its_neighbours(tmp_path):
     assert json.loads(lines[11]) == wanted
 
 
+def test_record_with_digest_returns_the_verified_slot_digest(tmp_path):
+    """A projection's record identity is the digest the pool already read."""
+    who = identity("digest")
+    answers = []
+    for name, value in (("one", {"record": 1}), ("two", {"record": 2})):
+        root = tmp_path / name
+        pool = SolPool(root)
+        assert pool.write(who, [("record", value)])
+        answers.append(pool.record_with_digest(who.key, "record"))
+        index = json.loads(
+            (root / who.key[:2] / who.key / "index.json").read_text(
+                encoding="utf-8"))
+        assert answers[-1][0] == value
+        assert answers[-1][1] == index["records"]["record"][3]
+        assert pool.record_with_digest(who.key, "record") == answers[-1]
+
+    assert answers[0][1] != answers[1][1]
+
+
 def test_a_corrupt_record_is_a_miss_and_the_manifest_survives(tmp_path):
     pool = SolPool(tmp_path, hotRecords=0)
     who = identity("corrupt")

@@ -64,7 +64,9 @@ def test_every_surface_context_is_a_measured_context():
 
 
 def test_the_gpu_and_decode_ladders_are_grid_subsets():
-    assert [x for x in GPU_COUNT_GRID if x <= 128] == SCALING_DEGREES
+    # The batch warm's degrees span the full GPU_COUNT_GRID
+    # (`SCALING_DEGREES = GPU_COUNT_GRID`, docs/sweep_card_class.md §2.B).
+    assert list(GPU_COUNT_GRID) == SCALING_DEGREES
     expected = (1, 8, 16, 32, 64, 128, 256, 512, 1024)
     assert expected == SCALING_DECODE_LADDER
 
@@ -189,6 +191,29 @@ def test_an_estimate_cloud_states_coordinates_and_keeps_absences():
     assert absent["refused"] == "capacity"
     assert absent["context"] == 1024 and absent["batch_key"] == "b64"
     assert len(cloud) == 4
+
+
+def test_a_max_rung_that_is_an_explicit_batch_is_one_cloud_point():
+    """The `max` display alias does not make a second coordinate.
+
+    `max_batch_rung` resolves the sentinel onto the grid's own rung. When
+    that rung is a `bN` the cloud already states, the two request keys name
+    one estimate; the cloud keeps it once, named by the alias readers
+    filter on (`max`).
+    """
+    knobs = CapacityKnobs(parallel=ParallelConfig(tp_attention=2,
+                                                   tp_dense_ffn=2))
+    plan = CapacitySweepPlan.of(
+        seq_lens=[1024], config={}, gpu_sku="H100-SXM", knobs=knobs,
+        batch_grid=[{"key": "b64", "prefill_batch_size": 64,
+                     "decode_batch_size": 64},
+                    {"key": "max", "prefill_batch_size": 64,
+                     "decode_batch_size": None}])
+    est = _est(0.01)
+    est["phases"]["decode"]["batch"] = 64
+    cloud = plan.throughput_cloud([[est, dict(est)]])
+    assert len(cloud) == 1
+    assert cloud[0]["batch_key"] == "max"
 
 
 def _cloud_point(gpu: str, mode: str, n: int, ctx: int, key: str, batch: int,

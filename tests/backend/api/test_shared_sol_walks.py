@@ -111,7 +111,7 @@ def _request(scaling, **changes):
 def _estimateRequest(scaling, **changes):
     from backend.api._models import BatchPoint, InferenceEstimateSweepRequest
     from backend.inference.sweep_grid import (
-        ROUTINE_SEQ_LENS,
+        GALLERY_SEQ_LENS,
         SCALING_BATCH_GRID,
     )
 
@@ -119,7 +119,7 @@ def _estimateRequest(scaling, **changes):
         "model_id": MODEL,
         "gpu_sku": "H100-SXM",
         "parallel": PARALLEL,
-        "seq_lens": list(ROUTINE_SEQ_LENS),
+        "seq_lens": list(GALLERY_SEQ_LENS),
         "batch_grid": [BatchPoint(**point) for point in SCALING_BATCH_GRID],
         "avg_output_tokens": 256,
         "gpu_memory_fraction": 0.9,
@@ -334,20 +334,73 @@ def test_gallery_and_scaling_compile_the_same_law_graph_once(
     assert compiled.cache_info().misses - before == 2
 
 
+def test_gallery_and_scaling_reuse_the_same_projected_rows(
+        shared, monkeypatch):
+    """The public surfaces' differing slices read one projected envelope."""
+    import backend.inference.serving_projection as projection
+
+    gallery, scaling, _pool, _calls = shared
+    view = gallery.FrontierView("H100-SXM")
+    stored = gallery._Stored(MODEL, gallery._resolve_one(MODEL)[2])
+    walk = stored.shared_walk(view)
+    assert walk is not None
+    req = _estimateRequest(scaling, gpu_sku="H100-SXM")
+    projection.SERVING_PROJECTION.clear()
+    calls = []
+    realRows = projection.servingLawPoints
+
+    def counted(*args, **kwargs):
+        calls.append((tuple(kwargs["contexts"]),
+                      tuple(kwargs["decodeBatches"])))
+        return realRows(*args, **kwargs)
+
+    monkeypatch.setattr(projection, "servingLawPoints", counted)
+    galleryEntry = gallery._restamp(MODEL, walk, "H100-SXM", view)
+    sweepCells = scaling._sharedWalkResults(
+        scaling._ESTIMATE, scaling._estimate_plan(req))
+
+    assert len(calls) == 1
+    assert set(sweepCells) == {0}
+    assert calls[0][0] == tuple(projection.GALLERY_SEQ_LENS)
+    assert calls[0][1] == tuple(
+        point["decode_batch_size"]
+        for point in projection.FRONTIER_BATCH_GRID)
+    assert not galleryEntry.get("error")
+    assert sweepCells[0]
+
+
+def test_a_fresh_walk_carries_the_digests_the_pool_wrote(shared):
+    """The first Gallery build and a later pool reader name one projection."""
+    gallery, _scaling, pool, _calls = shared
+    view = gallery.FrontierView("H100-SXM")
+    stored = gallery._Stored(MODEL, gallery._resolve_one(MODEL)[2])
+    walk = stored.shared_walk(view)
+    assert walk is not None
+    for item in walk["layouts"]:
+        item.pop("recordDigest", None)
+
+    assert stored.keep_walk(view, walk)
+    walk_key = stored.serving_key(view)
+    for item in walk["layouts"]:
+        name = gallery.StepLawKey.of_layout(walk_key, item["parallel"]).record_name
+        assert item["recordDigest"] == pool.record_digest(
+            walk_key.identity.key, name)
+
+
 def test_an_unserved_public_context_is_read_from_its_step_law(shared):
     """A serving projection owns an unserved point's status, not its time."""
-    from backend.inference.sweep_grid import ROUTINE_SEQ_LENS
+    from backend.inference.sweep_grid import GALLERY_SEQ_LENS, SCALING_BATCH_GRID
 
     _gallery, scaling, _pool, _calls = shared
-    req = _estimateRequest(scaling, seq_lens=list(ROUTINE_SEQ_LENS))
+    req = _estimateRequest(scaling, seq_lens=list(GALLERY_SEQ_LENS))
     reused = scaling._sharedWalkResults(
         scaling._ESTIMATE, scaling._estimate_plan(req))
     assert set(reused) == {0}
     rows = list(reused[0])
-    assert len(rows) == len(ROUTINE_SEQ_LENS)
-    assert all(len(row) == 4 for row in rows)
+    assert len(rows) == len(GALLERY_SEQ_LENS)
+    assert all(len(row) == len(SCALING_BATCH_GRID) for row in rows)
     assert [row[0]["sol"]["beyond_max_context"] for row in rows] == [
-        context >= 262144 for context in ROUTINE_SEQ_LENS]
+        context >= 262144 for context in GALLERY_SEQ_LENS]
 
 
 def test_an_infeasible_rtx_context_has_no_step_on_either_path(

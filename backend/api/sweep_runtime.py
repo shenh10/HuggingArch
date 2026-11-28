@@ -23,9 +23,9 @@ from backend.arch.loader import get_default_loader
 from backend.code_trace.provider import recording
 from backend.fingerprint import engine_version, result_version
 from backend.hf.metadata import fetch_config
-from backend.sweep_cache_artifact import SWEEP_CACHE
+from backend.sweep_cache_artifact import SWEEP_CACHE, sweep_disk_bytes
 from backend.measure.cache import (DiskBackend, KeyedCache, MemoryBackend,
-                                   TieredBackend, env_bytes, private_copy)
+                                   TieredBackend, private_copy)
 from backend.api._models import (
     CompareFrontierRequest,
     InferenceEstimateSweepRequest,
@@ -96,10 +96,10 @@ def resolved_spec_for(model_id: str) -> Any:
 
 # Declared once with the artifact that bootstraps it at container start.
 _SWEEP_CACHE_DIR = SWEEP_CACHE.directory()
-# Both sweep tiers share the directory's one budget (the directory is the
-# disk the operator sizes); finished answers keep the larger share, the
-# unfinished steps of one running sweep the smaller.
-_SWEEP_DISK_BYTES = env_bytes("HA_SWEEP_CACHE_BYTES", 512 << 20)
+# All disk tiers under the sweep cache directory share its one budget: finished
+# answers and shared projections keep the larger shares, unfinished steps the
+# smaller. The directory is the disk the operator sizes.
+_SWEEP_DISK_BYTES = sweep_disk_bytes()
 _SWEEP = KeyedCache(
     "sweep",
     TieredBackend(
@@ -107,7 +107,7 @@ _SWEEP = KeyedCache(
         # Featured models × DEFAULT_SWEEP_GPUS × 4 modes × 8 degrees is ~800
         # files; --all-gpus × the same grid is a few thousand.
         SWEEP_CACHE.disk(max_files=8000,
-                         max_bytes=_SWEEP_DISK_BYTES * 3 // 4),
+                         max_bytes=_SWEEP_DISK_BYTES * 3 // 8),
     ),
     single_flight=True,
 )
@@ -322,18 +322,24 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             walk_key, metadata = modelWalk
             if plan.gpu_sku not in metadata.get("layoutsByCard", {}):
                 break
-            projectionRequest = gridRequest(
-                walk_key, plan.gpu_sku, plan.knobs.parallel)
-            stepKey = projectionRequest.law_key
-            item = sharedSolPool.record(stepKey.bundle_key, stepKey.record_name)
-            if item is None:
+            lookupRequest = gridRequest(walk_key, plan.gpu_sku, plan.knobs.parallel)
+            stepKey = lookupRequest.law_key
+            record = sharedSolPool.record_with_digest(
+                stepKey.bundle_key, stepKey.record_name)
+            if record is None:
                 break
+            item, recordDigest = record
             law = item["walk"]
             if "refused" in law or "error" in law:
                 break
+            projectionRequest = gridRequest(
+                walk_key, plan.gpu_sku,
+                law.get("parallel", plan.knobs.parallel))
             points = [decode for _key, _prefill, decode in plan.points]
             try:
-                projectedRows = projectServingLawPoints(law, projectionRequest)
+                projectedRows = projectServingLawPoints(
+                    law, projectionRequest, publicEnvelope=True,
+                    recordDigest=recordDigest)
             except Exception:
                 break
             contexts = []
@@ -363,10 +369,12 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
                 break
             firstRequest = gridRequest(walk_key, skus[0], cell.parallel)
             stepKey = firstRequest.law_key
-            item = sharedSolPool.record(stepKey.bundle_key, stepKey.record_name)
-            if item is None:
+            record = sharedSolPool.record_with_digest(
+                stepKey.bundle_key, stepKey.record_name)
+            if record is None:
                 projected = None
                 break
+            item, recordDigest = record
             law = item["walk"]
             if "refused" in law:
                 projected = {"refused": law["refused"]}
@@ -378,7 +386,8 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
             failed = False
             for sku in skus:
                 try:
-                    request = gridRequest(walk_key, sku, cell.parallel)
+                    request = gridRequest(
+                        walk_key, sku, law.get("parallel", cell.parallel))
                     ladderRequest = dataclasses.replace(
                         request,
                         decode_batches=(None, *SCALING_DECODE_LADDER),
@@ -387,7 +396,9 @@ def _sharedWalkResults(sweep: _CachedSweep, plan: Any) -> dict[int, Any]:
                     entries = []
                     for context, projectedRow in zip(
                             request.contexts,
-                            projectServingLawPoints(law, ladderRequest),
+                            projectServingLawPoints(
+                                law, ladderRequest, publicEnvelope=True,
+                                recordDigest=recordDigest),
                             strict=True):
                         served = projectedRow[0]
                         byBatch = dict(zip(ladderRequest.decode_batches,

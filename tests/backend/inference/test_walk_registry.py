@@ -27,11 +27,31 @@ def test_a_walk_family_key_names_no_point_card_price_or_measurement():
     assert fields == ("model_id", "version", "config", "parallel", "precision")
 
 
-def test_walk_families_are_bound_by_resident_bytes_not_only_by_count():
+def test_walk_families_are_bound_by_their_own_bytes_not_the_shared_spec():
+    """The budget measures a family's own state — everything it reaches
+    minus everything its resolved spec reaches (shared by every family of
+    the model) — because the plain rule charged the spec it merely
+    references: 19MB against 1MB of own state, and a budget evicted on
+    accounting, not on memory."""
     backend = walk_registry.WALK_CELLS._backend
-    assert backend._max == 16
+    assert backend._max == walk_registry.WALK_CELLS_MAX_FAMILIES
     assert backend._max_bytes == walk_registry.WALK_CELLS_MEMORY_BYTES
-    assert backend._size_of is deep_size_of
+    assert backend._size_of is walk_registry._family_size
+
+    shared = {"rows": [{"law": "B * s"} for _ in range(4)]}
+    own = {"cells": [1, 2, 3], "label": "family own state"}
+    entry = dict(resolved=shared, cells=own)
+    # A fake spec has no content fingerprint; the memo keys one (the real
+    # entry's `data_version`), so the test states its own.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(walk_registry, "data_version", lambda r: "test-spec")
+    try:
+        plain = deep_size_of(entry)
+        charged = walk_registry._family_size(entry)
+        assert charged < plain
+        assert charged >= deep_size_of(own)
+    finally:
+        monkeypatch.undo()
 
 
 def test_a_reader_that_grows_a_walk_family_reaccounts_its_byte_budget():

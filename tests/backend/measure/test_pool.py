@@ -133,3 +133,12 @@ def test_cgroup_cpu_quota_caps_the_pool(tmp_path, monkeypatch):
     monkeypatch.delenv("HA_SWEEP_POOL_WORKERS", raising=False)
     assert _sweep_pool.usable_cpus() == 12
     assert _sweep_pool._max_workers() == 10
+
+
+def test_worker_recycling_is_opt_in_and_refuses_bad_values(monkeypatch):
+    monkeypatch.delenv("HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", raising=False)
+    assert _sweep_pool._max_tasks_per_child() is None
+    monkeypatch.setenv("HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", "16")
+    assert _sweep_pool._max_tasks_per_child() == 16
+    monkeypatch.setenv("HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", "0")
+    assert _sweep_pool._max_tasks_per_child() is None

@@ -1269,7 +1269,7 @@ def _row_laws(book: LawBook, *, flops_one: Any, flops_identity: Any,
         "dims": ({str(k): value_law(v) for k, v in frame.items()}
                  if frame else None),
         "definitions": {
-            name: {"law": str(definition.law),
+            name: {"law": sp.sstr(definition.law, order="none"),
                    "bindings": {key: value_law(value) for key, value
                                 in definition.bindings.items()}}
             for name, definition in (definitions or {}).items()},

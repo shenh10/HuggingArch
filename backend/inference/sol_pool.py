@@ -63,6 +63,7 @@ class SolPool:
         self.shardBytes = int(shardBytes)
         self._hot: OrderedDict[tuple[str, str], Any] = OrderedDict()
         self._hotSizes: dict[tuple[str, str], int] = {}
+        self._hotDigests: dict[tuple[str, str], str] = {}
         self._hotBytesTarget = int(hotBytes)
         self._hotRecordsTarget = int(hotRecords)
         self._lock = threading.Lock()
@@ -196,6 +197,7 @@ class SolPool:
                     for cacheKey in [k for k in self._hot if k[0] == identity.key]:
                         del self._hot[cacheKey]
                         del self._hotSizes[cacheKey]
+                        del self._hotDigests[cacheKey]
                 return True
             finally:
                 if output is not None:
@@ -274,6 +276,16 @@ class SolPool:
         by code the running code no longer matches (its trace) is a miss. A
         record read hands its trace to the computations open around the
         read: what they read depends on the code that computed it."""
+        answer = self.record_with_digest(key, recordId)
+        return None if answer is None else answer[0]
+
+    def record_with_digest(
+            self, key: str, recordId: str) -> Optional[tuple[Any, str]]:
+        """One record beside the digest the pool verified its bytes against.
+
+        A projection carries that digest into its own key rather than
+        re-deriving the record's content identity at every cache read.
+        """
         trace = self.recordTrace(key, recordId)
         p = provider()
         if trace is None or not p.valid(trace):
@@ -283,7 +295,7 @@ class SolPool:
         with self._lock:
             if cacheKey in self._hot:
                 self._hot.move_to_end(cacheKey)
-                return self._hot[cacheKey]
+                return self._hot[cacheKey], self._hotDigests[cacheKey]
         index = self._index(key)
         slot = index and index["records"].get(recordId)
         if slot is None:
@@ -301,8 +313,19 @@ class SolPool:
             logger.debug("SOL pool record read failed for %s/%s",
                          key, recordId, exc_info=True)
             return None
-        self._keep(cacheKey, value, recordSlot.length)
-        return value
+        self._keep(cacheKey, value, recordSlot.length, recordSlot.digest)
+        return value, recordSlot.digest
+
+    def record_digest(self, key: str, recordId: str) -> Optional[str]:
+        """A stored record's slot digest, without reading its value.
+
+        A writer that just wrote (or verified) a bundle can attach the digest
+        to its in-memory records; a reader that wants the value too asks
+        `record_with_digest`.
+        """
+        index = self._index(key)
+        slot = index and index["records"].get(recordId)
+        return None if slot is None else str(slot[3])
 
     def sequence(self, key: str) -> Optional["RecordView"]:
         """The bundle's records as a lazy `Sequence`.
@@ -328,6 +351,7 @@ class SolPool:
         with self._lock:
             self._hot.clear()
             self._hotSizes.clear()
+            self._hotDigests.clear()
 
     def _directory(self, key: str) -> pathlib.Path:
         return self.root / key[:2] / key
@@ -352,15 +376,18 @@ class SolPool:
                          exc_info=True)
             return None
 
-    def _keep(self, cacheKey: tuple[str, str], value: Any, size: int) -> None:
+    def _keep(self, cacheKey: tuple[str, str], value: Any, size: int,
+              digest: str) -> None:
         with self._lock:
             self._hot[cacheKey] = value
             self._hotSizes[cacheKey] = size
+            self._hotDigests[cacheKey] = digest
             while (len(self._hot) > self._hotRecordsTarget
                    or sum(self._hotSizes.values()) > self._hotBytesTarget):
                 oldest = next(iter(self._hot))
                 del self._hot[oldest]
                 del self._hotSizes[oldest]
+                del self._hotDigests[oldest]
 
     @staticmethod
     def _atomic_json(path: pathlib.Path, value: Any) -> None:

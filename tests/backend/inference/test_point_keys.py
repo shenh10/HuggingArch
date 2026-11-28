@@ -156,7 +156,8 @@ def _calls(tree: ast.AST) -> set:
 #: `compute_per_row_dtype_env_json`, which is half of the measurement key.
 _DERIVATION = {"RowIdentity", "BenchmarkKey", "one_event", "of_event",
                "launches", "cadence", "leaf_of", "params_from_row", "leaf_dtype_env",
-               "compute_per_row_dtype_env_json", "compute_per_row_shape_json"}
+               "compute_per_row_dtype_env_json", "compute_per_row_shape_json",
+               "keyed_shape"}
 
 
 def _functions(path: Path):
@@ -212,7 +213,21 @@ class TestCallSites:
             if fn.name == "point_keys":
                 continue
             if fn.name == "point_row_of":
-                assert _calls(fn) >= {"BenchmarkKey", "of_event"}
+                # Exactly these vocabulary calls, no more: a new one is a
+                # second road growing (and a removed one this test's
+                # prompt to shrink the set).
+                assert _calls(fn) & _DERIVATION == {
+                    "BenchmarkKey", "cadence", "keyed_shape",
+                    "params_from_row"}, sorted(_calls(fn) & _DERIVATION)
+                continue
+            # The structure half's capture is as much the single
+            # derivation as the values half that replays it: exactly these
+            # vocabulary calls, and nothing else may call any (a second
+            # road would grow here first).
+            if fn.name == "_capture_row_template":
+                assert _calls(fn) & _DERIVATION == {
+                    "launches", "leaf_dtype_env",
+                    "leaf_of"}, sorted(_calls(fn) & _DERIVATION)
                 continue
             # A nested function is walked inside its parent too; judge each
             # by its own body.

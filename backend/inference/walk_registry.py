@@ -23,11 +23,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 import threading
-from typing import Any, Callable, Optional
+from typing import (Any, Callable, Dict, FrozenSet, Mapping,
+                   Optional, Tuple)
 
 from backend.code_trace.provider import Growing, provider
 from backend.fingerprint import data_version
-from backend.measure.cache import KeyedCache, MemoryBackend, deep_size_of
+from backend.measure.cache import (KeyedCache, MemoryBackend,
+                                        deep_size_of, reachable_ids)
 from backend.measure.scope import make_key
 
 from .step_eval import StepCells
@@ -83,17 +85,54 @@ class SharedWalkCells:
         return WALK_CELLS.resize(self.cache_key, self)
 
 
-# A process-local memo, not an estimate-result cache: at most sixteen
-# model/deployment families and, more importantly, at most this much resident
-# walk state. Entry count alone cannot bound memory: one Kimi family is many
-# times a 3B family. `StepCells` and the readers attached to each cell provide
-# the finer-grained bounds below this entry; a family larger than the whole
-# budget is returned to its caller but not retained.
-WALK_CELLS_MEMORY_BYTES = 768 * 1024 * 1024
+#: A family's size is its OWN bytes: everything reachable from the entry
+#: minus everything the resolved spec already reaches (`reachable_ids`),
+#: which every family of that model shares. The plain rule charged a family
+#: the spec it merely references — 19MB for a family whose own state
+#: measured 1MB — and a budget on that rule evicted on accounting, not on
+#: memory. Measured over the corpus's families: ~1MB own state each
+#: (row metadata; almost no expression objects), so the whole corpus of
+#: model x mode x degree families is a few GB of walk state plus one spec
+#: per model.
+#: The ids a resolved spec reaches, by the spec's content version: every
+#: family of one model shares the spec's objects, but a caller hands each
+#: family its own equal instance of the spec, so an id-keyed memo missed on
+#: all of them and each family store walked the spec's ninety-five thousand
+#: objects again — the accounting must not outweigh what it accounts for.
+#: `data_version` is the same content fingerprint the family key already
+#: names the spec by, measured at ~1ms.
+_SPEC_IDS: Dict[str, Tuple[Any, FrozenSet[int]]] = {}
+
+
+def _family_size(entry: Any) -> int:
+    resolved = (entry.get("resolved") if isinstance(entry, Mapping)
+                else getattr(entry, "resolved", None))
+    if resolved is None:
+        return deep_size_of(entry)
+    version = data_version(resolved)
+    held = _SPEC_IDS.get(version)
+    if held is None:
+        # The spec is held beside its ids: an id in the memo names this
+        # very object, whatever else equal content later replaces it.
+        _SPEC_IDS[version] = held = (resolved, reachable_ids(resolved))
+    return deep_size_of(entry, ignore=held[1])
+
+
+# A process-local memo, not an estimate-result cache: every model/deployment
+# family the process has asked for, and at most this much of their own walk
+# state. `StepCells` and the readers attached to each cell provide the
+# finer-grained bounds below this entry; a family larger than the whole
+# budget is returned to its caller but not retained. The caps once held
+# sixteen families and 768MB, and measured on the plain rule they looked
+# right: the true cost of a family was a tenth of what the accounting
+# charged, so the corpus now fits with room to spare.
+WALK_CELLS_MEMORY_BYTES = 6 * 1024 * 1024 * 1024
+WALK_CELLS_MAX_FAMILIES = 4096
 WALK_CELLS = KeyedCache(
     "walk_cells",
-    MemoryBackend(max_entries=16, max_bytes=WALK_CELLS_MEMORY_BYTES,
-                  size_of=deep_size_of),
+    MemoryBackend(max_entries=WALK_CELLS_MAX_FAMILIES,
+                  max_bytes=WALK_CELLS_MEMORY_BYTES,
+                  size_of=_family_size),
     single_flight=True)
 
 

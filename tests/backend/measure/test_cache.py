@@ -148,6 +148,18 @@ def test_disk_backend_roundtrip_and_prune(tmp_path):
     assert len(list(tmp_path.glob("*.json"))) == 10  # capped, oldest evicted
 
 
+def test_disk_backend_can_amortize_a_wide_tier_prune(tmp_path):
+    be = DiskBackend(tmp_path, max_files=2, prune_every=3)
+
+    for key in ("a", "b"):
+        be.put(key, {"key": key})
+    assert len(be.files()) == 2
+
+    be.put("c", {"key": "c"})
+    assert len(be.files()) == 2
+    assert be.get("a") is None and be.get("b") is not None
+
+
 def test_disk_backend_survives_bad_dir(tmp_path):
     # A read/write failure must never raise — the endpoint just recomputes.
     be = DiskBackend(tmp_path / "nonexistent" / "nested")

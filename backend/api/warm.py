@@ -42,19 +42,21 @@ import logging
 import os
 import pathlib
 import sys
+import time
 from typing import Any
 
 from backend.fingerprint import engine_version
 from backend.measure.cache import WRITE_BEHIND
+from backend.measure.timing import log_timing
 from backend.api._models import (
     BatchPoint,
     InferenceEstimateSweepRequest,
     InferenceParallelSweepRequest,
 )
+from backend.arch.snapshots import iter_snapshot_ids
 from backend.api.gallery_overview import (
     _GALLERY_CACHE_DIR,
     build_model_facts,
-    featured_examples,
 )
 from backend.api.gallery_frontier import (
     FrontierView, keepSharedWalk, warm_frontier,
@@ -79,8 +81,8 @@ from backend.inference.sweep_grid import (
     DEFAULT_INFER_MODEL,
     GALLERY_GPUS,
     GALLERY_LANDING_GPU,
+    GALLERY_SEQ_LENS,
     ROUTINE_OUTPUT_TOKENS,
-    ROUTINE_SEQ_LENS,
     SCALING_PANEL_BATCH_GRID,
     SCALING_DEGREES,
 )
@@ -144,25 +146,30 @@ _PLAN_OUTPUT_TOKENS = ROUTINE_OUTPUT_TOKENS  # Inference.tsx useState(SWEEP_OUTP
 def _scaling_models(models: list[str] | None) -> list[str]:
     if models:
         return list(models)
-    # The default landing model (DeepSeek-V3) is the single most common
-    # first hit; the featured set may not include it. Union it in, default
-    # first, de-duped, so the default page load is always warmed.
-    featured = featured_examples()
-    return [DEFAULT_INFER_MODEL] + [m for m in featured if m != DEFAULT_INFER_MODEL]
+    # Every model the Gallery warms — the one declaration of the corpus
+    # (`iter_snapshot_ids`, what `build_model_facts` lists) — because a
+    # swept model costs no extra walk: its projections read the canonical
+    # walk the frontier already produced. The default landing model stays
+    # first (the single most common first hit). The featured set no longer
+    # narrows this: a visitor to the Scaling panel can pick any model, and
+    # a warm that leaves 58 of them to live computation is a warm that
+    # times out for exactly the models nobody benchmarked.
+    every = sorted(iter_snapshot_ids())
+    return [DEFAULT_INFER_MODEL] + [m for m in every if m != DEFAULT_INFER_MODEL]
 
 
 def default_scaling_sweep_request(model_id: str):
     """The exact `InferenceParallelSweepRequest` a first visitor to the Scaling
     panel produces for a model — so warm writes the key the endpoint reads.
     One request serves every context the panel draws: the sweep prices the
-    routine context grid (`ROUTINE_SEQ_LENS`, the throughput cloud's contexts and
+    shared context grid (`GALLERY_SEQ_LENS`, the throughput cloud's contexts and
     the Prefill chart's) whichever context the panel's dropdown shows. See the field-source comment above; `gpu_sku` is inherited-but-ignored
     in the parallel key, and `gpu_skus=None` matches the panel (which does not
     send it → the server's curated default series)."""
     return InferenceParallelSweepRequest(
         model_id=model_id,
         gpu_sku="",
-        contexts=list(ROUTINE_SEQ_LENS),
+        contexts=list(GALLERY_SEQ_LENS),
         modes=list(ALL_MODES),
         gpu_memory_fraction=_SCALING_FRAC,
         avg_output_tokens=_PLAN_OUTPUT_TOKENS,
@@ -180,7 +187,7 @@ def default_scaling_batch_request(
     return InferenceEstimateSweepRequest(
         model_id=model_id,
         gpu_sku=gpu,
-        seq_lens=list(ROUTINE_SEQ_LENS),
+        seq_lens=list(GALLERY_SEQ_LENS),
         batch_grid=[BatchPoint(**bp) for bp in SCALING_PANEL_BATCH_GRID],
         avg_output_tokens=_PLAN_OUTPUT_TOKENS,
         parallel_preset={"mode": mode, "degree": degree},
@@ -290,6 +297,16 @@ async def warm_sweeps(
         print("SOL answer cache disabled: canonical walks kept only", flush=True)
         return int(walks > 0)
     jobs = scaling_jobs(models, gpus, modes, degrees)
+    # Batch cells first, parallel cells last: the parallel sweep's cells
+    # ARE the batch cells at the max rung, viewed per model — running
+    # them after the batch jobs means the pool's cell results are warm
+    # and the parallel jobs read them instead of re-computing. The
+    # overlay cache (one walk per class) makes both halves cheaper
+    # still; together this is the parallel sweep's retirement as a
+    # computation, its response assembled from cells the batch warm
+    # already produced (`docs/sweep_card_class.md` §2.D).
+    jobs = ([j for j in jobs if j[0] == "batch"]
+            + [j for j in jobs if j[0] == "parallel"])
     n_par = sum(1 for k, _, _ in jobs if k == "parallel")
     n_batch = sum(1 for k, _, _ in jobs if k == "batch")
     print(f"sweep engine version: {engine_version()}", flush=True)
@@ -311,6 +328,7 @@ async def warm_sweeps(
     async def run_job(index: int, kind: str, label: str, req: Any) -> bool:
         async with window:
             print(f"[{index}/{len(jobs)}] {kind} {label}", flush=True)
+            started = time.perf_counter()
             try:
                 if kind == "parallel":
                     await compute_parallel_sweep_cached(req)
@@ -320,6 +338,12 @@ async def warm_sweeps(
             except Exception as e:  # isolate: one model never aborts warm
                 print(f"  fail {kind} {label}: {e}", flush=True)
                 succeeded = False
+            log_timing(
+                "sweep", kind=kind, label=label,
+                model=getattr(req, "model_id", None),
+                gpu=getattr(req, "gpu_sku", None), index=index,
+                elapsed_s=time.perf_counter() - started,
+                succeeded=succeeded)
         async with progress:
             state["done"] += 1
             state["ok"] += int(succeeded)
@@ -375,6 +399,13 @@ class WarmProcess:
         # Read by `pool._max_workers` when the pool is first built,
         # which happens after this point (first sweep cell).
         os.environ["HA_SWEEP_POOL_WORKERS"] = str(self.workers)
+        # A warm touches every model in one set of workers. Replace a worker
+        # after a bounded number of jobs so its process-local registries --
+        # class overlays, walk cells, compiled laws -- cannot accumulate into
+        # the cgroup's memory ceiling. 16 jobs is enough to amortize spawn
+        # while keeping ten workers well below the 120 GiB budget.
+        os.environ.setdefault(
+            "HA_SWEEP_POOL_MAX_TASKS_PER_CHILD", "16")
         # Every heavy job — each gallery model, each sweep cell — runs in
         # the pool, as in the server. The pool is budgeted beside the API's
         # in one container (fly.toml).
@@ -540,6 +571,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Write this process's pid here; removed on a clean exit.",
     )
     args = parser.parse_args(argv)
+    started = time.perf_counter()
+    log_timing("warm_start", engine=engine_version(), workers=(
+        args.workers if args.workers is not None
+        else WarmProcess.default_workers()))
     if args.show_config:
         print(f"gallery cache dir: {_GALLERY_CACHE_DIR}")
         print(f"SOL pool dir:      {sharedSolPool.root}")
@@ -588,6 +623,7 @@ def main(argv: list[str] | None = None) -> int:
         if warmScaling and not asyncio.run(warm_sweeps(
                 models=args.models, gpus=sweep_gpus, walks=walks)):
             rc = 1
+    log_timing("warm_end", elapsed_s=time.perf_counter() - started)
     return rc
 
 

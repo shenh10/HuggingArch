@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from backend.arch.eval.analysis import Point
 from backend.arch.eval.dim import as_extent, value_of
 from backend.arch.eval.program import BlockStage, OpStage, Program
 from backend.arch.eval.refusal import node_context
@@ -238,10 +239,13 @@ def physical_module_rows(
     program = Program(resolved=walked.resolved, ir=result.post_tree,
                       schedule=walked.schedule)
     cost = result.cost
+    law_cost = result.cost if result.laws is None else result.laws.cost
     # The unsharded column is one data-parallel replica's
     # (`Analysis.replica_cost`), the unit the rest of the table is per.
-    full_cost = result.replica_cost
+    full_cost = (result.replica_cost if result.laws is None
+                 else result.laws.replica_cost)
     instances = result.instances
+    point = Point(dict(result.point))
 
     def count_of(uid: int) -> int:
         return instance_count(instances, uid)
@@ -252,8 +256,8 @@ def physical_module_rows(
     rows: List[Dict[str, Any]] = []
 
     def flops_of(layer: Any, uid: int, count: int) -> int:
-        c = layer.values.get(uid)
-        return round(float(value_of(c.flops if c is not None else 0)) * count)
+        law = flops_law(layer, uid)
+        return round(float(point.laws(book, (law,))[law]) * count)
 
     # The laws the rows' FLOPs are read at other points by: the layers
     # before they were read at this result's point.
@@ -281,7 +285,7 @@ def physical_module_rows(
                                     f"timing row uid {uid}")
             flops_full = flops_of(full_cost, uid, own_count)
         else:
-            flops_pr = flops_of(cost, uid, count)
+            flops_pr = flops_of(law_cost, uid, count)
             flops_full = flops_of(full_cost, uid, count)
         identity = TableIdentity(
             name=node.name, op=node.op, role=node.role or "",
@@ -303,14 +307,10 @@ def physical_module_rows(
         # shapes; read the uid-keyed layers instead of the old
         # aggregation_id-keyed override, with their laws in the workload
         # beside them so a re-read at another point has them too.
-        shape = result.shapes.values.get(uid)
-        full_shape = result.full_shapes.values.get(uid)
-        if shape is not None:
-            parts = (shape.ins, shape.out,
-                     full_shape.ins if full_shape is not None else None,
-                     full_shape.out if full_shape is not None else None)
-            row.update(shape_columns(*parts))
-            row["shape_law"] = _table_shape_law(uid)
+        law = _table_shape_law(uid)
+        if law is not None:
+            row.update(shape_at(law))
+            row["shape_law"] = law
         return row
 
     def _table_shape_law(uid: int) -> Optional[Dict[str, Any]]:
@@ -330,6 +330,24 @@ def physical_module_rows(
                         (full.ins if full is not None else None) or ()],
             "out_full": (book.axes(full.out) if full is not None
                          and full.out is not None else None)}
+
+    def shape_at(law: Mapping[str, Any]) -> Dict[str, Any]:
+        """A table row's shape columns at `result.point`, off the laws its
+        `shape_law` states — the one road a re-read point takes."""
+        axes = tuple(axis for key in ("in", "in_full")
+                     for one in law[key] or () for axis in one)
+        axes += tuple(axis for key in ("out", "out_full")
+                      if law[key] is not None for axis in law[key])
+        read = point.laws(book, axes)
+
+        def values(one: Any) -> List[Any]:
+            return [read[axis] for axis in one]
+
+        return shape_columns(
+            [values(one) for one in law["in"] or ()],
+            values(law["out"]) if law["out"] is not None else None,
+            [values(one) for one in law["in_full"] or ()],
+            values(law["out_full"]) if law["out_full"] is not None else None)
 
     # A node the walk evaluated as a parent: its cost is its children's. A
     # launch that took every child leaves it empty on the post tree

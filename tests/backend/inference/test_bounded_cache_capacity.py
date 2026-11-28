@@ -18,11 +18,13 @@ import unittest
 from functools import lru_cache
 from types import SimpleNamespace
 
-from backend.inference.capacity import _cache_budget_terms, estimate_capacity
+from backend.inference.capacity import (
+    _cache_budget_terms, estimate_capacity, max_batch_rung)
 from backend.inference.parallel_config import ParallelConfig
 from tests.snapshots import (
     resolve_snapshot, shared_loader, snapshot_config,
 )
+from backend.inference import capacity as _capacity
 
 MISTRAL = "mistralai__Mistral-7B-v0.1"
 # 32 layers × 2 (K, V) × 8 KV heads × 128 head dim × 2 bytes × 4096 window.
@@ -88,8 +90,66 @@ class TestAllWindowModelEstimates(unittest.TestCase):
         self.assertEqual(r["max_batch_per_gpu"],
                          int((budget - _FULL_WINDOW_BYTES) // per_request))
         self.assertGreater(r["max_batch_per_gpu"], 100)
+        # The phase batch is the rung of the exact ceiling
+        # (`max_batch_rung`): the max point the panels draw, the exact
+        # ceiling a capacity fact (docs/sweep_card_class.md §2.C).
         self.assertEqual(r["phases"]["decode"]["batch"],
-                         r["max_batch_per_gpu"])
+                         1 << (r["max_batch_per_gpu"].bit_length() - 1))
+
+    def test_prefills_public_point_is_its_rung_and_its_cap_stays_exact(self):
+        r = estimate_capacity(
+            config=snapshot_config(MISTRAL), gpu_sku="H100-SXM",
+            resolved=resolve_snapshot(MISTRAL, shared_loader()),
+            selection_mode="theoretical_only",
+            avg_input_tokens=1024, avg_output_tokens=1024,
+            prefill_batch_size=-1)
+        cap = int(r["max_prefill_batch_per_gpu"])
+        self.assertGreater(cap, 1)
+        self.assertEqual(r["phases"]["prefill"]["batch"], max_batch_rung(cap))
+        self.assertEqual(r["max_prefill_batch_per_gpu"], cap)
+
+    def test_same_class_skus_share_one_overlay_walk(self):
+        """The class cache walks the class once; the sibling's SKU, point and
+        module layers are substituted, not re-walked."""
+        _capacity._CLASS_OVERLAYS.clear()
+        original = _capacity.overlay_walk
+        calls = []
+
+        def counted(**kwargs):
+            calls.append((kwargs["phase"], kwargs["gpu_sku"],
+                          kwargs["max_batch"]))
+            return original(**kwargs)
+
+        _capacity.overlay_walk = counted
+        try:
+            estimates = [estimate_capacity(
+                config=snapshot_config(MISTRAL), gpu_sku="H100-SXM",
+                resolved=resolve_snapshot(MISTRAL, shared_loader()),
+                selection_mode="theoretical_only",
+                avg_input_tokens=1024, avg_output_tokens=1024),
+                estimate_capacity(
+                    config=snapshot_config(MISTRAL), gpu_sku="H200",
+                    resolved=resolve_snapshot(MISTRAL, shared_loader()),
+                    selection_mode="theoretical_only",
+                    avg_input_tokens=1024, avg_output_tokens=1024)]
+        finally:
+            _capacity.overlay_walk = original
+        self.assertEqual(calls, [
+            ("prefill", "H100-SXM", 1),
+            ("decode", "H100-SXM",
+             estimates[0]["phases"]["decode"]["batch"])])
+        self.assertTrue(estimates)
+
+    def test_the_class_overlay_registry_is_bounded(self):
+        """A warm touches every model; finished models' overlays are garbage."""
+        _capacity._CLASS_OVERLAYS.clear()
+        for index in range(_capacity._CLASS_OVERLAYS_MAX + 10):
+            _capacity._remember_class_overlay((index,), index)
+        self.assertEqual(len(_capacity._CLASS_OVERLAYS),
+                         _capacity._CLASS_OVERLAYS_MAX)
+        self.assertEqual(list(_capacity._CLASS_OVERLAYS),
+                         [(index,) for index in range(
+                             10, _capacity._CLASS_OVERLAYS_MAX + 10)])
 
     def test_past_the_window_a_request_costs_the_window_and_no_more(self):
         long = _estimate(1, 64 * 1024)

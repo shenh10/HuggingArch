@@ -1814,13 +1814,19 @@ class Point:
                       ) -> Callable[[Mapping[str, Any]], Dict[Any, Any]]:
         """Laws, each with the point it is read at (`needs`), read once per
         point, each point's in one call (`laws`): what a point's laws come
-        to, asked by the point."""
-        grouped: Dict[Tuple[Tuple[str, Any], ...], List[Any]] = {}
+        to, asked by the point.
+
+        The point's key is the frozenset of its items: a point's counts
+        are hashable scalars, two equal points have equal sets whatever
+        order they were built in, and no sort is paid per need — grouping
+        was measured at four times the evaluation it groups for (the warm
+        asks ~4,000 needs per point)."""
+        grouped: Dict[FrozenSet[Tuple[str, Any]], List[Any]] = {}
         for at, law in needs:
-            grouped.setdefault(tuple(sorted(at.items())), []).append(law)
+            grouped.setdefault(frozenset(at.items()), []).append(law)
         read = {key: Point(dict(key)).laws(book, laws)
                 for key, laws in grouped.items()}
-        return lambda at: read[tuple(sorted(at.items()))]
+        return lambda at: read[frozenset(at.items())]
 
     def admit(self, cell: Any) -> None:
         """Refuse this point where a walk there would refuse it

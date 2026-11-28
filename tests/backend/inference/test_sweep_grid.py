@@ -12,6 +12,7 @@ import pathlib
 import re
 
 from backend.inference.sweep_grid import (
+    GALLERY_SEQ_LENS,
     ROUTINE_OUTPUT_TOKENS,
     ROUTINE_SEQ_LENS,
     SCALING_BATCH_GRID,
@@ -47,20 +48,23 @@ def _batch_grid(ts: str) -> list[dict]:
 def test_web_sweep_grid_matches_backend():
     """`web/src/compare.ts` feeds both the Scaling panel and Compare."""
     ts = (_WEB / "compare.ts").read_text()
-    assert _int_array(ts, "SWEEP_SEQ_LENS") == ROUTINE_SEQ_LENS
+    assert _int_array(ts, "SWEEP_SEQ_LENS") == GALLERY_SEQ_LENS
     assert _batch_grid(ts) == SCALING_BATCH_GRID
     out = re.search(r"SWEEP_OUTPUT_TOKENS\s*=\s*(\d+)", ts)
     assert out and int(out.group(1)) == ROUTINE_OUTPUT_TOKENS
 
 
 def test_the_panels_context_batch_grid_is_the_rungs_it_draws():
-    """The Scaling panel's Context × Batch body asks one request (prefill vs
-    context) and the ceiling (KV storage), in both languages by one rule."""
+    """The Scaling panel's Context × Batch body asks the cloud's own ladder,
+    in both languages by one rule."""
     ts = (_WEB / "compare.ts").read_text()
-    assert [bp["key"] for bp in SCALING_PANEL_BATCH_GRID] == ["b1", "max"]
-    assert re.search(r"SCALING_PANEL_BATCH_GRID[^=]*=\s*SWEEP_BATCH_GRID\.filter\(\s*"
-                     r"\(p\)\s*=>\s*p\.decode_batch_size\s*===\s*1\s*\|\|\s*"
-                     r"p\.decode_batch_size\s*===\s*null\)", ts)
+    # The panel asks the full grid (`docs/sweep_card_class.md` §2.B): the
+    # trim to a few rungs was a cost decision the class machinery dissolved.
+    assert [bp["key"] for bp in SCALING_PANEL_BATCH_GRID] == [
+        "b1", "b8", "b16", "b32", "b64", "b128", "b256", "b512",
+        "b1024", "max"]
+    # The TS mirror asks the full grid too (no filter).
+    assert "SCALING_PANEL_BATCH_GRID: SweepBatchPoint[] = SWEEP_BATCH_GRID" in ts
 
 
 def test_serving_prefill_stays_at_one_request():
@@ -68,7 +72,7 @@ def test_serving_prefill_stays_at_one_request():
     assert all(point["prefill_batch_size"] == 1
                for point in SCALING_BATCH_GRID)
     assert [point["decode_batch_size"] for point in SCALING_BATCH_GRID] == [
-        1, 16, 64, None]
+        1, 8, 16, 32, 64, 128, 256, 512, 1024, None]
 
 
 def _spec_presets(ts: str) -> dict:

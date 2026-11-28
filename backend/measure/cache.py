@@ -49,7 +49,7 @@ import sys
 import threading
 import types
 import zlib
-from typing import Any, Callable, Optional
+from typing import Any, Callable, FrozenSet, Optional, Tuple
 
 from backend.code_trace.provider import TRACES, Trace, provider, recording
 
@@ -170,21 +170,43 @@ def _json_size_of(value: Any) -> int:
     return len(json.dumps(value).encode())
 
 
-def deep_size_of(value: Any) -> int:
+def reachable_ids(value: Any) -> FrozenSet[int]:
+    """The ids `deep_size_of` would visit from `value` — the shared subtree
+    a second value can be measured without charging (`deep_size_of`'s
+    `ignore`)."""
+    return frozenset(_deep_walk(value, frozenset())[1])
+
+
+def deep_size_of(value: Any, *,
+                 ignore: FrozenSet[int] = frozenset()) -> int:
     """The resident bytes an object graph attributes to one cache value.
 
     Shared children are counted once within a value and process-global code
     (modules, classes, functions, and builtins) is not charged to an entry.
+    `ignore` holds ids already attributed elsewhere (`reachable_ids` of the
+    shared root), so a value that merely references them is not charged for
+    them: a walk family referencing its model's resolved spec measured 19MB
+    by the plain rule and 1MB of its own, and a budget on the plain rule
+    evicted on accounting, not on memory.
     This is the size function for in-process caches whose values are working
     objects rather than JSON payloads; the bytes still feed the same
     `MemoryBackend.max_bytes` budget and LRU eviction as JSON sizes.
     """
+    return _deep_walk(value, ignore)[0]
+
+
+def _deep_walk(value: Any, ignore: FrozenSet[int]) -> Tuple[int, set[int]]:
+    """One traversal, two answers: the total size and the visited ids —
+    `deep_size_of` reads the bytes, `reachable_ids` the ids, and one rule
+    serves both. A plain loop, not a generator: this walk was measured at
+    a fifth of a sweep cell's time in generator form, per-object `yield`
+    being its whole cost at a hundred thousand objects per family."""
     shared_code = (
         type, types.ModuleType, types.FunctionType, types.BuiltinFunctionType,
         types.MethodType, types.WrapperDescriptorType,
         types.MethodWrapperType, types.BuiltinMethodType,
     )
-    seen: set[int] = set()
+    seen: set[int] = set(ignore)
     stack: list[Any] = [value]
     total = 0
     while stack:
@@ -211,7 +233,7 @@ def deep_size_of(value: Any) -> int:
                         pass
             else:
                 stack.extend(gc.get_referents(obj))
-    return total
+    return total, seen
 
 
 _SIZE_UNITS = {"": 1, "b": 1, "k": 1 << 10, "kib": 1 << 10, "kb": 1 << 10,
@@ -264,16 +286,24 @@ class DiskBackend:
     bound counts the bytes on disk, compressed or not. A directory is one
     backend's: a file there in the other format is not an entry this backend
     reads (no backend reads both — an entry written before its tier changed
-    format is a miss, recomputed), only a dead file its prune removes."""
+    format is a miss, recomputed), only a dead file its prune removes.
+
+    ``prune_every`` amortizes the directory scan for a tier with many small
+    entries: bounds are checked on every write by default, while a wide tier
+    may check every N writes and accept at most N−1 entries over its bounds
+    between scans."""
 
     _PLAIN, _GZIP = ".json", ".json.gz"
 
     def __init__(self, directory: os.PathLike | str, max_files: int = 2000,
-                 max_bytes: Optional[int] = None, *, compress: bool = False):
+                 max_bytes: Optional[int] = None, *, compress: bool = False,
+                 prune_every: int = 1):
         self._dir = pathlib.Path(directory)
         self._max = max_files
         self._max_bytes = max_bytes
         self._compress = compress
+        self._prune_every = max(1, int(prune_every))
+        self._writes_since_prune = 0
 
     @property
     def suffix(self) -> str:
@@ -343,7 +373,10 @@ class DiskBackend:
                     with io.TextIOWrapper(raw, encoding="utf-8") as f:
                         json.dump(value, f)
             os.replace(tmp, path)
-            self._prune()
+            self._writes_since_prune += 1
+            if self._writes_since_prune >= self._prune_every:
+                self._prune()
+                self._writes_since_prune = 0
         except (OSError, TypeError, ValueError):
             pass
 
@@ -378,6 +411,7 @@ class DiskBackend:
     def clear(self) -> None:
         for p in self.files():
             p.unlink(missing_ok=True)
+        self._writes_since_prune = 0
 
 
 class TieredBackend:
